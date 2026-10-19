@@ -1,0 +1,130 @@
+/* VoiceManager web UI stylesheet.
+
+   Every colour is a token on :root, written once as light-dark(<light>,
+   <dark>). color-scheme on :root picks the side: it is "dark", so pages
+   are dark by default; "light dark" would follow the browser. Tints are mixed from the tokens with color-mix(), so the accent
+   changes in one place. System fonts only. base.html inlines this file in
+   its one nonce-carrying style block. */
+
+/* ---------- Colour tokens (the only place a colour literal may sit) ---------- */
+:root {
+  color-scheme: dark;
+  --bg:           light-dark(#ffffff, #17191c);
+  --bg-muted:     light-dark(#f6f7f9, #1f2226);
+  --bg-header:    light-dark(#fbfbfc, #1b1d20);
+  --bg-hover:     light-dark(#f0f2f5, #24282d);
+  --fg:           light-dark(#1f2329, #dde0e5);
+  --fg-muted:     light-dark(#5c6570, #9aa1ab);
+  --border:       light-dark(#d5d9de, #353a41);
+  --border-muted: light-dark(#e4e7eb, #2b2f35);
+  --accent:       light-dark(#b45309, #f5a524);
+  --on-accent:    light-dark(#ffffff, #111417);
+  --mark:         light-dark(#fff1a6, #5a4a0c);
+}
+
+/* ---------- Derived tints, sizes and fonts ---------- */
+:root {
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --neutral-soft: color-mix(in srgb, var(--fg-muted) 16%, transparent);
+  --radius: 6px;
+  --gutter: 32px;
+  --ui: system-ui, -apple-system, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* ---------- Frame ---------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 var(--ui); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+h1 { font-size: 26px; line-height: 1.25; font-weight: 600; margin: 24px 0 12px; letter-spacing: -0.01em; }
+h2 { font-size: 16px; font-weight: 600; margin: 24px 0 12px; }
+code, pre { font-family: var(--mono); }
+small { color: var(--fg-muted); }
+
+.container { max-width: 1280px; margin: 0 auto; padding: 0 var(--gutter); }
+@media (max-width: 1200px) { :root { --gutter: 16px; } }
+@media (max-width: 767px) { :root { --gutter: 8px; } }
+main.container { padding-bottom: 48px; }
+
+/* ---------- Header ---------- */
+.site-header { background: var(--bg-header); border-top: 3px solid var(--accent);
+  border-bottom: 1px solid var(--border); }
+.site-header .container { display: flex; align-items: center; gap: 16px; min-height: 56px;
+  flex-wrap: wrap; padding-block: 8px; }
+.brand { display: flex; align-items: center; gap: 8px; color: var(--fg); font-weight: 600;
+  font-size: 16px; letter-spacing: -0.01em; }
+.brand:hover { text-decoration: none; }
+.brand svg { width: 24px; height: 24px; color: var(--accent); flex: none; }
+.site-nav { display: flex; gap: 4px; padding-left: 12px; border-left: 1px solid var(--border); }
+.site-nav a { color: var(--fg); padding: 4px 8px; border-radius: var(--radius); }
+.site-nav a:hover { text-decoration: none; background: var(--bg-hover); }
+.account { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 13px;
+  color: var(--fg-muted); }
+.account .identity strong { color: var(--fg); font-weight: 600; }
+.signout { margin: 0; }
+.signout button { font-size: 12px; padding: 4px 9px; min-height: 0; }
+@media (max-width: 767px) {
+  .account .identity { display: none; }
+}
+
+/* ---------- Form controls ---------- */
+input[type=checkbox],
+input[type=radio] { accent-color: var(--accent); }
+input[type=text],
+input[type=password] { font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 10px; min-height: 32px; }
+input[type=text]:focus,
+input[type=password]:focus,
+select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+select { font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 8px; min-height: 32px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; }
+button,
+.btn { font: inherit; color: var(--fg); background: var(--bg-muted); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 5px 14px; min-height: 32px; cursor: pointer; font-weight: 500; }
+button:hover,
+.btn:hover { background: var(--bg-hover); }
+.btn-accent,
+.btn-accent:hover { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.error { color: var(--fg); background: var(--mark); border-radius: var(--radius); padding: 8px 12px; margin: 0 0 12px; }
+.notice { color: var(--fg-muted); }
+
+/* ---------- Page heading and boxes ---------- */
+h1.page-title { font-size: 26px; line-height: 1.25; font-weight: 600; margin: 12px 0 6px; letter-spacing: -0.01em; }
+main > h1.page-title:first-child { margin-top: 24px; }
+.page-sub { color: var(--fg-muted); margin: 0 0 20px; }
+.box { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+
+/* ---------- Sign-in form ---------- */
+.box.signin { max-width: 400px; padding: 16px; }
+.signin form { display: flex; flex-direction: column; gap: 12px; }
+.signin label { display: flex; flex-direction: column; gap: 4px; font-weight: 500; }
+.signin button { align-self: flex-start; }
+
+/* ---------- Tokens and account pages ---------- */
+.box.user-section { max-width: 880px; padding: 16px; margin-bottom: 20px; }
+.user-section h2 { font-size: 18px; font-weight: 600; margin: 0 0 8px; }
+.user-section h3 { font-size: 15px; font-weight: 600; margin: 20px 0 8px; }
+.user-section .notice { margin: 0 0 12px; }
+.token-create,
+.password-change { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.token-create > label,
+.password-change > label { display: flex; flex-direction: column; gap: 4px; font-weight: 500; }
+.token-table { border-collapse: collapse; font-size: 14px; width: 100%; }
+.token-table th,
+.token-table td { text-align: left; padding: 6px 12px 6px 0; border-top: 1px solid var(--border-muted);
+  vertical-align: middle; white-space: nowrap; }
+.token-table thead th { border-top: 0; color: var(--fg-muted); font-weight: 500; font-size: 13px; }
+.table-scroll { overflow-x: auto; }
+.token-actions { display: flex; gap: 6px; align-items: center; }
+.token-revoke,
+.token-voice { margin: 0; display: flex; gap: 6px; align-items: center; }
+.token-revoke button,
+.token-voice button { font-size: 12px; padding: 4px 9px; min-height: 0; }
+.minted { margin: 12px 0; }
+.minted .secret code { display: block; padding: 8px 12px; background: var(--bg-muted);
+  border: 1px solid var(--border); border-radius: var(--radius); word-break: break-all; }

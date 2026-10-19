@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="currentColor">
+  <!-- The VoiceManager mark (option D): five waveform bars on the 32 grid. Each bar is 4 units wide with a 2-unit gap, so at 16 px every edge falls on a pixel. The web UI header draws these same rects. -->
+  <rect x="2" y="14" width="4" height="4" rx="1"/>
+  <rect x="8" y="10" width="4" height="12" rx="1"/>
+  <rect x="14" y="6" width="4" height="20" rx="1"/>
+  <rect x="20" y="10" width="4" height="12" rx="1"/>
+  <rect x="26" y="14" width="4" height="4" rx="1"/>
+</svg>

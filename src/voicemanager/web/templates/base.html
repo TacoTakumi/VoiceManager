@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ title }}{% endblock %} - VoiceManager</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+{# Inlined, not linked: pages load no external CSS. #}
+<style nonce="{{ csp_nonce }}">
+{% include "viewer.css" %}
+</style>
+</head>
+<body>
+<header class="site-header">
+<div class="container">
+<a class="brand" href="/">
+<svg viewBox="0 0 32 32" aria-hidden="true" fill="currentColor">
+<rect x="2" y="14" width="4" height="4" rx="1"/>
+<rect x="8" y="10" width="4" height="12" rx="1"/>
+<rect x="14" y="6" width="4" height="20" rx="1"/>
+<rect x="20" y="10" width="4" height="12" rx="1"/>
+<rect x="26" y="14" width="4" height="4" rx="1"/>
+</svg>
+VoiceManager
+</a>
+{% if user %}
+<nav class="site-nav" aria-label="Pages">
+<a href="/tokens">Tokens</a>
+<a href="/account">Account</a>
+</nav>
+<div class="account">
+<span class="identity">Signed in as <strong>{{ user }}</strong></span>
+<form class="signout" method="post" action="/signout">
+<input type="hidden" name="session" value="{{ session }}">
+<button type="submit">Sign out</button>
+</form>
+</div>
+{% endif %}
+</div>
+</header>
+<main class="container">
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

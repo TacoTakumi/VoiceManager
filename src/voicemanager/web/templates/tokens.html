@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="page-title">Tokens</h1>
+<p class="page-sub">A token lets a client use this server's API and WebSocket as <strong>{{ user }}</strong>. Send it as a bearer token. Revoke a token you no longer use.</p>
+<section class="box user-section" id="create">
+<h2>Create a token</h2>
+{% if minted %}
+<div class="minted" id="minted">
+<h3>New token {{ minted[0] }}</h3>
+<p class="secret"><code>{{ minted[1] }}</code></p>
+<p class="error" role="status">{{ shown_once }}</p>
+</div>
+{% endif %}
+{% if create_error %}
+<p class="error" role="alert">{{ create_error }}</p>
+{% endif %}
+<form class="token-create" method="post" action="{{ create_path }}">
+<input type="hidden" name="session" value="{{ session }}">
+<label>Name
+<input type="text" name="name" required autocomplete="off">
+</label>
+{% if voices %}
+<label>Voice
+<select name="voice">
+<option value="" selected>{{ server_default }}{% if default_voice %} ({{ default_voice }}){% endif %}</option>
+{% for voice in voices %}
+<option value="{{ voice }}">{{ voice }}</option>
+{% endfor %}
+</select>
+</label>
+{% endif %}
+<button class="btn-accent" type="submit">Create token</button>
+</form>
+</section>
+<section class="box user-section" id="tokens">
+<h2>Your tokens</h2>
+{% if list_error %}
+<p class="error" role="alert">{{ list_error }}</p>
+{% endif %}
+{% if tokens %}
+<div class="table-scroll">
+<table class="token-table">
+<thead>
+<tr>
+<th scope="col">Name</th>
+<th scope="col">Ends in</th>
+{% if not voices %}
+<th scope="col">Voice</th>
+{% endif %}
+<th scope="col">Created</th>
+<th scope="col">Last used</th>
+<th scope="col"><span class="visually-hidden">Actions</span></th>
+</tr>
+</thead>
+<tbody>
+{% for token in tokens %}
+<tr data-token="{{ token.name }}">
+<td>{{ token.name }}</td>
+<td><code>{{ token.last4 }}</code></td>
+{% if not voices %}
+<td>{{ token.voice or server_default }}</td>
+{% endif %}
+<td>{{ token.created }}</td>
+<td>{{ token.last_used }}</td>
+<td>
+<div class="token-actions">
+{% if voices %}
+<form class="token-voice" method="post" action="{{ voice_path }}">
+<input type="hidden" name="session" value="{{ session }}">
+<input type="hidden" name="name" value="{{ token.name }}">
+<select name="voice" aria-label="Voice for {{ token.name }}">
+<option value=""{% if not token.voice %} selected{% endif %}>{{ server_default }}{% if default_voice %} ({{ default_voice }}){% endif %}</option>
+{% for voice in voices %}
+<option value="{{ voice }}"{% if voice == token.voice %} selected{% endif %}>{{ voice }}</option>
+{% endfor %}
+</select>
+<button type="submit">Set voice</button>
+</form>
+{% endif %}
+<form class="token-revoke" method="post" action="{{ revoke_path }}">
+<input type="hidden" name="session" value="{{ session }}">
+<input type="hidden" name="name" value="{{ token.name }}">
+<button type="submit">Revoke</button>
+</form>
+</div>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<p class="notice">{{ no_tokens }}</p>
+{% endif %}
+</section>
+{% endblock %}

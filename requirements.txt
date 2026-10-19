@@ -1,0 +1,30 @@
+# Core: the server, the Python client and the default audiocpp STT + TTS engines.
+# Other engines have their own file (requirements-<engine>.txt). setup_models.py
+# offers to install the one for each configured engine.
+
+# Web Framework & Server
+fastapi
+uvicorn
+websockets
+python-multipart
+pydantic
+pydantic-settings
+requests
+click
+jinja2
+httpx
+
+# Silero VAD drives the audiocpp acoustic endpoint (and the Whisper segmenter)
+silero-vad
+numpy
+torch
+torchaudio
+
+# Audio Processing
+soundfile
+
+# Model downloads (setup_models.py)
+huggingface_hub
+
+# Voice design prompt files (scripts/design_voice.py)
+PyYAML

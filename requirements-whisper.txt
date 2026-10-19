@@ -1,0 +1,2 @@
+# VM_STT_ENGINE=whisper: faster-whisper (silero-vad is in requirements.txt)
+faster-whisper

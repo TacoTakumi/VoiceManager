@@ -1,0 +1,35 @@
+# Prototype files — kept locally for reference, not tracked
+src/server_prototype_1.py
+src/client_prototype_1.py
+
+# Environment
+.env
+venv/
+
+# Local agent tooling (settings, worktrees)
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Upstream checkouts (audio.cpp is cloned here per the README), never committed
+3rdParty/
+
+# Model weights, downloaded by setup_models.py
+checkpoints/
+checkpoints_v2/
+/models/
+voices/streaming_model/
+
+# Local drafts of outward-facing posts (issues, PRs), never committed
+drafts/
+
+# Voice design candidates from scripts/design_voice.py; --register copies the chosen one to voices/designed/
+voice_design/
+
+# Listen-test clips stay on disk, never in git
+tts_evidence/

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="page-title">Account</h1>
+<p class="page-sub">Signed in as <strong>{{ user }}</strong>.</p>
+<section class="box user-section" id="password">
+<h2>Password</h2>
+<p class="notice">Change the password <strong>{{ user }}</strong> signs in with. This session stays signed in; every other session of yours ends.</p>
+{% if password_error %}
+<p class="error" role="alert">{{ password_error }}</p>
+{% endif %}
+{% if password_changed %}
+<p class="notice" role="status">{{ password_changed }}</p>
+{% endif %}
+<form class="password-change" method="post" action="{{ change_password_path }}">
+<input type="hidden" name="session" value="{{ session }}">
+<label>Current password
+<input type="password" name="current" required autocomplete="current-password">
+</label>
+<label>New password
+<input type="password" name="new" required autocomplete="new-password">
+</label>
+<label>New password again
+<input type="password" name="confirm" required autocomplete="new-password">
+</label>
+<button class="btn-accent" type="submit">Change password</button>
+</form>
+</section>
+{% endblock %}

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voicemanager"
+version = "0.1.0"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.scripts]
+voicemanager = "voicemanager.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voicemanager"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

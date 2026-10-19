@@ -1,0 +1,2 @@
+# Build tree - reproducible from CMakeLists.txt, never committed.
+build*/

@@ -1,0 +1,13 @@
+# VM_TTS_ENGINE=openvoice: OpenVoice v2 + MeloTTS.
+# OpenVoice itself is installed from a clone (see the README), not from this file.
+librosa
+scipy
+tensorboard
+phonemizer
+unidecode
+jieba
+pypinyin
+torchvision
+
+# MeloTTS - install from GitHub, PyPI 0.1.1 requires torch<2.0 which conflicts
+MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git

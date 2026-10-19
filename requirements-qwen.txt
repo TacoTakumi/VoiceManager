@@ -1,0 +1,3 @@
+# VM_STT_ENGINE=qwen: Qwen3-ASR through vLLM
+qwen-asr
+vllm

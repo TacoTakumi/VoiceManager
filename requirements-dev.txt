@@ -1,0 +1,6 @@
+# Running the automated tests: ./venv/bin/python -m pytest tests/
+# Needs only requirements.txt plus this file. Tests for other engines use fakes, and
+# the one that needs NeMo skips without requirements-nemotron.txt.
+-r requirements.txt
+pytest
+pytest-asyncio

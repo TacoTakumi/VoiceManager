@@ -1,0 +1,5 @@
+# VM_STT_ENGINE=nemotron: NeMo cache-aware streaming - "26.06"; no PyPI wheel exists, pin the git commit.
+# Self-reports as 3.1.0+4a33e9c2e. Re-pin to the stable "NeMo Speech" PyPI release when it lands
+# and re-run the re-gate (scripts/spike_nemotron_2606.py). Do NOT pin 2.7.3 - the finalization
+# crash is not fixed there.
+nemo_toolkit[asr] @ git+https://github.com/NVIDIA-NeMo/NeMo.git@4a33e9c2e17c8eaae539a28a18d8dccd8d5d8e62

@@ -1,0 +1,3 @@
+# VM_TTS_ENGINE=vibevoice: VibeVoice-Realtime-0.5B
+vibevoice[streamingtts] @ git+https://github.com/microsoft/VibeVoice.git
+diffusers

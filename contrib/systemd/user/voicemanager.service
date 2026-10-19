@@ -1,0 +1,35 @@
+# VoiceManager as a systemd user service (systemctl --user). For a
+# system-wide unit that runs as one user, see ../system/voicemanager.service.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/user/voicemanager.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now voicemanager
+#   loginctl enable-linger "$USER"     # keep it running when you are logged out
+#
+# Logs:    journalctl --user -u voicemanager -f
+# Restart: systemctl --user restart voicemanager   (after a code or .env change)
+#
+# Adjust before installing:
+# - %h/VoiceManager is the clone. The server reads .env from the clone and
+#   resolves relative paths against it, whatever the WorkingDirectory.
+#   Set Environment=VOICEMANAGER_HOME=... to use a different home.
+# - Host, port, engines and devices come from .env (VM_HOST, VM_PORT, ...).
+
+[Unit]
+Description=VoiceManager STT/TTS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/VoiceManager
+#Environment=HF_HOME=%h/.cache/huggingface
+ExecStart=%h/VoiceManager/venv/bin/voicemanager serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

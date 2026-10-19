@@ -1,0 +1,44 @@
+# VoiceManager as a system-wide systemd service that runs as one user.
+# For a per-user unit (systemctl --user), see ../user/voicemanager.service.
+#
+# Install:
+#   sudo cp contrib/systemd/system/voicemanager.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now voicemanager
+#
+# Logs:    journalctl -u voicemanager -f
+# Restart: sudo systemctl restart voicemanager   (after a code or .env change)
+#
+# Adjust before installing:
+# - Replace "you" (User, Group, every path) with the account the server runs
+#   as. A system unit does not expand %h to that user's home, so the paths are
+#   written out.
+# - /home/you/VoiceManager is the clone. The server reads .env from the clone
+#   and resolves relative paths against it, whatever the WorkingDirectory.
+#   Set Environment=VOICEMANAGER_HOME=... to use a different home.
+# - HOME must be that user's home: the user and token store defaults to
+#   ~/.local/state/voicemanager/state.db (VM_DB_PATH), and the Hugging Face
+#   cache is under it unless HF_HOME is set.
+# - The account needs access to the GPU device nodes (/dev/nvidia*). On most
+#   distributions they are open to all users; some require the video group.
+# - Host, port, engines and devices come from .env (VM_HOST, VM_PORT, ...).
+
+[Unit]
+Description=VoiceManager STT/TTS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=you
+Group=you
+WorkingDirectory=/home/you/VoiceManager
+Environment=HOME=/home/you
+#Environment=HF_HOME=/home/you/.cache/huggingface
+ExecStart=/home/you/VoiceManager/venv/bin/voicemanager serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

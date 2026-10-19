@@ -1,0 +1,27 @@
+{
+  "_comment": "Frozen clone references for the audiocpp TTS backend (ear test 2026-08-14). Each entry pairs reference audio with its exact transcript (ref_text). Engines clone from (audio, transcript). Provenance on the wiki page: research/tts-candidates-for-a-voicemanager-audiocpp-tts-backend-at-audiocpp-06-2026-08-14.",
+  "designed_female_s101": {
+    "file": "designed_female_s101.wav",
+    "ref_text": "All primary systems are functioning within normal parameters. Long range communications are standing by. State the nature of your request, and I will route it to the appropriate subsystem.",
+    "origin": "VoxCPM2 q8_0 voice design, seed 101, instruction: 'A calm adult female voice, precise and even-paced, slightly synthetic, neutral affect, like a starship computer'",
+    "sample_rate": 48000
+  },
+  "designed_male_s202": {
+    "file": "designed_male_s202.wav",
+    "ref_text": "All primary systems are functioning within normal parameters. Long range communications are standing by. State the nature of your request, and I will route it to the appropriate subsystem.",
+    "origin": "VoxCPM2 q8_0 voice design, seed 202, instruction: 'A calm adult male voice, deep and measured, slightly synthetic, even-paced, neutral affect, like a computer assistant'",
+    "sample_rate": 48000
+  },
+  "lcars_demo": {
+    "file": "lcars_demo.wav",
+    "ref_text": "Accessing library computer data. Please do not address this unit in that manner. Incoming transmission.",
+    "origin": "Concatenation of three computer voice clips from Star Trek: The Next Generation (tng/*_clean.mp3), 0.35 s gaps. The audio is copyrighted by its owners and is included for personal, non-commercial use only. VoiceManager is not affiliated with or endorsed by the owners of Star Trek.",
+    "sample_rate": 24000
+  },
+  "designed_gm_02": {
+    "file": "designed_gm_02.wav",
+    "ref_text": "The heavy oak doors creak open into the damp hall, and deep within the darkness, a pair of glowing amber eyes slowly ignites.",
+    "origin": "Breeze-TTS 2 q8_0 voice design, seed 501, instruction: 'A man in his late thirties with a deep, warm, dynamic voice and a natural storytelling flair. He speaks at a deliberate pace with high expressive variance, using sharp enunciation for fantasy terms and dramatic pauses before key reveals. The tone shifts fluidly between suspenseful whispers and resonant authority. Close-miked in a quiet room, no reverb.'",
+    "sample_rate": 24000
+  }
+}
