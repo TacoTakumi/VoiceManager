@@ -40,7 +40,7 @@ async def main(path: str) -> None:
           f"{len(frames)} frames @ {FRAME_MS}ms")
 
     token = os.environ["VOICEMANAGER_TOKEN"]
-    async with VoiceManagerClient(host="localhost", port=8000, token=token) as client:
+    async with VoiceManagerClient(host="localhost", port=8255, token=token) as client:
         print(f"connected session={client.session_id} stt_engine={client.stt_engine}")
         t0 = time.monotonic()
 

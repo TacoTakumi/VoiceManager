@@ -24,7 +24,7 @@ import websockets
 
 TOKEN = sys.argv[1]
 CLIP = sys.argv[2]
-PORT = sys.argv[3] if len(sys.argv) > 3 else "8000"
+PORT = sys.argv[3] if len(sys.argv) > 3 else "8255"
 URL = f"ws://localhost:{PORT}/ws/stream"
 
 CHUNK_MS = 100

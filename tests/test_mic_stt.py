@@ -280,7 +280,7 @@ async def main():
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Endpoint-aware frame log: show segment_index/endpoint/is_final per frame")
     parser.add_argument("--host", default="localhost", help="Server host (default localhost)")
-    parser.add_argument("--port", type=int, default=8000, help="Server port (default 8000)")
+    parser.add_argument("--port", type=int, default=8255, help="Server port (default 8255)")
     args = parser.parse_args()
 
     token = os.environ["VOICEMANAGER_TOKEN"]

@@ -4,6 +4,14 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0]
+
+### Changed
+
+- **Breaking:** the default port is now 8255 (TALK on a phone keypad), not
+  8000. Port 8000 is the default of many other servers. To keep the old port,
+  set `VM_PORT=8000` in `.env` and pass `port=8000` to `VoiceManagerClient`.
+
 ## [0.1.0] - 2026-10-18
 
 First public release. Developed privately since March 2026.

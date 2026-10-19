@@ -15,7 +15,7 @@ reason "complete" (the WS face of the sidecar's TTS_DONE), with no error frame
 and no WS close in between. The TTS sidecar process must still be alive after
 the last request. Prints a paste-ready block; exit 0 on pass, 1 on fail.
 
-Usage: VOICEMANAGER_TOKEN=vmp_... BZ_PORT=8000 BZ_GPU=3 python scripts/audiocpp_breeze_probe.py
+Usage: VOICEMANAGER_TOKEN=vmp_... BZ_PORT=8255 BZ_GPU=3 python scripts/audiocpp_breeze_probe.py
 """
 import asyncio
 import json
@@ -27,7 +27,7 @@ import wave
 
 import websockets
 
-PORT = int(os.environ.get("BZ_PORT", "8000"))
+PORT = int(os.environ.get("BZ_PORT", "8255"))
 TOKEN = os.environ["VOICEMANAGER_TOKEN"]
 URL = f"ws://localhost:{PORT}/ws/stream"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}

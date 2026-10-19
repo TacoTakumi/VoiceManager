@@ -118,7 +118,7 @@ class Settings(BaseSettings):
         dotenv_filtering="match_prefix",
     )
     host: str = Field(default="0.0.0.0")         # VM_HOST
-    port: int = Field(default=8000)              # VM_PORT
+    port: int = Field(default=8255)              # VM_PORT
     # Auth store file; blank means the XDG state dir (see resolve_db_path).
     db_path: str = Field(default="")             # VM_DB_PATH
     whisper_model: str = Field(default="tiny")   # VM_WHISPER_MODEL

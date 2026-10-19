@@ -9,7 +9,7 @@ REST call, and never puts the token in a URL.
 
 Usage::
 
-    async with VoiceManagerClient(host="localhost", port=8000, token="secret") as client:
+    async with VoiceManagerClient(host="localhost", port=8255, token="secret") as client:
         results = await client.transcribe_file("audio.wav")
         pcm, rate = await client.synthesize_tts("Hello world")
         client.save_tts_to_file(pcm, "output.wav", rate)
@@ -75,7 +75,7 @@ class VoiceManagerClient:
     def __init__(
         self,
         host: str = "localhost",
-        port: int = 8000,
+        port: int = 8255,
         token: str = "",
         max_retries: int = 3,
         use_ssl: bool = False,

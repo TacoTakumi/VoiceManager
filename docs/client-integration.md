@@ -116,7 +116,7 @@ and on every authenticated REST call:
 
 ```text
 GET /ws/stream HTTP/1.1
-Host: voice.example:8000
+Host: voice.example:8255
 Upgrade: websocket
 Connection: Upgrade
 Authorization: Bearer vmp_...
@@ -169,7 +169,7 @@ token in the `Authorization: Bearer` header (see [Authentication](#authenticatio
 ```python
 from voicemanager.client import VoiceManagerClient, AuthenticationError
 
-client = VoiceManagerClient(host="localhost", port=8000, token="vmp_...")
+client = VoiceManagerClient(host="localhost", port=8255, token="vmp_...")
 try:
     async with client:
         ...  # steps 2-7 happen inside this scope
@@ -991,7 +991,7 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 
 | Symbol | Signature | Purpose |
 |---|---|---|
-| `VoiceManagerClient` | `(host="localhost", port=8000, token="", max_retries=3, use_ssl=False)` | Construct a client. No socket opens until you enter the context manager. |
+| `VoiceManagerClient` | `(host="localhost", port=8255, token="", max_retries=3, use_ssl=False)` | Construct a client. No socket opens until you enter the context manager. |
 | `async with client:` | `__aenter__` / `__aexit__` | Opens the WebSocket, reads the `ready` handshake, starts the single reader task; closes the socket and drains queues on exit. |
 
 ### Speech to text
@@ -1100,7 +1100,7 @@ timeouts that end a session. Defaults are the server's built-in values.
 |---|---|---|
 | `VM_DB_PATH` | `$XDG_STATE_HOME/voicemanager/state.db` (else `~/.local/state/voicemanager/state.db`) | The SQLite file that holds users and tokens. The CLI and the server read the same setting, so a token made with `voicemanager user token add` works on the server that uses the same path. |
 | `VM_HOST` | `0.0.0.0` | Bind address; the host the client points at. |
-| `VM_PORT` | `8000` | Port the client connects to (`/ws/stream`, REST). |
+| `VM_PORT` | `8255` | Port the client connects to (`/ws/stream`, REST). |
 | `VM_STT_ENGINE` | `whisper` | Active STT engine (`whisper`, `qwen`, `nemotron`, or `audiocpp`); only `nemotron` drives the [endpoint-hold path](#the-endpoint-hold-consumption-model). |
 | `VM_AUDIOCPP_MODEL_TASK` | `nemotron-3.5-asr-streaming` | Which model the `audiocpp` engine serves; selects the transcription cadence a client sees (both registered ASR model_tasks, `nemotron-3.5-asr-streaming` and `voxtral-mini-4b-realtime-asr-streaming`, stream growing partials mid-speech). `VM_AUDIOCPP_MODEL` must point at the matching GGUF. |
 | `VM_TTS_ENGINE` | `openvoice` | Active TTS engine (`openvoice`, `vibevoice`, or `audiocpp`); voice cloning is OpenVoice-only, handshake `available_voices` lists the VibeVoice or audiocpp presets, audiocpp serves [named presets](#the-audiocpp-tts-engine-presets-per-model-sample-rate-one-request-batching) at its model_task's rate (48 kHz dots/voxcpm2, 24 kHz breeze). |

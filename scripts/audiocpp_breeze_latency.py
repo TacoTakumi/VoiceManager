@@ -18,7 +18,7 @@ Measures and prints, each line stamped with the wall-clock time:
     cancel -> audio_end(reason=cancelled) ack, PCM bytes after the ack, and
     cancel -> next request first audio. The worst (max) of each is reported.
 
-Usage: VOICEMANAGER_TOKEN=vmp_... BZ_PORT=8000 BZ_GPU=3 BZ_SPEECH_WAV=/tmp/speech16k.wav \
+Usage: VOICEMANAGER_TOKEN=vmp_... BZ_PORT=8255 BZ_GPU=3 BZ_SPEECH_WAV=/tmp/speech16k.wav \
     python scripts/audiocpp_breeze_latency.py
 """
 import asyncio
@@ -32,7 +32,7 @@ from datetime import datetime
 
 import websockets
 
-PORT = int(os.environ.get("BZ_PORT", "8000"))
+PORT = int(os.environ.get("BZ_PORT", "8255"))
 TOKEN = os.environ["VOICEMANAGER_TOKEN"]
 URL = f"ws://localhost:{PORT}/ws/stream"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
