@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoiceManager - give your agent a voice</title>
+<meta name="description" content="VoiceManager is a local speech server for voice agents: streaming speech-to-text and text-to-speech at the same time over one WebSocket.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+/* Same tokens as the web UI (src/voicemanager/web/static/viewer.css), but the
+   page follows the browser's light or dark setting. */
+:root {
+  color-scheme: light dark;
+  --bg:           light-dark(#ffffff, #17191c);
+  --bg-muted:     light-dark(#f6f7f9, #1f2226);
+  --bg-header:    light-dark(#fbfbfc, #1b1d20);
+  --bg-hover:     light-dark(#f0f2f5, #24282d);
+  --fg:           light-dark(#1f2329, #dde0e5);
+  --fg-muted:     light-dark(#5c6570, #9aa1ab);
+  --border:       light-dark(#d5d9de, #353a41);
+  --border-muted: light-dark(#e4e7eb, #2b2f35);
+  --accent:       light-dark(#b45309, #f5a524);
+  --on-accent:    light-dark(#ffffff, #111417);
+}
+:root {
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --neutral-soft: color-mix(in srgb, var(--fg-muted) 16%, transparent);
+  --radius: 6px;
+  --gutter: 32px;
+  --ui: system-ui, -apple-system, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* ---------- Frame ---------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+html { scroll-behavior: smooth; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.6 var(--ui); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+code, pre { font-family: var(--mono); }
+p { margin: 0 0 12px; }
+.container { max-width: 1180px; margin: 0 auto; padding: 0 var(--gutter); }
+@media (max-width: 1200px) { :root { --gutter: 24px; } }
+@media (max-width: 767px) { :root { --gutter: 16px; } }
+
+/* ---------- Header (as the web UI) ---------- */
+.site-header { background: var(--bg-header); border-top: 3px solid var(--accent);
+  border-bottom: 1px solid var(--border); }
+.site-header .container { display: flex; align-items: center; gap: 16px; min-height: 56px;
+  flex-wrap: wrap; padding-block: 8px; }
+.brand { display: flex; align-items: center; gap: 8px; color: var(--fg); font-weight: 600;
+  font-size: 16px; letter-spacing: -0.01em; }
+.brand:hover { text-decoration: none; }
+.brand svg { width: 24px; height: 24px; color: var(--accent); flex: none; }
+.header-links { margin-left: auto; display: flex; gap: 4px; font-size: 14px; }
+.header-links a { color: var(--fg); padding: 4px 10px; border-radius: var(--radius); }
+.header-links a:hover { background: var(--bg-hover); text-decoration: none; }
+.header-links .gh { display: inline-flex; align-items: center; gap: 6px; }
+.header-links .gh svg { width: 16px; height: 16px; flex: none; }
+.tabs-row { padding-block: 0; }
+.tabs { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: thin; margin-bottom: -1px; font-size: 14px; }
+.tabs a { padding: 8px 10px 9px; color: var(--fg); white-space: nowrap;
+  border-bottom: 2px solid transparent; border-radius: var(--radius) var(--radius) 0 0; }
+.tabs a:hover { text-decoration: none; background: var(--bg-hover); }
+.tabs a:first-child { font-weight: 600; border-bottom-color: var(--accent); }
+
+/* ---------- Buttons ---------- */
+.btn { display: inline-flex; align-items: center; font: inherit; font-size: 15px; font-weight: 500;
+  color: var(--fg); background: var(--bg-muted); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 7px 16px; min-height: 38px; cursor: pointer; }
+.btn:hover { background: var(--bg-hover); text-decoration: none; }
+.btn-accent,
+.btn-accent:hover { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn-small { font-size: 12px; padding: 2px 9px; min-height: 0; }
+
+/* ---------- Box with rows ---------- */
+.box { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); font-size: 14px; }
+.box-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 16px; background: var(--bg-muted); border-bottom: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0; font-weight: 600; }
+.box-head small { font-weight: 400; color: var(--fg-muted); font-size: 13px; }
+.file-head { font-family: var(--mono); font-size: 12px; font-weight: 400; color: var(--fg-muted); }
+.box pre { margin: 0; padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.6; }
+.rows { list-style: none; margin: 0; padding: 0; }
+.rows li { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 4px 12px;
+  padding: 14px 16px; border-top: 1px solid var(--border-muted); }
+.rows li:first-child { border-top: 0; }
+.rows .step { display: inline-flex; justify-content: center; align-items: center; width: 24px; height: 24px;
+  border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  font-size: 12px; font-variant-numeric: tabular-nums; }
+.rows strong { display: block; font-weight: 600; font-size: 15px; }
+.rows p { margin: 2px 0 0; color: var(--fg-muted); }
+.rows.plain li { display: block; }
+.rows strong .topic-tag { margin-left: 6px; font-weight: 400; vertical-align: 1px; }
+.topic-tag { font-size: 12px; color: var(--fg-muted); border: 1px solid var(--border); border-radius: 999px;
+  padding: 0 8px; white-space: nowrap; }
+.topic-tag.default { color: var(--accent); border-color: var(--accent); }
+
+/* ---------- Hero ---------- */
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 48px;
+  align-items: center; padding: 64px 0 72px; }
+.hero h1 { font-size: 46px; line-height: 1.1; font-weight: 650; letter-spacing: -0.025em;
+  margin: 0 0 20px; text-wrap: balance; }
+.lead { font-size: 19px; line-height: 1.55; color: var(--fg-muted); max-width: 34em; margin-bottom: 28px; }
+.lead strong { color: var(--fg); font-weight: 600; }
+.install { display: flex; align-items: center; gap: 8px; margin-bottom: 20px;
+  padding: 6px 6px 6px 14px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-muted); font-family: var(--mono); font-size: 13px; }
+.install code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; }
+.install code::before { content: "$ "; color: var(--fg-muted); }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.note { font-size: 13px; color: var(--fg-muted); margin-top: 16px; }
+
+/* The frame mock: one socket carries a turn in both directions. */
+.frames { margin: 0; padding: 14px 16px; list-style: none; font-family: var(--mono); font-size: 12.5px;
+  line-height: 1.75; background: var(--accent-soft); overflow-x: auto; }
+.frames li { white-space: nowrap; }
+.frames .d { display: inline-block; width: 2.2em; font-weight: 600; }
+.frames .up .d { color: var(--accent); }
+.frames .down .d { color: var(--fg-muted); }
+.frames .t { color: var(--fg); font-weight: 600; }
+.frames .v { color: var(--fg-muted); }
+.frames .gap { height: 6px; }
+.mock-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 10px 16px; font-size: 12px;
+  color: var(--fg-muted); border-bottom: 1px solid var(--border-muted); }
+.mock-legend b { font-family: var(--mono); font-size: 14px; }
+.mock-legend .up { color: var(--accent); }
+.after { padding: 12px 16px; color: var(--fg-muted); font-size: 13px; margin: 0; }
+@media (prefers-reduced-motion: no-preference) {
+  /* "backwards" hides each line only while its animation waits to start, so a
+     browser that does not animate still shows the lines. */
+  .frames li { animation: show 0.35s ease-out backwards; }
+  .frames li:nth-child(1) { animation-delay: 0.4s; }
+  .frames li:nth-child(2) { animation-delay: 0.6s; }
+  .frames li:nth-child(3) { animation-delay: 0.8s; }
+  .frames li:nth-child(4) { animation-delay: 1.0s; }
+  .frames li:nth-child(5) { animation-delay: 1.3s; }
+  .frames li:nth-child(6) { animation-delay: 1.5s; }
+  .frames li:nth-child(7) { animation-delay: 1.7s; }
+  .frames li:nth-child(8) { animation-delay: 1.9s; }
+  .frames li:nth-child(9) { animation-delay: 2.1s; }
+  .frames li:nth-child(10) { animation-delay: 2.5s; }
+  .frames li:nth-child(11) { animation-delay: 2.7s; }
+  @keyframes show { from { opacity: 0; transform: translateY(3px); } }
+}
+
+/* ---------- Sections ---------- */
+section { padding: 56px 0; border-top: 1px solid var(--border-muted); }
+section h2 { font-size: 28px; line-height: 1.2; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 10px; }
+.section-sub { color: var(--fg-muted); font-size: 17px; max-width: 40em; margin-bottom: 28px; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; align-items: start; }
+.points { display: grid; gap: 22px; }
+.points h3 { font-size: 17px; font-weight: 600; margin: 0 0 4px; }
+.points p { margin: 0; color: var(--fg-muted); }
+.points code, .section-sub code, .rows code, .say code { font-size: 0.9em; padding: 1px 5px; border-radius: 4px;
+  background: var(--neutral-soft); color: var(--fg); }
+.py .k { color: var(--accent); }
+.py .c { color: var(--fg-muted); }
+.py .s { color: var(--fg); font-style: italic; }
+
+/* Get started */
+.say { margin: 20px 0 0; padding: 14px 18px; border-left: 3px solid var(--accent);
+  background: var(--bg-muted); border-radius: 0 var(--radius) var(--radius) 0; }
+.say p { margin: 0; overflow-wrap: anywhere; }
+.say .who { display: block; font-size: 13px; color: var(--fg-muted); margin-bottom: 4px; }
+.cmd .m { color: var(--fg-muted); }
+
+/* Footer */
+footer { border-top: 1px solid var(--border); background: var(--bg-header); font-size: 14px; color: var(--fg-muted); }
+footer .container { display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between; padding-block: 24px; }
+footer nav { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+
+@media (max-width: 1011px) {
+  .hero { grid-template-columns: minmax(0, 1fr); gap: 36px; padding: 40px 0 48px; }
+  .split { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+}
+@media (max-width: 767px) {
+  .hero h1 { font-size: 34px; }
+  .lead { font-size: 17px; }
+  section { padding: 40px 0; }
+  section h2 { font-size: 24px; }
+  .header-links a.hide-narrow { display: none; }
+}
+</style>
+</head>
+<body>
+<header class="site-header">
+<div class="container">
+<a class="brand" href="#">
+<svg viewBox="0 0 32 32" aria-hidden="true" fill="currentColor">
+<rect x="2" y="14" width="4" height="4" rx="1"/>
+<rect x="8" y="10" width="4" height="12" rx="1"/>
+<rect x="14" y="6" width="4" height="20" rx="1"/>
+<rect x="20" y="10" width="4" height="12" rx="1"/>
+<rect x="26" y="14" width="4" height="4" rx="1"/>
+</svg>
+VoiceManager
+</a>
+<nav class="header-links" aria-label="Project links">
+<a class="hide-narrow" href="https://github.com/TacoTakumi/VoiceManager/blob/main/docs/client-integration.md">Protocol</a>
+<a class="gh" href="https://github.com/TacoTakumi/VoiceManager"><svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>GitHub</a>
+</nav>
+</div>
+<div class="container tabs-row">
+<nav class="tabs" aria-label="Sections">
+<a href="#top">Overview</a>
+<a href="#how">How it works</a>
+<a href="#engines">Engines</a>
+<a href="#client">Python client</a>
+<a href="#start">Get started</a>
+<a href="https://github.com/TacoTakumi/VoiceManager#readme">Docs</a>
+</nav>
+</div>
+</header>
+
+<main class="container" id="top">
+<div class="hero">
+<div>
+<h1>Give your agent a voice.</h1>
+<p class="lead">VoiceManager is a local speech server for voice agents. <strong>One WebSocket carries speech-to-text and text-to-speech at the same time</strong>, so your agent listens while it talks. Stream LLM tokens in, and the speech starts before the reply is complete. When the person talks over it, the agent stops at once.</p>
+<div class="install">
+<code id="install-cmd">git clone https://github.com/TacoTakumi/VoiceManager</code>
+<button class="btn btn-small" type="button" data-copy="install-cmd">Copy</button>
+</div>
+<div class="actions">
+<a class="btn btn-accent" href="#start">Get started</a>
+<a class="btn" href="https://github.com/TacoTakumi/VoiceManager">View on GitHub</a>
+</div>
+<p class="note">Free and open source (MIT). Python 3.12 on Linux. Runs on your own GPU. Whisper and OpenVoice also run on a CPU.</p>
+</div>
+
+<div class="box" aria-label="Example: one conversation turn on one WebSocket">
+<div class="box-head">One turn, one socket <small>Example</small></div>
+<div class="mock-legend"><span><b class="up">&rarr;</b> your agent to VoiceManager</span><span><b>&larr;</b> VoiceManager to your agent</span></div>
+<ol class="frames">
+<li class="up"><span class="d">&rarr;</span><span class="t">binary</span> <span class="v">16 kHz PCM from the microphone</span></li>
+<li class="down"><span class="d">&larr;</span><span class="t">transcription</span> <span class="v">"will it rain" is_final=false</span></li>
+<li class="down"><span class="d">&larr;</span><span class="t">transcription</span> <span class="v">"Will it rain tomorrow?" is_final=true</span></li>
+<li class="up"><span class="d">&rarr;</span><span class="t">tts_stream</span> <span class="v">"No, tomorrow"</span></li>
+<li class="up"><span class="d">&rarr;</span><span class="t">tts_stream</span> <span class="v">" looks dry."</span></li>
+<li class="down"><span class="d">&larr;</span><span class="t">audio_start</span> <span class="v">sample_rate=24000</span></li>
+<li class="down"><span class="d">&larr;</span><span class="t">binary</span> <span class="v">PCM, playing while text still arrives</span></li>
+<li class="up"><span class="d">&rarr;</span><span class="t">tts_stream</span> <span class="v">" Rain comes on"</span></li>
+<li class="up"><span class="d">&rarr;</span><span class="t">binary</span> <span class="v">the person starts to talk</span></li>
+<li class="up"><span class="d">&rarr;</span><span class="t">tts_cancel</span> <span class="v">barge-in</span></li>
+<li class="down"><span class="d">&larr;</span><span class="t">audio_end</span> <span class="v">reason="cancelled", no more audio</span></li>
+</ol>
+<p class="after">The microphone keeps streaming the whole time. STT and TTS share the socket, so the agent hears the interruption while it speaks.</p>
+</div>
+</div>
+
+<section id="how">
+<h2>Built for conversation</h2>
+<p class="section-sub">Batch STT and TTS make a voice agent wait at every step. VoiceManager streams both directions, so a reply can start while the person is still finishing a sentence.</p>
+<div class="split">
+<div class="box">
+<div class="box-head">A conversation turn</div>
+<ol class="rows">
+<li><span class="step">1</span><div><strong>Hear it as it is said</strong><p>Send audio as you capture it. Interim transcripts arrive while the person speaks, and a final transcript arrives when they stop. The default engine finds the end of speech with Silero VAD, also when the microphone never pauses.</p></div></li>
+<li><span class="step">2</span><div><strong>Speak before the reply is complete</strong><p>Forward every LLM token with <code>tts_stream</code>. The server finds the sentence boundaries and starts the audio. <code>flush</code> speaks the buffered text now.</p></div></li>
+<li><span class="step">3</span><div><strong>Stop when interrupted</strong><p><code>tts_cancel</code> ends a reply at once: one <code>audio_end</code> with <code>reason: "cancelled"</code>, and no more audio for that request.</p></div></li>
+<li><span class="step">4</span><div><strong>Keep the turns apart</strong><p><code>turn_start</code> opens a new turn, and each transcript carries its <code>turn_id</code>. Late transcripts from a turn you ended are easy to drop.</p></div></li>
+</ol>
+</div>
+<div class="points">
+<div><h3>Fast first audio</h3><p>With the default audio.cpp engine, the first TTS audio of a warm session arrives in about 110-170 ms with Breeze-TTS 2, and 50-85 ms with Qwen3-TTS.</p></div>
+<div><h3>Any language, one contract</h3><p>The WebSocket protocol is the contract, and <a href="https://github.com/TacoTakumi/VoiceManager/blob/main/docs/client-integration.md">it is documented</a> frame by frame. The Python client ships with the server. HermesConsole talks to it from Kotlin.</p></div>
+<div><h3>Users, tokens and voices</h3><p>Each client gets its own bearer token, and each token can have its own voice. Manage them with the <code>voicemanager</code> command or a small web UI that uses no JavaScript.</p></div>
+<div><h3>On your own hardware</h3><p>Audio and text stay on your machine. Each session runs its audio.cpp engine in its own sidecar process, so a crash ends one session, not the server.</p></div>
+</div>
+</div>
+</section>
+
+<section id="engines">
+<h2>Pick your engines</h2>
+<p class="section-sub">Choose one STT engine and one TTS engine in <code>.env</code>. Clients see the same protocol whichever engines run behind it.</p>
+<div class="split">
+<div class="box">
+<div class="box-head">Speech to text <small><code>VM_STT_ENGINE</code></small></div>
+<ul class="rows plain">
+<li><div><strong>audio.cpp <span class="topic-tag default">default</span></strong><p>Nemotron-3.5 ASR streaming or Voxtral Realtime, as GGUF models in a native sidecar. The lowest latency.</p></div></li>
+<li><div><strong>faster-whisper</strong><p>With Silero VAD. Runs on a CPU.</p></div></li>
+<li><div><strong>NeMo Nemotron</strong><p>Cache-aware streaming through NVIDIA NeMo.</p></div></li>
+<li><div><strong>Qwen3-ASR</strong><p>Interim transcripts through vLLM.</p></div></li>
+</ul>
+</div>
+<div class="box">
+<div class="box-head">Text to speech <small><code>VM_TTS_ENGINE</code></small></div>
+<ul class="rows plain">
+<li><div><strong>audio.cpp <span class="topic-tag default">default</span></strong><p>Breeze-TTS 2, Qwen3-TTS, dots.tts or VoxCPM2, with preset voices from <code>voices/designed/</code>.</p></div></li>
+<li><div><strong>OpenVoice v2</strong><p>With MeloTTS. The only engine that clones a voice from an uploaded sample.</p></div></li>
+<li><div><strong>VibeVoice</strong><p>VibeVoice-Realtime-0.5B with preset voices.</p></div></li>
+</ul>
+</div>
+</div>
+</section>
+
+<section id="client">
+<h2>The Python client</h2>
+<p class="section-sub"><code>voicemanager.client</code> wraps the protocol. One <code>async with</code> block holds one socket, and every STT and TTS call shares it.</p>
+<div class="split">
+<div class="box">
+<div class="box-head"><span class="file-head">agent.py</span></div>
+<pre class="py"><span class="k">from</span> voicemanager.client <span class="k">import</span> VoiceManagerClient
+
+<span class="k">async with</span> VoiceManagerClient(host=<span class="s">"voice.local"</span>, token=<span class="s">"vmp_..."</span>) <span class="k">as</span> vm:
+    <span class="c"># Listen: interim and final transcripts as they arrive</span>
+    <span class="k">async for</span> t <span class="k">in</span> vm.stream_stt_live(mic_chunks()):
+        <span class="k">if</span> t[<span class="s">"is_final"</span>]:
+            question = t[<span class="s">"text"</span>]
+            <span class="k">break</span>
+
+    <span class="c"># Speak: send LLM tokens in, play PCM out</span>
+    <span class="k">async for</span> pcm <span class="k">in</span> vm.stream_tts_live(llm_tokens(question)):
+        speaker.write(pcm)</pre>
+</div>
+<div class="points">
+<div><h3>Stream or batch</h3><p><code>stream_stt_live</code> and <code>stream_tts_live</code> yield results as they arrive. <code>transcribe_file</code> and <code>synthesize_tts</code> return the whole result at once.</p></div>
+<div><h3>Turn taking built in</h3><p><code>cancel_tts</code>, <code>flush_tts</code> and <code>turn_start</code> map one to one to the protocol frames for barge-in, flush and turns.</p></div>
+<div><h3>Pick a voice per request</h3><p>Pass <code>voice=</code> to any TTS call. Without it, the server uses the voice of the token, then the server default.</p></div>
+</div>
+</div>
+</section>
+
+<section id="start">
+<h2>Get started</h2>
+<p class="section-sub">Install the server, build the audio.cpp engine for the default models, make a token, and start it. The README has the full steps, including the other engines.</p>
+<div class="split">
+<div>
+<div class="box">
+<div class="box-head">Terminal <button class="btn btn-small" type="button" data-copy="setup-cmds">Copy</button></div>
+<pre class="cmd" id="setup-cmds">git clone https://github.com/TacoTakumi/VoiceManager
+cd VoiceManager
+python3.12 -m venv venv &amp;&amp; source venv/bin/activate
+pip install -r requirements.txt &amp;&amp; pip install -e .
+cp .env.example .env
+<span class="m"># build audio.cpp and the sidecar (README, "audio.cpp engine")</span>
+python setup_models.py
+voicemanager user add me
+voicemanager user token add me my-agent
+voicemanager serve</pre>
+</div>
+<div class="say">
+<span class="who">Or let your agent do the setup. Point it at the repo and ask:</span>
+<p>Set up VoiceManager from <a href="https://github.com/TacoTakumi/VoiceManager">https://github.com/TacoTakumi/VoiceManager</a> on this machine.</p>
+</div>
+</div>
+<div class="points">
+<div><h3>What you need</h3><p>Linux and Python 3.12. An NVIDIA GPU with CUDA for real-time speed. For the default engine, CMake, Ninja, a C++ compiler and the CUDA toolkit.</p></div>
+<div><h3>Connect</h3><p>Open <code>ws://&lt;host&gt;:8000/ws/stream</code> with the header <code>Authorization: Bearer &lt;token&gt;</code>. The first frame tells you the engines, the voices and the default voice.</p></div>
+<div><h3>Check the model licenses</h3><p>The code is MIT. Each model has its own license. Breeze-TTS 2, the default voice model, is for non-commercial use.</p></div>
+</div>
+</div>
+</section>
+
+<section id="hermesconsole">
+<div class="split">
+<div>
+<h2>Pairs with HermesConsole</h2>
+<p class="section-sub">HermesConsole is an LCARS-style voice console for an Android wall tablet. Say "hey computer", ask a question, and it streams your speech through VoiceManager, sends the turn to a Hermes agent and speaks the reply back sentence by sentence.</p>
+<div class="actions">
+<a class="btn" href="https://github.com/TacoTakumi/HermesConsole">HermesConsole on GitHub</a>
+</div>
+</div>
+<div class="box">
+<div class="box-head">What HermesConsole uses</div>
+<ul class="rows plain">
+<li><div><strong>Streaming STT</strong><p>After the wake word, the tablet streams 16 kHz audio and gets the transcripts back on the same socket.</p></div></li>
+<li><div><strong>Streaming TTS</strong><p>The agent's reply goes to <code>tts_stream</code> as it arrives, so the console speaks while the agent still writes.</p></div></li>
+<li><div><strong>The protocol, from Kotlin</strong><p>It uses no Python client. The documented WebSocket frames are all it needs.</p></div></li>
+</ul>
+</div>
+</div>
+</section>
+</main>
+
+<footer>
+<div class="container">
+<span>VoiceManager is free software under the MIT License.</span>
+<nav aria-label="Footer">
+<a href="https://github.com/TacoTakumi/VoiceManager">GitHub</a>
+<a href="https://github.com/TacoTakumi/VoiceManager#readme">Docs</a>
+<a href="https://github.com/TacoTakumi/VoiceManager/blob/main/docs/client-integration.md">Protocol</a>
+<a href="https://github.com/TacoTakumi/HermesConsole">HermesConsole</a>
+</nav>
+</div>
+</footer>
+
+<script>
+document.querySelectorAll("[data-copy]").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var text = document.getElementById(btn.dataset.copy).textContent;
+    navigator.clipboard.writeText(text).then(function () {
+      btn.textContent = "Copied";
+      setTimeout(function () { btn.textContent = "Copy"; }, 1500);
+    });
+  });
+});
+</script>
+</body>
+</html>

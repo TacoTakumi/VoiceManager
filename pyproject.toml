@@ -9,11 +9,19 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 
+[project.urls]
+Homepage = "https://tacotakumi.github.io/VoiceManager/"
+Repository = "https://github.com/TacoTakumi/VoiceManager"
+
 [project.scripts]
 voicemanager = "voicemanager.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/voicemanager"]
+
+# The website and its deploy workflow are not package source.
+[tool.hatch.build.targets.sdist]
+exclude = ["site", ".github"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
