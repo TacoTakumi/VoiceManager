@@ -36,6 +36,53 @@ SYSTEM = (
 )
 
 
+class TickSlicer:
+    """Turns VoiceManager's streaming transcription frames into one string per tick.
+
+    The server sends cumulative frames: each interim carries the whole transcript so far
+    of the current utterance (its ``segment_index``), the final carries the committed
+    text of that segment, and on silence nothing arrives at all. The model expects only
+    the words new in each 0.6 s window, or ``NOVOICE``. So the client keeps the latest
+    frame per segment, and each tick sends the words beyond those already sent.
+
+    Sent words are never taken back, because the model's history only grows. When the
+    STT revises words already sent (or shrinks the text), the tick counts one revision
+    for that segment and sends only the words past the already-sent count.
+    """
+
+    def __init__(self) -> None:
+        self.revisions = 0
+        self.last_revised = False
+        self._latest: dict[int, str] = {}
+        # Per segment: the words treated as sent. After a revision this holds the new
+        # text's prefix, so the same revision is not counted again on later frames.
+        self._sent: dict[int, list[str]] = {}
+
+    def feed(self, frame: dict) -> None:
+        """Store one transcription frame; only the latest per segment counts per tick."""
+        self._latest[frame.get("segment_index", 0)] = frame.get("text", "")
+
+    def tick(self) -> str:
+        """Return the new words heard since the last tick, or ``NOVOICE``, and reset."""
+        emitted: list[str] = []
+        self.last_revised = False
+        for seg in sorted(self._latest):
+            words = self._latest[seg].split()
+            sent = self._sent.get(seg, [])
+            n = len(sent)
+            if len(words) < n or words[:n] != sent:
+                self.revisions += 1
+                self.last_revised = True
+                logger.debug("segment %d revised: sent=%r now=%r", seg, sent, words)
+            if len(words) > n:
+                emitted.extend(words[n:])
+                self._sent[seg] = words
+            elif len(words) == n:
+                self._sent[seg] = words
+        self._latest.clear()
+        return " ".join(emitted) if emitted else NOVOICE
+
+
 def build_prompt(history: list[tuple[str, str]], heard: str) -> str:
     """Raw ChatML for one tick: system, every past (role, content), the new user turn.
 
