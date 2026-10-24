@@ -18,6 +18,8 @@ import logging
 import math
 import time
 import urllib.request
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -191,6 +193,88 @@ def decide(engine: CompletionEngine, history: list[tuple[str, str]], heard: str,
     logger.debug("heard=%r said=%r p_listen=%.2f requests=%d %.0f ms",
                  heard, said, p_listen, requests, turn_ms)
     return TickResult(said=said, p_listen=p_listen, turn_ms=turn_ms, requests=requests)
+
+
+class TTSSink(Protocol):
+    """Where the orchestrator sends speech: VoiceManager's streaming TTS requests.
+
+    ``send_text`` appends to the request (``tts_stream``), ``flush`` synthesizes what is
+    buffered and keeps it open, ``done`` ends it and ``cancel`` stops it (``tts_cancel``).
+    """
+
+    async def send_text(self, request_id: str, text: str) -> None:
+        """Append text to the request, opening it on first use."""
+        ...
+
+    async def flush(self, request_id: str) -> None:
+        """Synthesize the buffered text now and keep the request open."""
+        ...
+
+    async def done(self, request_id: str) -> None:
+        """End the request; the server sends ``audio_end`` after the last audio."""
+        ...
+
+    async def cancel(self, request_id: str) -> None:
+        """Stop the request and drop any audio not yet sent."""
+        ...
+
+
+class Player(Protocol):
+    """The local audio output that plays the TTS audio."""
+
+    def is_playing(self) -> bool:
+        """True while audio is playing or queued."""
+        ...
+
+    def clear(self) -> None:
+        """Stop playback and drop all queued audio."""
+        ...
+
+
+class TTSOrchestrator:
+    """Turns each tick's decision into VoiceManager streaming TTS calls.
+
+    One request per assistant utterance, with a flush per speaking tick, so the audio
+    of each tick's words starts within a tick. The first LISTEN after speech ends the
+    request with ``done``. The model is never told what audio is playing, so the client
+    stops playback itself when the user talks over it: user words, a LISTEN and audio
+    still playing cancel the request and clear the player.
+    """
+
+    def __init__(self, sink: TTSSink, player: Player,
+                 new_id: Callable[[], str] = lambda: str(uuid.uuid4())):
+        self.sink = sink
+        self.player = player
+        self.new_id = new_id
+        self.request_id: str | None = None  # the current request, or the last one
+        self.open = False  # request_id still takes text (no done or cancel sent)
+        self.live = False  # request_id may still have audio to cancel
+        self.cutins = 0
+
+    async def on_tick(self, heard: str, said: str) -> None:
+        """Send the TTS calls for one tick: what was heard and what the model said."""
+        if said != LISTEN:
+            if self.open:
+                text = f" {said}"
+            else:
+                self.request_id, self.open, self.live = self.new_id(), True, True
+                text = said
+            await self.sink.send_text(self.request_id, text)
+            await self.sink.flush(self.request_id)
+            return
+        user_spoke = bool(heard) and heard != NOVOICE
+        if user_spoke and self.player.is_playing():
+            # After done the server may still be sending audio for the request, so it
+            # is cancelled too, not only an open one.
+            if self.live:
+                await self.sink.cancel(self.request_id)
+            self.open = self.live = False
+            self.player.clear()
+            self.cutins += 1
+            logger.debug("cut-in on %s: heard=%r", self.request_id, heard)
+        elif self.open:
+            await self.sink.done(self.request_id)
+            self.open = False
 
 
 def main() -> None:
