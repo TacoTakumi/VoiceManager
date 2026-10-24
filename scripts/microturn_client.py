@@ -82,8 +82,10 @@ class TickSlicer:
         self.revisions = 0
         self.last_revised = False
         self._latest: dict[int, str] = {}
-        # Per segment: the words treated as sent. After a revision this holds the new
-        # text's prefix, so the same revision is not counted again on later frames.
+        # Per segment: how many words were sent, and the latest version of those words.
+        # After a revision or a shrink the version follows the new text, so the same
+        # change is not counted again on later frames that repeat or extend it.
+        self._count: dict[int, int] = {}
         self._sent: dict[int, list[str]] = {}
 
     def feed(self, frame: dict) -> None:
@@ -97,16 +99,15 @@ class TickSlicer:
         for seg in sorted(self._latest):
             words = self._latest[seg].split()
             sent = self._sent.get(seg, [])
-            n = len(sent)
-            if len(words) < n or words[:n] != sent:
+            n = self._count.get(seg, 0)
+            if len(words) < len(sent) or words[:len(sent)] != sent:
                 self.revisions += 1
                 self.last_revised = True
                 logger.debug("segment %d revised: sent=%r now=%r", seg, sent, words)
             if len(words) > n:
                 emitted.extend(words[n:])
-                self._sent[seg] = words
-            elif len(words) == n:
-                self._sent[seg] = words
+                self._count[seg] = len(words)
+            self._sent[seg] = words[:self._count.get(seg, 0)]
         self._latest.clear()
         return " ".join(emitted) if emitted else NOVOICE
 

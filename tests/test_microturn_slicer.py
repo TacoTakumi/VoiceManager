@@ -119,3 +119,26 @@ def test_slicer_scripted_call_sequence():
         NOVOICE,
     ]
     assert s.revisions == 1
+
+
+def test_slicer_repeated_shrink_counts_one_revision():
+    s = mc.TickSlicer()
+    s.feed(frame("hey i'm cleaning the"))
+    assert s.tick() == "hey i'm cleaning the"
+    for _ in range(3):
+        s.feed(frame("hey i'm"))
+        assert s.tick() == NOVOICE
+    assert s.revisions == 1
+
+
+def test_slicer_changed_shrink_then_growth_counts_one_revision():
+    s = mc.TickSlicer()
+    s.feed(frame("hey i'm cleaning the"))
+    assert s.tick() == "hey i'm cleaning the"
+    s.feed(frame("hey I"))
+    assert s.tick() == NOVOICE
+    # Growth back over the sent region re-fills words already sent: only the
+    # fifth word onward is new.
+    s.feed(frame("hey I am cleaning the bathroom"))
+    assert s.tick() == "the bathroom"
+    assert s.revisions == 1
