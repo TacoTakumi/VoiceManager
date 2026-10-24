@@ -291,3 +291,14 @@ def test_live_cli_options():
 
 def test_live_no_sounddevice_at_import():
     assert "sounddevice" not in vars(mc)
+
+
+def test_live_engine_check_refuses_whisper():
+    with pytest.raises(SystemExit) as exc:
+        mc.check_stt_engine("whisper")
+    assert "whisper" in str(exc.value)
+
+
+def test_live_engine_check_allows_streaming_engines():
+    for name in ("audiocpp", "qwen", "nemotron"):
+        mc.check_stt_engine(name)

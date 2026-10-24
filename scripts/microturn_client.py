@@ -601,6 +601,18 @@ async def _tick_task(session: LiveSession) -> None:
         next_at = max(next_at + TICK, session.clock())
 
 
+def check_stt_engine(name: str) -> None:
+    """Exit unless the server's STT engine streams interim transcripts the slicer can use.
+
+    Whisper sends only finals and numbers each utterance's segments from 0 again, so the
+    slicer would take later utterances for revisions of earlier ones and drop their words.
+    """
+    if name == "whisper":
+        raise SystemExit("error: the server's STT engine is whisper, which sends no interim "
+                         "transcripts; run VoiceManager with a streaming engine "
+                         "(VM_STT_ENGINE=audiocpp, qwen or nemotron)")
+
+
 async def live(args: argparse.Namespace) -> None:
     """Run a live call over VoiceManager until Ctrl-C or ``--duration`` seconds."""
     token = os.environ.get("VOICEMANAGER_TOKEN")
@@ -618,6 +630,11 @@ async def live(args: argparse.Namespace) -> None:
         await client._connect()
     except (VoiceManagerError, OSError) as exc:
         raise SystemExit(f"error: cannot connect to VoiceManager: {exc}") from exc
+    try:
+        check_stt_engine(client.stt_engine)
+    except SystemExit:
+        await client._disconnect()
+        raise
     player = AudioPlayer()
     sink = WsTTSSink(client, voice=args.voice)
     orchestrator = TTSOrchestrator(sink, player)
