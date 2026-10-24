@@ -4,6 +4,16 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1]
+
+### Added
+
+- `scripts/microturn_client.py`, a reference client for micro-turn full-duplex
+  voice: every 0.6 s a text LLM with the micro-turn LoRA decides to speak a few
+  words or to listen. Replay mode runs a scripted call as text. Live mode runs
+  a real call over VoiceManager (headphones required) and logs the turn time
+  and the delay to the first audio.
+
 ## [0.2.0]
 
 ### Changed

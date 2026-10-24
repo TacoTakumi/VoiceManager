@@ -14,18 +14,31 @@ Replay mode runs a scripted call through the model as text, with no audio and no
 VoiceManager connection, and prints one line per tick. Without ``--script`` it plays the
 adapter card's demo call; a script file has one heard string per line, empty for silence.
 
+Live mode is a real call over VoiceManager: the microphone streams to its STT, each tick
+sends the new words to the model, and the model's words go to its streaming TTS and play
+on the speaker. It writes one JSON line per tick and per utterance (turn time, delay from
+the last heard word to the first audio) and a WAV of what played. Use headphones: there
+is no echo cancellation, so the microphone would hear the assistant. The bearer token
+comes from the ``VOICEMANAGER_TOKEN`` environment variable.
+
     python scripts/microturn_client.py replay [--script FILE] [--url URL] [--model NAME]
+    python scripts/microturn_client.py live [--vm-host HOST] [--vm-port PORT] [--voice NAME]
+        [--duration SECONDS] [--log FILE] [--wav FILE] [--url URL] [--model NAME]
 """
 import argparse
+import asyncio
 import json
 import logging
 import math
+import os
 import pathlib
 import statistics
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+import wave
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
@@ -327,6 +340,321 @@ def summary(results: list[TickResult]) -> str:
     return f"{len(results)} ticks, median turn {median:.0f} ms, spoke on {spoke}"
 
 
+class WsTTSSink:
+    """TTSSink over a connected ``VoiceManagerClient``.
+
+    Text and done frames go straight onto the client's socket, because the client's
+    public streaming TTS generator only plays audio between the text chunks it sends.
+    Flush and cancel use the client's own methods; ``cancel_tts`` also marks the id so
+    its late audio is dropped.
+    """
+
+    def __init__(self, client, voice: str | None = None):
+        self.client = client
+        self.voice = voice
+        self._opened: set[str] = set()
+
+    async def send_text(self, request_id: str, text: str) -> None:
+        """Append text to the request; the first frame of a request carries the voice."""
+        payload = {"type": "tts_stream", "request_id": request_id, "text": text,
+                   "done": False}
+        # The server fixes the voice when the request starts.
+        if self.voice is not None and request_id not in self._opened:
+            payload["voice"] = self.voice
+        self._opened.add(request_id)
+        await self.client._ws.send(json.dumps(payload))
+
+    async def flush(self, request_id: str) -> None:
+        """Synthesize the buffered text now and keep the request open."""
+        await self.client.flush_tts(request_id)
+
+    async def done(self, request_id: str) -> None:
+        """End the request."""
+        await self.client._ws.send(json.dumps(
+            {"type": "tts_stream", "request_id": request_id, "text": "", "done": True}))
+
+    async def cancel(self, request_id: str) -> None:
+        """Stop the request; the client drops its audio still in flight."""
+        await self.client.cancel_tts(request_id)
+
+
+class AudioPlayer:
+    """Player that plays mono int16 PCM on the default output device.
+
+    The TTS task feeds a byte buffer with ``enqueue``; the output stream's callback, on
+    the audio thread, takes from it with ``pull``, which pads with silence when the
+    buffer runs dry. Every real byte pulled is kept in ``played`` for the WAV.
+    """
+
+    def __init__(self) -> None:
+        self.played = bytearray()
+        self.sample_rate: int | None = None
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._stream = None
+
+    def start(self, sample_rate: int) -> None:
+        """Open the output stream at the first reply's rate; later calls do nothing."""
+        if self._stream is not None:
+            return
+        import sounddevice as sd
+
+        self.sample_rate = sample_rate
+        self._stream = sd.RawOutputStream(samplerate=sample_rate, channels=1, dtype="int16",
+                                          callback=self._callback)
+        self._stream.start()
+
+    def _callback(self, outdata, frames: int, time_info, status) -> None:
+        if status:
+            logger.debug("output status: %s", status)
+        outdata[:] = self.pull(frames * 2)
+
+    def enqueue(self, pcm: bytes) -> None:
+        """Queue PCM to play after what is already queued."""
+        with self._lock:
+            self._buf += pcm
+
+    def pull(self, n: int) -> bytes:
+        """Take n bytes to play, padded with zeros (silence) when fewer are queued."""
+        with self._lock:
+            chunk = bytes(self._buf[:n])
+            del self._buf[:n]
+            self.played += chunk
+        return chunk + b"\x00" * (n - len(chunk))
+
+    def is_playing(self) -> bool:
+        """True while queued audio remains."""
+        with self._lock:
+            return bool(self._buf)
+
+    def clear(self) -> None:
+        """Drop all queued audio."""
+        with self._lock:
+            self._buf.clear()
+
+    def close(self) -> None:
+        """Stop and close the output stream, if open."""
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+
+def write_wav(path: str | pathlib.Path, pcm: bytes, sample_rate: int) -> None:
+    """Write mono int16 PCM to a WAV file."""
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+
+
+class LiveSession:
+    """The state of one live call: history, tick log and first-audio timing.
+
+    The parts are injected, so the loop runs the same over fakes as over llama-server
+    and VoiceManager. Times are clock seconds; the log's ``t`` counts from the start.
+    """
+
+    def __init__(self, engine: CompletionEngine, slicer: TickSlicer,
+                 orchestrator: TTSOrchestrator, log,
+                 clock: Callable[[], float] = time.monotonic,
+                 cancelled: Callable[[str], bool] = lambda request_id: False):
+        self.engine = engine
+        self.slicer = slicer
+        self.orchestrator = orchestrator
+        self.log = log
+        self.clock = clock
+        self.cancelled = cancelled
+        self.history: list[tuple[str, str]] = []
+        self.results: list[TickResult] = []
+        self.first_audio_ms: list[float] = []
+        self.last_word_t: float | None = None
+        self._t0 = clock()
+        self._text: dict[int, str] = {}
+        # Per request: the time of the last word heard before the tick that opened it.
+        self._opened_at: dict[str, float | None] = {}
+        self._logged: set[str] = set()
+        self._audio_id: str | None = None  # the request the next binary frames belong to
+
+    def _write(self, record: dict) -> None:
+        self.log.write(json.dumps(record) + "\n")
+        self.log.flush()
+
+    def on_transcription(self, frame: dict, now: float) -> None:
+        """Feed a transcription frame; a changed text marks the time of the last word."""
+        self.slicer.feed(frame)
+        seg, text = frame.get("segment_index", 0), frame.get("text", "")
+        if text and text != self._text.get(seg):
+            self.last_word_t = now
+        self._text[seg] = text
+
+    async def run_tick(self, now: float) -> TickResult:
+        """Run one tick: decide, drive the TTS and write the tick line."""
+        # Taken before the decision: words heard while the model runs did not cause it.
+        word_t = self.last_word_t
+        heard = self.slicer.tick()
+        result = await asyncio.to_thread(decide, self.engine, self.history, heard)
+        self.history += [("user", heard), ("assistant", result.said)]
+        self.results.append(result)
+        before = self.orchestrator.request_id
+        await self.orchestrator.on_tick(heard, result.said)
+        if self.orchestrator.request_id != before:
+            self._opened_at[self.orchestrator.request_id] = word_t
+        self._write({
+            "type": "tick", "t": round(now - self._t0, 3), "heard": heard,
+            "said": result.said, "p_listen": round(result.p_listen, 4),
+            "turn_ms": round(result.turn_ms, 1), "requests": result.requests,
+            "revised": self.slicer.last_revised, "revisions": self.slicer.revisions,
+        })
+        return result
+
+    def on_audio_start(self, request_id: str, sample_rate: int, now: float) -> None:
+        """Note the request the following binary frames belong to."""
+        self._audio_id = request_id
+        logger.debug("audio_start %s at %d Hz", request_id, sample_rate)
+
+    def on_audio_end(self, request_id: str) -> None:
+        """Forget the request whose audio ended."""
+        if self._audio_id == request_id:
+            self._audio_id = None
+
+    def on_audio(self, pcm: bytes, now: float) -> bool:
+        """Log the first audio of a request; False when the audio must not be played."""
+        rid = self._audio_id
+        if rid is None or self.cancelled(rid):
+            return False
+        if rid not in self._logged:
+            self._logged.add(rid)
+            word_t = self._opened_at.get(rid, self.last_word_t)
+            delay = None if word_t is None else (now - word_t) * 1000.0
+            if delay is not None:
+                self.first_audio_ms.append(delay)
+            self._write({
+                "type": "utterance", "request_id": rid, "t": round(now - self._t0, 3),
+                "first_audio_ms": None if delay is None else round(delay, 1),
+                "cancelled": False,
+            })
+        return True
+
+    def summary_line(self) -> str:
+        """One line for the end of a call: turn time, first-audio delay, budget, cut-ins."""
+        turns = [r.turn_ms for r in self.results]
+        turn = f"{statistics.median(turns):.0f} ms" if turns else "n/a"
+        first = (f"{statistics.median(self.first_audio_ms):.0f} ms"
+                 if self.first_audio_ms else "n/a")
+        over = sum(t > TICK * 1000 for t in turns)
+        return (f"{len(turns)} ticks, median turn {turn}, median first audio {first}, "
+                f"{over} over budget, {self.slicer.revisions} revisions, "
+                f"{self.orchestrator.cutins} cut-ins")
+
+
+async def _mic_task(client) -> None:
+    """Send the microphone to VoiceManager as 16 kHz mono int16 blocks of 100 ms."""
+    import sounddevice as sd
+
+    loop = asyncio.get_running_loop()
+    blocks: asyncio.Queue = asyncio.Queue()
+
+    def callback(indata, frames: int, time_info, status) -> None:
+        # Runs on the audio thread; hand the block to the event loop.
+        loop.call_soon_threadsafe(blocks.put_nowait, bytes(indata))
+
+    with sd.RawInputStream(samplerate=16000, channels=1, dtype="int16", blocksize=1600,
+                           callback=callback):
+        while True:
+            await client._ws.send(await blocks.get())
+
+
+async def _stt_task(client, session: LiveSession) -> None:
+    """Feed transcription frames to the session until the connection closes."""
+    while (frame := await client._stt_queue.get()) is not None:
+        session.on_transcription(frame, session.clock())
+    logger.warning("VoiceManager closed the connection")
+
+
+async def _tts_task(client, session: LiveSession, player: AudioPlayer) -> None:
+    """Play TTS audio and time its first bytes until the connection closes."""
+    while (item := await client._tts_queue.get()) is not None:
+        if isinstance(item, bytes):
+            if session.on_audio(item, session.clock()):
+                player.enqueue(item)
+        elif item.get("type") == "audio_start":
+            rate = item.get("sample_rate", 22050)
+            session.on_audio_start(item.get("request_id"), rate, session.clock())
+            player.start(rate)
+        elif item.get("type") == "audio_end":
+            session.on_audio_end(item.get("request_id"))
+            # Exactly one audio_end per request, so its cancel mark is no longer needed.
+            client._cancelled_tts.discard(item.get("request_id"))
+
+
+async def _tick_task(session: LiveSession) -> None:
+    """Run a tick every TICK seconds on a monotonic schedule."""
+    next_at = session.clock() + TICK
+    while True:
+        await asyncio.sleep(max(0.0, next_at - session.clock()))
+        await session.run_tick(session.clock())
+        # After an overrun the next tick starts at once and the schedule restarts from
+        # there: no tick is skipped and no burst of ticks follows to catch up.
+        next_at = max(next_at + TICK, session.clock())
+
+
+async def live(args: argparse.Namespace) -> None:
+    """Run a live call over VoiceManager until Ctrl-C or ``--duration`` seconds."""
+    token = os.environ.get("VOICEMANAGER_TOKEN")
+    if not token:
+        raise SystemExit("error: set VOICEMANAGER_TOKEN to a VoiceManager bearer token")
+    from voicemanager.client import VoiceManagerClient, VoiceManagerError
+    from websockets.exceptions import ConnectionClosed
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log_path = args.log or f"microturn-{stamp}.jsonl"
+    wav_path = args.wav or f"microturn-{stamp}.wav"
+    print("warning: use headphones; there is no echo cancellation")
+    client = VoiceManagerClient(host=args.vm_host, port=args.vm_port, token=token)
+    try:
+        await client._connect()
+    except (VoiceManagerError, OSError) as exc:
+        raise SystemExit(f"error: cannot connect to VoiceManager: {exc}") from exc
+    player = AudioPlayer()
+    sink = WsTTSSink(client, voice=args.voice)
+    orchestrator = TTSOrchestrator(sink, player)
+    engine = LlamaServerEngine(args.url, model=args.model)
+    try:
+        with open(log_path, "w") as log:
+            session = LiveSession(engine, TickSlicer(), orchestrator, log,
+                                  cancelled=lambda rid: rid in client._cancelled_tts)
+            # The client's public stream_stt_live / stream_tts_live generators only read
+            # replies between the chunks they send, so they cannot run STT and TTS at the
+            # same time. The tasks use its socket and reader queues directly instead.
+            tasks = [asyncio.create_task(c) for c in (
+                _mic_task(client), _stt_task(client, session),
+                _tts_task(client, session, player), _tick_task(session))]
+            try:
+                await asyncio.wait(tasks, timeout=args.duration,
+                                   return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                pass  # Ctrl-C: asyncio.run cancels this task; stop cleanly below
+            for task in tasks:
+                task.cancel()
+            for task, outcome in zip(tasks, await asyncio.gather(*tasks,
+                                                                 return_exceptions=True)):
+                if isinstance(outcome, Exception):
+                    logger.error("%s stopped: %r", task.get_coro().__name__, outcome)
+            if orchestrator.open:
+                try:
+                    await sink.done(orchestrator.request_id)
+                except ConnectionClosed:
+                    pass
+    finally:
+        player.close()
+        await client._disconnect()
+    write_wav(wav_path, bytes(player.played), player.sample_rate or client.last_tts_sample_rate)
+    print(f"log: {log_path}  wav: {wav_path}")
+    print(session.summary_line())
+
+
 def _parser() -> argparse.ArgumentParser:
     """The command line: one subcommand per mode, each with the shared server options."""
     server = argparse.ArgumentParser(add_help=False)
@@ -340,12 +668,22 @@ def _parser() -> argparse.ArgumentParser:
                           help="run a scripted call as text, no audio")
     rp.add_argument("--script", type=pathlib.Path, default=None,
                     help="one heard string per line, empty line for silence (default: demo)")
+    lv = modes.add_parser("live", parents=[server],
+                          help="a live call over VoiceManager (headphones required)")
+    lv.add_argument("--vm-host", default="localhost", help="VoiceManager host")
+    lv.add_argument("--vm-port", type=int, default=8255, help="VoiceManager port")
+    lv.add_argument("--voice", default=None, help="TTS voice (default: the token's voice)")
+    lv.add_argument("--duration", type=float, default=None,
+                    help="stop after this many seconds (default: at Ctrl-C)")
+    lv.add_argument("--log", default=None,
+                    help="JSON lines log (default: microturn-<stamp>.jsonl)")
+    lv.add_argument("--wav", default=None,
+                    help="WAV of the audio played (default: microturn-<stamp>.wav)")
     return parser
 
 
-def main() -> None:
-    """Run the selected mode against llama-server."""
-    args = _parser().parse_args()
+def _run_replay(args: argparse.Namespace) -> None:
+    """Replay a script through llama-server and print each tick and a summary."""
     engine = LlamaServerEngine(args.url, model=args.model)
     script = read_script(args.script) if args.script else DEMO
     results: list[TickResult] = []
@@ -354,6 +692,15 @@ def main() -> None:
     except urllib.error.URLError as exc:
         raise SystemExit(f"error: cannot reach {args.url}: {exc}") from exc
     print(summary(results))
+
+
+def main() -> None:
+    """Run the selected mode."""
+    args = _parser().parse_args()
+    if args.mode == "live":
+        asyncio.run(live(args))
+    else:
+        _run_replay(args)
 
 
 if __name__ == "__main__":
