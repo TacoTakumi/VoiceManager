@@ -10,16 +10,23 @@ llama-swap entry that serves it; pass ``--model`` so llama-swap can route the re
 The system prompt below is the exact text the adapter was trained on. Keep it byte for
 byte, and keep the history append-only so llama-server's prompt cache resumes each tick.
 
-    python scripts/microturn_client.py --url http://127.0.0.1:8080 [--model NAME]
+Replay mode runs a scripted call through the model as text, with no audio and no
+VoiceManager connection, and prints one line per tick. Without ``--script`` it plays the
+adapter card's demo call; a script file has one heard string per line, empty for silence.
+
+    python scripts/microturn_client.py replay [--script FILE] [--url URL] [--model NAME]
 """
 import argparse
 import json
 import logging
 import math
+import pathlib
+import statistics
 import time
+import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -36,6 +43,12 @@ SYSTEM = (
     f"transcript fragment, or {NOVOICE}. You reply with up to three new words to say next, "
     f"or {LISTEN} to add nothing."
 )
+# The adapter card's scripted call.
+DEMO = [
+    "Hey I'm cleaning", "the bathroom", "right now and", "I got some", "bleach here", NOVOICE,
+    "and I'm going", "to mix it", "with the ammonia", "cleaner so it", "gets extra strong",
+    *[NOVOICE] * 7,
+]
 
 
 class TickSlicer:
@@ -277,16 +290,70 @@ class TTSOrchestrator:
             self.open = False
 
 
-def main() -> None:
-    """Parse the server options. Modes that drive a call are added on top of this core."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--url", default="http://127.0.0.1:8080",
+def format_tick(heard: str, result: TickResult) -> str:
+    """One aligned output line for a tick: heard, said, P(listen) and the LLM turn time."""
+    return (f"  heard: {heard:<22} said: {result.said:<28} "
+            f"P(listen) {result.p_listen:.2f} {result.turn_ms:>4.0f} ms")
+
+
+def replay(engine: CompletionEngine, script: Iterable[str],
+           out: Callable[[str], None] = print,
+           results: list[TickResult] | None = None) -> list[tuple[str, str]]:
+    """Run each heard string through the model as one tick and return the history.
+
+    Ticks run back to back: the turn time is reported, not paced. Each tick's
+    ``TickResult`` is appended to ``results`` when it is given.
+    """
+    history: list[tuple[str, str]] = []
+    for heard in script:
+        result = decide(engine, history, heard)
+        history += [("user", heard), ("assistant", result.said)]
+        out(format_tick(heard, result))
+        if results is not None:
+            results.append(result)
+    return history
+
+
+def read_script(path: str | pathlib.Path) -> list[str]:
+    """Read a replay script: one heard string per line, an empty line means ``NOVOICE``."""
+    lines = pathlib.Path(path).read_text().splitlines()
+    return [line.strip() or NOVOICE for line in lines]
+
+
+def summary(results: list[TickResult]) -> str:
+    """One line for the end of a run: tick count, median turn time, ticks that spoke."""
+    median = statistics.median(r.turn_ms for r in results) if results else 0.0
+    spoke = sum(r.said != LISTEN for r in results)
+    return f"{len(results)} ticks, median turn {median:.0f} ms, spoke on {spoke}"
+
+
+def _parser() -> argparse.ArgumentParser:
+    """The command line: one subcommand per mode, each with the shared server options."""
+    server = argparse.ArgumentParser(add_help=False)
+    server.add_argument("--url", default="http://127.0.0.1:8080",
                         help="llama-server or llama-swap base URL")
-    parser.add_argument("--model", default=None,
+    server.add_argument("--model", default=None,
                         help="model name for llama-swap routing (omit for plain llama-server)")
-    args = parser.parse_args()
-    print(f"usage: microturn_client.py --url {args.url}"
-          f"{f' --model {args.model}' if args.model else ''} (no mode selected yet)")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    modes = parser.add_subparsers(dest="mode", required=True)
+    rp = modes.add_parser("replay", parents=[server],
+                          help="run a scripted call as text, no audio")
+    rp.add_argument("--script", type=pathlib.Path, default=None,
+                    help="one heard string per line, empty line for silence (default: demo)")
+    return parser
+
+
+def main() -> None:
+    """Run the selected mode against llama-server."""
+    args = _parser().parse_args()
+    engine = LlamaServerEngine(args.url, model=args.model)
+    script = read_script(args.script) if args.script else DEMO
+    results: list[TickResult] = []
+    try:
+        replay(engine, script, results=results)
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"error: cannot reach {args.url}: {exc}") from exc
+    print(summary(results))
 
 
 if __name__ == "__main__":
