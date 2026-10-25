@@ -896,6 +896,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 effective_voice = self._voice or self._tts_pipeline._voice
                 if effective_voice is not None:
                     kwargs["voice"] = effective_voice
+                if self._chunking == "clause":
+                    logger.info(
+                        "Clause TTS engine request: request_id=%s parts=%d text=%r",
+                        request_id, len(parts), text,
+                    )
                 async for chunk_np in engine.stream_synthesize(text, **kwargs):
                     await websocket.send_bytes(float32_to_pcm16(chunk_np))
                     # Clause mode's unplayed-audio estimate needs every chunk sent;

@@ -751,6 +751,14 @@ class TTSStreamPipeline:
                     )
                     self._audio_started = True
 
+                if self._chunking == "clause":
+                    # Makes a dropped or altered piece visible: the exact text the
+                    # engine gets, once per piece, whichever path runs below.
+                    logger.info(
+                        "Clause TTS engine request: request_id=%s parts=1 text=%r",
+                        request_id, sentence,
+                    )
+
                 # Use async stream_synthesize() for both engines
                 loop = asyncio.get_event_loop()
                 if effective_tgt_se is not None and hasattr(self._tts_pipeline._engine, 'synthesize_cloned'):
