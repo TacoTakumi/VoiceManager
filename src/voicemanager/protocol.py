@@ -121,6 +121,16 @@ class TTSStreamMessage(BaseModel):
     # sentinel and never yields an audio_end.
     flush: bool = False
     voice: str | None = None
+    # Additive: where the server may cut the accumulated text into synthesis units.
+    # "sentence" (the default) is today's behaviour; "clause" also allows cuts at
+    # clause boundaries. Fixed by the request's first frame, like voice: a later
+    # frame's value is ignored. Any other value is rejected with an error frame of
+    # error_type "invalid_request" and the frame is dropped.
+    chunking: Literal["sentence", "clause"] = "sentence"
+
+
+#: The tts_stream chunking modes a client may ask for.
+CHUNKING_MODES: tuple[str, ...] = ("sentence", "clause")
 
 
 class TurnStartedMessage(BaseModel):

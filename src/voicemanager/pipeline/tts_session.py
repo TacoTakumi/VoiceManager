@@ -227,8 +227,12 @@ class TTSSession:
         request_id: str,
         voice: str | None = None,
         flush: bool = False,
+        chunking: str = "sentence",
     ) -> None:
         """Feed one `tts_stream` chunk.
+
+        `chunking` is fixed by the request's first frame, like `voice`; the stream
+        pipeline ignores the value on every later frame of the same request.
 
         A chunk opening a NEW request supersedes anything in flight — one-shot or stream
         — down the cancel path (see `_supersede`), which is also what keeps the
@@ -263,6 +267,7 @@ class TTSSession:
             request_id=request_id,
             voice=voice,
             flush=flush,
+            chunking=chunking,
         )
         new_task = self._stream_pipeline.synthesis_task
         if new_task is not None and new_task is not previous_task:

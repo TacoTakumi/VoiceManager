@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 from voicemanager.auth.deps import websocket_token
 from voicemanager.config import get_settings
 from voicemanager.pipeline import AcousticEndpointer, STTPipeline
@@ -18,6 +19,7 @@ from voicemanager.pipeline.tts_session import TTSSession
 from voicemanager.protocol import (
     HandshakeMessage, ErrorMessage, TranscriptionMessage, AUDIO_FORMAT_SPEC,
     TTSRequestMessage, TTSCancelMessage, TTSStreamMessage, TurnStartedMessage,
+    CHUNKING_MODES,
 )
 from voicemanager.session import SessionRegistry, SessionEntry
 from voicemanager.transport.endpoint_hold import EndpointHoldMachine
@@ -26,6 +28,17 @@ from voicemanager.transport.turns import TurnTracker
 logger = logging.getLogger(__name__)
 
 websocket_router = APIRouter()
+
+
+def _is_chunking_only_fault(exc: ValidationError) -> bool:
+    """True when every validation error of a tts_stream frame is on its chunking field.
+
+    Such a frame is a client asking for a mode the server does not offer: it gets an
+    invalid_request error frame and is dropped, and the connection stays open. Any other
+    fault (a missing request_id, a bad text) keeps the generic server_error path.
+    """
+    errors = exc.errors()
+    return bool(errors) and all(tuple(e.get("loc", ())) == ("chunking",) for e in errors)
 
 
 def _make_hold_machine(settings) -> EndpointHoldMachine | None:
@@ -873,11 +886,34 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
 
                 elif msg_type == "tts_stream" and tts_session is not None:
-                    tts_stream_msg = TTSStreamMessage.model_validate(parsed)
+                    try:
+                        tts_stream_msg = TTSStreamMessage.model_validate(parsed)
+                    except ValidationError as exc:
+                        if not _is_chunking_only_fault(exc):
+                            raise
+                        # An unknown chunking mode: tell the client and drop the frame.
+                        # Nothing is opened or disturbed, and STT keeps running.
+                        logger.warning(
+                            "Dropped tts_stream with bad chunking=%r: session=%s",
+                            parsed.get("chunking"), session_id,
+                        )
+                        await websocket.send_text(
+                            ErrorMessage(
+                                error_type="invalid_request",
+                                message=(
+                                    "tts_stream chunking must be one of: "
+                                    + ", ".join(CHUNKING_MODES)
+                                    + "; the frame was dropped."
+                                ),
+                            ).model_dump_json()
+                        )
+                        continue
                     logger.info(
-                        "TTS stream chunk: session=%s request_id=%s done=%s flush=%s len=%d voice=%s",
+                        "TTS stream chunk: session=%s request_id=%s done=%s flush=%s len=%d "
+                        "voice=%s chunking=%s",
                         session_id, tts_stream_msg.request_id, tts_stream_msg.done,
                         tts_stream_msg.flush, len(tts_stream_msg.text), tts_stream_msg.voice,
+                        tts_stream_msg.chunking,
                     )
                     await tts_session.feed_stream(
                         chunk=tts_stream_msg.text,
@@ -885,6 +921,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         request_id=tts_stream_msg.request_id,
                         voice=tts_stream_msg.voice,  # voice parameter routing
                         flush=tts_stream_msg.flush,  # speak the buffer now
+                        chunking=tts_stream_msg.chunking,  # fixed at request start
                     )
 
                 elif msg_type == "tts_cancel" and tts_session is not None:

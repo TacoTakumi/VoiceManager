@@ -450,6 +450,13 @@ class TTSStreamPipeline:
         self._done_received: bool = False
         self._audio_started: bool = False
         self._voice: str | None = voice
+        # The open request's chunking mode, fixed at request start like voice.
+        self._chunking: str = "sentence"
+
+    @property
+    def chunking(self) -> str:
+        """The chunking mode of the current request ("sentence" or "clause")."""
+        return self._chunking
 
     @property
     def synthesis_task(self) -> asyncio.Task | None:
@@ -468,12 +475,13 @@ class TTSStreamPipeline:
         request_id: str,
         voice: str | None = None,
         flush: bool = False,
+        chunking: str = "sentence",
     ) -> None:
         """Accumulate a text chunk and dispatch complete sentences.
 
-        Voice is fixed at request start. If a subsequent feed_text() call for the
-        same request_id specifies a different voice, it is silently ignored. Voice
-        selection only takes effect when a new request_id begins.
+        Voice and chunking are fixed at request start. If a subsequent feed_text()
+        call for the same request_id specifies a different value, it is silently
+        ignored. Either only takes effect when a new request_id begins.
 
         On first call for a new request_id, starts a synthesis consumer task.
         Dispatches all-but-last sentence from split_sentences() result.
@@ -489,6 +497,8 @@ class TTSStreamPipeline:
                 A flush with an empty or whitespace-only buffer is
                 a silent no-op. Ignored when done=True, which closes the
                 request anyway.
+            chunking: "sentence" or "clause"; fixed at request start. Validated
+                upstream by the protocol model.
         """
         # New request — start fresh
         if self._request_id != request_id:
@@ -504,8 +514,9 @@ class TTSStreamPipeline:
             self._done_received = False
             self._audio_started = False
             self._sentence_queue = asyncio.Queue()
-            # Voice is fixed at request start
+            # Voice and chunking are fixed at request start
             self._voice = voice
+            self._chunking = chunking
             # Start synthesis consumer task (asyncio.create_task for full-duplex)
             self._synthesis_task = asyncio.create_task(
                 self._synthesis_loop(websocket, request_id)
