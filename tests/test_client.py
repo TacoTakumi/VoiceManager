@@ -1255,3 +1255,54 @@ class TestDefaultVoice:
             await client._reader
         except asyncio.CancelledError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# TestStreamChunking - the chunking argument rides the first tts_stream frame
+# ---------------------------------------------------------------------------
+
+async def _chunking_frames(client, method, **kwargs):
+    """Run a streaming TTS call over a fake socket; return the tts_stream frames."""
+    rid = "CHUNK-RID"
+    client._ws = AsyncMock()
+    client._ws.send = AsyncMock()
+    await client._tts_queue.put(
+        {"type": "audio_start", "request_id": rid, "sample_rate": 24000}
+    )
+
+    async def _text():
+        for piece in ("one ", "two ", "three"):
+            yield piece
+        # The server ends the request only after the done frame goes out.
+        await client._tts_queue.put({"type": "audio_end", "request_id": rid})
+
+    if method == "stream_tts":
+        with patch("uuid.uuid4", return_value=MagicMock(__str__=lambda self: rid)):
+            await client.stream_tts(_text(), **kwargs)
+    else:
+        async for _ in client.stream_tts_live(_text(), request_id=rid, **kwargs):
+            pass
+    sent = [json.loads(c.args[0]) for c in client._ws.send.await_args_list]
+    return [f for f in sent if f.get("type") == "tts_stream"]
+
+
+class TestStreamChunking:
+    @pytest.mark.parametrize("method", ["stream_tts", "stream_tts_live"])
+    async def test_chunking_only_on_first_frame(self, client, method):
+        frames = await _chunking_frames(client, method, chunking="clause")
+        assert len(frames) == 4  # three text frames plus the done frame
+        assert frames[0]["chunking"] == "clause"
+        assert all("chunking" not in f for f in frames[1:])
+
+    @pytest.mark.parametrize("method", ["stream_tts", "stream_tts_live"])
+    async def test_no_chunking_key_by_default(self, client, method):
+        frames = await _chunking_frames(client, method)
+        assert frames
+        assert all("chunking" not in f for f in frames)
+
+    @pytest.mark.parametrize("method", ["stream_tts", "stream_tts_live"])
+    async def test_chunking_and_voice_share_first_frame(self, client, method):
+        frames = await _chunking_frames(client, method, voice="Carter", chunking="clause")
+        assert frames[0]["voice"] == "Carter"
+        assert frames[0]["chunking"] == "clause"
+        assert all("voice" not in f and "chunking" not in f for f in frames[1:])

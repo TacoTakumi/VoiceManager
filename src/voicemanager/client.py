@@ -523,7 +523,10 @@ class VoiceManagerClient:
         return bytes(audio_buf), sample_rate
 
     async def stream_tts(
-        self, text_chunks: AsyncIterator[str], voice: str | None = None
+        self,
+        text_chunks: AsyncIterator[str],
+        voice: str | None = None,
+        chunking: str | None = None,
     ) -> tuple[bytes, int]:
         """Stream text chunks for TTS and collect all audio as PCM bytes.
 
@@ -537,6 +540,10 @@ class VoiceManagerClient:
             text_chunks: Async iterator of text strings (e.g., LLM token stream).
             voice: Voice preset name (VibeVoice only). Sent on the first
                 tts_stream message; the server fixes voice at request start.
+            chunking: Text cut mode, "sentence" or "clause". Sent on the first
+                tts_stream message; the server fixes it at request start. When
+                omitted, no chunking field is sent and the server default applies.
+                A bad value comes back as an invalid_request error frame.
 
         Returns:
             Tuple of (pcm_bytes, sample_rate). Use sample_rate when writing
@@ -560,8 +567,11 @@ class VoiceManagerClient:
                     "text": chunk,
                     "done": False,
                 }
-                if first_chunk and voice is not None:
-                    payload["voice"] = voice
+                if first_chunk:
+                    if voice is not None:
+                        payload["voice"] = voice
+                    if chunking is not None:
+                        payload["chunking"] = chunking
                     first_chunk = False
                 msg = json.dumps(payload)
                 await self._ws.send(msg)
@@ -617,6 +627,7 @@ class VoiceManagerClient:
         text_chunks: AsyncIterator[str],
         voice: str | None = None,
         request_id: str | None = None,
+        chunking: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Stream text for TTS and yield audio bytes in real-time.
 
@@ -646,6 +657,10 @@ class VoiceManagerClient:
                 ``client.last_tts_request_id``. Supplying one lets the caller hold
                 the id up front so it can call ``cancel_tts()`` on the in-flight
                 request without waiting for iteration to start.
+            chunking: Text cut mode, "sentence" or "clause". Sent on the first
+                tts_stream message; the server fixes it at request start. When
+                omitted, no chunking field is sent and the server default applies.
+                A bad value comes back as an invalid_request error frame.
 
         Yields:
             Raw PCM bytes per audio chunk from the server.
@@ -674,8 +689,11 @@ class VoiceManagerClient:
                         "text": chunk,
                         "done": False,
                     }
-                    if first_chunk and voice is not None:
-                        payload["voice"] = voice
+                    if first_chunk:
+                        if voice is not None:
+                            payload["voice"] = voice
+                        if chunking is not None:
+                            payload["chunking"] = chunking
                         first_chunk = False
                     msg = json.dumps(payload)
                     await self._ws.send(msg)
