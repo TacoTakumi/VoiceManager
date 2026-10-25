@@ -11,12 +11,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `tts_stream` has a `chunking` field: `"sentence"` (the default, unchanged) or
   `"clause"`. In clause mode the server holds the streamed text and cuts
   playback-aware pieces at clause marks, word counts or when the unplayed
-  audio runs low, so a client that sends a few words at a time gets smooth
+  audio runs low (a clause mark cuts only after at least 3 words, and the
+  unplayed estimate is a play cursor that ignores playback gaps), so a client that sends a few words at a time gets smooth
   speech. The first frame of a request fixes the mode. Any other value gets an
   `invalid_request` error frame and the connection stays open. `flush` and
   `done` keep their meaning. Works on the shared and the audiocpp pipelines.
+  Each engine request of a clause-mode request logs its text at INFO.
 - Settings `VM_TTS_CLAUSE_FIRST_WORDS` (4), `VM_TTS_CLAUSE_FIRST_DEADLINE_MS`
-  (600), `VM_TTS_CLAUSE_LATER_WORDS` (12) and `VM_TTS_CLAUSE_MARGIN_MS` (500).
+  (600), `VM_TTS_CLAUSE_LATER_WORDS` (12), `VM_TTS_CLAUSE_MARGIN_MS` (1000) and
+  `VM_TTS_CLAUSE_MARK_MIN_WORDS` (3).
 - `chunking` argument in `stream_tts` and `stream_tts_live` of the Python
   client. It is sent on the first frame only.
 - `--tts-mode clause|flush` in `scripts/microturn_client.py` live mode (clause

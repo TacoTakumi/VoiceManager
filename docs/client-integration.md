@@ -742,14 +742,14 @@ A client that sends 2-3 words per frame, and flushes after each one, gets choppy
 { "type": "tts_stream", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "text": "Sure, I can", "chunking": "clause", "done": false }
 ```
 
-The cut rule has two cases. A clause mark is one of `,` `;` `:` `.` `?` `!` that ends a word (so `3.5` holds no mark).
+The cut rule has two cases. A clause mark is one of `,` `;` `:` `.` `?` `!` that ends a word (so `3.5` holds no mark). A mark is a cut point only when the held text up to it holds at least `VM_TTS_CLAUSE_MARK_MIN_WORDS` words (default 3). A shorter mark, as in `Yes,` or `Stop!`, stays inside the piece, because a very short piece plays for less time than the next piece takes to start and would leave a gap.
 
 - **First piece** (nothing is playing): the server sends a piece at a clause mark, when it holds `VM_TTS_CLAUSE_FIRST_WORDS` words, or `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` after the first held word arrived. The first of the three that happens wins.
-- **Later pieces** (audio is playing): the server sends a piece at a clause mark, when it holds `VM_TTS_CLAUSE_LATER_WORDS` words, or when the estimated unplayed audio drops below `VM_TTS_CLAUSE_MARGIN_MS`. The estimate is the duration of all audio sent for the request, minus the time since the first audio chunk was sent, and never below 0. When it reaches 0, the first-piece rule applies again.
+- **Later pieces** (audio is playing): the server sends a piece at a clause mark, when it holds `VM_TTS_CLAUSE_LATER_WORDS` words, or when the estimated unplayed audio drops below `VM_TTS_CLAUSE_MARGIN_MS`. The estimate follows a play cursor: each audio chunk sent extends playback from the later of the cursor and now by its duration, and the estimate is the cursor minus now, never below 0. A gap in playback is not counted as audio played. When it reaches 0, the first-piece rule applies again.
 
-A cut at a clause mark sends the text up to the last mark and keeps the words after it held. A cut by word count or time sends all held text. Punctuation stays in the text. Because later pieces wait while audio plays, they grow longer and the speech gets smoother.
+A cut at a clause mark sends the text up to the last qualifying mark and keeps the words after it held. A cut by word count or time sends all held text. Punctuation stays in the text. Because later pieces wait while audio plays, they grow longer and the speech gets smoother.
 
-`flush` and `done` keep their meaning in clause mode. `flush: true` sends all held text now and keeps the request open. `done: true` sends all held text and ends the request with one `audio_end`. A client that uses clause mode can still flush at its own boundaries. On the audiocpp engine, pieces that queue while it is busy are merged by its existing coalescing. The four settings are in [Configuration](#configuration).
+`flush` and `done` keep their meaning in clause mode. `flush: true` sends all held text now and keeps the request open. `done: true` sends all held text and ends the request with one `audio_end`. A client that uses clause mode can still flush at its own boundaries. On the audiocpp engine, pieces that queue while it is busy are merged by its existing coalescing. The five settings are in [Configuration](#configuration). To debug a dropped or odd piece, look for the INFO log line `Clause TTS engine request: request_id=... parts=N text='...'`, which the server writes for each engine request of a clause-mode request.
 
 ### 3. Why an audio stream ended: `reason` on `audio_end`
 
@@ -1130,7 +1130,8 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_TTS_CLAUSE_FIRST_WORDS` | `4` | Clause mode: words held before the first piece is sent, if no clause mark comes first. |
 | `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` | `600` | Clause mode: milliseconds after the first held word before the first piece is sent. |
 | `VM_TTS_CLAUSE_LATER_WORDS` | `12` | Clause mode: words held before a later piece is sent, while audio is playing. |
-| `VM_TTS_CLAUSE_MARGIN_MS` | `500` | Clause mode: a later piece is sent when the estimated unplayed audio drops below this. |
+| `VM_TTS_CLAUSE_MARGIN_MS` | `1000` | Clause mode: a later piece is sent when the estimated unplayed audio drops below this. The default covers the audiocpp coalescing wait plus the engine start. |
+| `VM_TTS_CLAUSE_MARK_MIN_WORDS` | `3` | Clause mode: a clause mark cuts only when the held text up to it holds at least this many words. |
 | `VM_DEVICE` | `auto` | Compute device (`auto`, `cpu`, `cuda`, `cuda:N`); affects latency, not the protocol. |
 
 The server has many more `VM_` variables for model selection and tuning
