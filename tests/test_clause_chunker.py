@@ -43,7 +43,8 @@ def test_defaults_match_the_documented_thresholds():
     assert c.first_piece_words == 4
     assert c.first_piece_deadline_ms == 600
     assert c.later_piece_words == 12
-    assert c.unplayed_margin_ms == 500
+    assert c.unplayed_margin_ms == 1000
+    assert c.mark_min_words == 3
 
 
 def test_clause_marks_are_the_six_marks():
@@ -55,6 +56,7 @@ def test_clause_marks_are_the_six_marks():
     {"later_piece_words": 0},
     {"first_piece_deadline_ms": 0},
     {"unplayed_margin_ms": -1},
+    {"mark_min_words": 0},
 ])
 def test_bad_thresholds_are_rejected(kwargs):
     with pytest.raises(ValueError):
@@ -64,16 +66,66 @@ def test_bad_thresholds_are_rejected(kwargs):
 # --- first piece: no audio playing -----------------------------------------------
 
 
-def test_first_piece_clause_mark_with_two_words_dispatches(chunker):
-    chunker.feed("Hello there,")
-    assert chunker.poll() == ["Hello there,"]
+def test_first_piece_clause_mark_with_three_words_dispatches(chunker):
+    chunker.feed("Hello there friend,")
+    assert chunker.poll() == ["Hello there friend,"]
     assert chunker.held_text == ""
+
+
+def test_first_piece_clause_mark_with_two_words_is_held(chunker):
+    chunker.feed("Hello there,")
+    assert chunker.poll() == []
+    assert chunker.held_text == "Hello there,"
 
 
 @pytest.mark.parametrize("mark", list(",;:.?!"))
 def test_first_piece_each_clause_mark_dispatches(chunker, mark):
-    chunker.feed(f"Two words{mark}")
-    assert chunker.poll() == [f"Two words{mark}"]
+    chunker.feed(f"Three short words{mark}")
+    assert chunker.poll() == [f"Three short words{mark}"]
+
+
+def test_mark_after_one_word_waits_for_the_deadline(chunker, clock):
+    chunker.feed("Yes, I")
+    assert chunker.poll() == []
+    clock.advance(0.599)
+    assert chunker.poll() == []
+    clock.advance(0.001)
+    assert chunker.poll() == ["Yes, I"]
+
+
+def test_mark_after_one_word_waits_for_the_word_count(chunker):
+    chunker.feed("Yes, I")
+    assert chunker.poll() == []
+    chunker.feed(" can hear")
+    assert chunker.poll() == ["Yes, I can hear"]
+
+
+def test_short_mark_stays_inside_the_piece_cut_at_a_later_mark(chunker):
+    chunker.feed("Yes, I can hear you fine. What")
+    assert chunker.poll() == ["Yes, I can hear you fine."]
+    assert chunker.held_text == "What"
+
+
+def test_short_mark_then_word_count_sends_all_held_text(chunker):
+    chunker.feed("Stop! Do not mix")
+    assert chunker.poll() == ["Stop! Do not mix"]
+    assert chunker.held_text == ""
+
+
+def test_mark_min_words_counts_from_the_start_of_held_text(clock):
+    chunker = ClauseChunker(mark_min_words=5, clock=clock)
+    chunker.feed("one two three,")
+    assert chunker.poll() == []
+    chunker.feed(" four five. six")
+    assert chunker.poll() == ["one two three, four five."]
+    assert chunker.held_text == "six"
+
+
+def test_mark_min_words_of_one_cuts_at_any_mark(clock):
+    chunker = ClauseChunker(mark_min_words=1, clock=clock)
+    chunker.feed("Yes, I")
+    assert chunker.poll() == ["Yes,"]
+    assert chunker.held_text == "I"
 
 
 def test_first_piece_four_words_without_mark_dispatches(chunker):
@@ -132,8 +184,18 @@ def test_poll_accepts_explicit_now(clock):
 
 def test_later_piece_clause_mark_dispatches(chunker, clock):
     play_earlier_piece(chunker, 3.0)
-    chunker.feed("two words.")
-    assert chunker.poll() == ["two words."]
+    chunker.feed("three words here.")
+    assert chunker.poll() == ["three words here."]
+
+
+def test_later_piece_mark_after_one_word_with_two_seconds_unplayed_is_held(
+        chunker, clock):
+    play_earlier_piece(chunker, 3.0)
+    clock.advance(1.0)
+    assert chunker.unplayed_estimate() == pytest.approx(2.0)
+    chunker.feed("Yes, I")
+    assert chunker.poll() == []
+    assert chunker.held_text == "Yes, I"
 
 
 def test_later_piece_twelve_words_dispatch(chunker, clock):
@@ -153,7 +215,7 @@ def test_later_piece_eleven_words_are_held(chunker, clock):
 def test_later_piece_dispatches_when_unplayed_drops_below_margin(chunker, clock):
     play_earlier_piece(chunker, 3.0)
     chunker.feed("two words")
-    clock.advance(2.5)  # unplayed is exactly 0.5 s: not below the margin
+    clock.advance(2.0)  # unplayed is exactly 1.0 s: not below the margin
     assert chunker.poll() == []
     clock.advance(0.01)
     assert chunker.poll() == ["two words"]
@@ -202,13 +264,42 @@ def test_estimate_three_seconds_sent_four_elapsed_is_zero(chunker, clock):
     assert chunker.unplayed_estimate() == 0.0
 
 
-def test_estimate_sums_chunks_and_counts_from_the_first(chunker, clock):
+def test_estimate_queues_chunks_sent_while_audio_plays(chunker, clock):
     chunker.record_audio(1.0)
     clock.advance(0.5)
-    chunker.record_audio(2.0)
+    chunker.record_audio(2.0)  # starts when the first chunk ends
     clock.advance(0.5)
-    # 3 s sent, 1 s since the first chunk
+    # the cursor is 3 s after the first chunk, 1 s of it has played
     assert chunker.unplayed_estimate() == pytest.approx(2.0)
+
+
+def test_estimate_does_not_count_a_playback_gap_as_audio_played():
+    clock = FakeClock(start=0.0)
+    chunker = ClauseChunker(clock=clock)
+    chunker.record_audio(3.0)
+    clock.now = 1.0
+    assert chunker.unplayed_estimate() == pytest.approx(2.0)
+    clock.now = 4.0
+    assert chunker.unplayed_estimate() == 0.0
+    clock.now = 5.0
+    chunker.record_audio(1.0)
+    assert chunker.unplayed_estimate() == pytest.approx(1.0)
+    clock.now = 5.5
+    assert chunker.unplayed_estimate() == pytest.approx(0.5)
+
+
+def test_later_piece_rule_applies_to_audio_sent_after_a_gap():
+    clock = FakeClock(start=0.0)
+    chunker = ClauseChunker(clock=clock)
+    chunker.record_audio(1.0)
+    clock.now = 5.0
+    chunker.record_audio(3.0)
+    chunker.feed("one two three four five")
+    assert chunker.poll() == []  # 3 s unplayed: the later-piece rule holds them
+    clock.now = 7.0  # exactly 1 s left: not below the margin
+    assert chunker.poll() == []
+    clock.now = 7.01
+    assert chunker.poll() == ["one two three four five"]
 
 
 def test_record_audio_rejects_negative_duration(chunker):
@@ -220,8 +311,8 @@ def test_record_audio_rejects_negative_duration(chunker):
 
 
 def test_cut_at_clause_mark_keeps_following_words_held(chunker, clock):
-    chunker.feed("them. It creates")
-    assert chunker.poll() == ["them."]
+    chunker.feed("Do not mix them. It creates")
+    assert chunker.poll() == ["Do not mix them."]
     assert chunker.held_text == "It creates"
     clock.advance(0.599)
     assert chunker.poll() == []
@@ -236,19 +327,19 @@ def test_cut_is_at_the_last_clause_mark(chunker):
 
 
 def test_remainder_deadline_counts_from_its_own_arrival(chunker, clock):
-    chunker.feed("one")
+    chunker.feed("one two")
     clock.advance(0.3)
-    chunker.feed(" two, three")
-    assert chunker.poll() == ["one two,"]
-    clock.advance(0.3)  # 0.6 s since "one", 0.3 s since "three"
+    chunker.feed(" three, four")
+    assert chunker.poll() == ["one two three,"]
+    clock.advance(0.3)  # 0.6 s since "one", 0.3 s since "four"
     assert chunker.poll() == []
     clock.advance(0.3)
-    assert chunker.poll() == ["three"]
+    assert chunker.poll() == ["four"]
 
 
 def test_remainder_can_trigger_its_own_word_count(chunker):
-    chunker.feed("Well, one two three four")
-    assert chunker.poll() == ["Well,", "one two three four"]
+    chunker.feed("Well, all right. one two three four")
+    assert chunker.poll() == ["Well, all right.", "one two three four"]
     assert chunker.held_text == ""
 
 
@@ -265,8 +356,8 @@ def test_closing_quote_after_a_mark_stays_with_the_piece(chunker):
 
 
 def test_repeated_marks_are_cut_after_the_run(chunker):
-    chunker.feed("Wait... what?! So")
-    assert chunker.poll() == ["Wait... what?!"]
+    chunker.feed("Wait... what now?! So")
+    assert chunker.poll() == ["Wait... what now?!"]
     assert chunker.held_text == "So"
 
 
@@ -287,8 +378,8 @@ def test_only_surrounding_whitespace_is_trimmed(chunker):
 
 def test_word_split_across_frames_is_joined_as_received(chunker):
     chunker.feed("Hel")
-    chunker.feed("lo,")
-    assert chunker.poll() == ["Hello,"]
+    chunker.feed("lo there friend,")
+    assert chunker.poll() == ["Hello there friend,"]
 
 
 # --- next_deadline ----------------------------------------------------------------
@@ -311,7 +402,17 @@ def test_next_deadline_later_piece_is_when_unplayed_reaches_margin(chunker, cloc
     chunker.record_audio(3.0)
     clock.advance(1.0)
     chunker.feed("two words")
-    assert chunker.next_deadline() == pytest.approx(start + 2.5)
+    assert chunker.next_deadline() == pytest.approx(start + 2.0)
+
+
+def test_next_deadline_later_piece_follows_the_play_cursor_after_a_gap():
+    clock = FakeClock(start=0.0)
+    chunker = ClauseChunker(clock=clock)
+    chunker.record_audio(1.0)
+    clock.now = 5.0
+    chunker.record_audio(2.0)  # plays from 5.0 to 7.0
+    chunker.feed("two words")
+    assert chunker.next_deadline() == pytest.approx(6.0)
 
 
 def test_next_deadline_then_poll_dispatches(chunker, clock):

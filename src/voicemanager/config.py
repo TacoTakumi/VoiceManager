@@ -271,14 +271,17 @@ class Settings(BaseSettings):
     audiocpp_tts_coalesce_ms: int = Field(default=350)       # VM_AUDIOCPP_TTS_COALESCE_MS
 
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
-    # playback-aware deadlines instead of whole sentences. The first piece goes out
-    # after this many words or this many ms, whichever comes first; later pieces
-    # wait for this many words, and are held back while more than the margin of
-    # audio is still unplayed.
+    # playback-aware deadlines instead of whole sentences. A clause mark cuts only
+    # when the piece up to it holds at least mark_min_words words. The first piece
+    # goes out at such a mark, after this many words or this many ms, whichever
+    # comes first; later pieces wait for such a mark or this many words, and are
+    # held back while more than the margin of audio is still unplayed (estimated
+    # from a play cursor, so a playback gap is not counted as audio played).
     tts_clause_first_words: int = Field(default=4, gt=0)          # VM_TTS_CLAUSE_FIRST_WORDS
     tts_clause_first_deadline_ms: int = Field(default=600, gt=0)  # VM_TTS_CLAUSE_FIRST_DEADLINE_MS
     tts_clause_later_words: int = Field(default=12, gt=0)         # VM_TTS_CLAUSE_LATER_WORDS
-    tts_clause_margin_ms: int = Field(default=500, gt=0)          # VM_TTS_CLAUSE_MARGIN_MS
+    tts_clause_margin_ms: int = Field(default=1000, gt=0)         # VM_TTS_CLAUSE_MARGIN_MS
+    tts_clause_mark_min_words: int = Field(default=3, gt=0)       # VM_TTS_CLAUSE_MARK_MIN_WORDS
 
     # Settings that hold a file or directory path. A relative value resolves
     # against resolve_home(), so it means the same file from any directory.

@@ -4,10 +4,11 @@ A ``tts_stream`` request opened with ``chunking="clause"`` sends its text to the
 engine in clause-sized pieces cut by ClauseChunker (see
 ``voicemanager.pipeline.clause_chunker``), instead of whole sentences:
 
-- while nothing is playing, a piece goes at a clause mark, at the first-piece word
-  count, or at the first-piece deadline;
-- while audio is playing, held words wait for a clause mark, the later-piece word
-  count, or the unplayed audio dropping below the margin;
+- a clause mark cuts only when the piece up to it holds the minimum word count;
+- while nothing is playing, a piece goes at such a clause mark, at the first-piece
+  word count, or at the first-piece deadline;
+- while audio is playing, held words wait for such a clause mark, the later-piece
+  word count, or the unplayed audio dropping below the margin;
 - done sends all held text at once and ends the request with one audio_end;
 - flush sends all held text at once and leaves the request open;
 - the mode is fixed by the request's first frame.
@@ -146,10 +147,54 @@ def test_a_clause_mark_sends_the_piece_at_once(cls):
     async def run():
         engine, ws = _Engine(), _WS()
         pipe = _pipe(engine, cls, **_NO_TIMER)
-        await pipe.feed_text("Well, I", False, ws, "r1", chunking="clause")
-        await _until(lambda: engine.texts == ["Well,"])
+        await pipe.feed_text("Do not mix them. It creates", False, ws, "r1",
+                             chunking="clause")
+        await _until(lambda: engine.texts == ["Do not mix them."])
+        assert pipe._clause_chunker.held_text == "It creates"
         await _finish(pipe, ws)
-        assert engine.texts == ["Well,", "I"]
+        assert engine.texts == ["Do not mix them.", "It creates"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_a_clause_mark_after_one_word_does_not_cut(cls):
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, cls, **_NO_TIMER)
+        await pipe.feed_text("Yes, I", False, ws, "r1", chunking="clause")
+        await asyncio.sleep(0.05)
+        assert engine.texts == []
+        await pipe.feed_text(" can hear you fine. What", False, ws, "r1")
+        await _until(lambda: engine.texts == ["Yes, I can hear you fine."])
+        await _finish(pipe, ws)
+        assert engine.texts == ["Yes, I can hear you fine.", "What"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_the_mark_minimum_is_passed_to_the_chunker(cls):
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, cls, clause_mark_min_words=1, **_NO_TIMER)
+        await pipe.feed_text("Yes, I", False, ws, "r1", chunking="clause")
+        await _until(lambda: engine.texts == ["Yes,"])
+        await _finish(pipe, ws)
+        assert engine.texts == ["Yes,", "I"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_the_default_margin_and_mark_minimum(cls):
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, cls, **_NO_TIMER)
+        await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
+        assert pipe._clause_chunker.unplayed_margin_ms == 1000
+        assert pipe._clause_chunker.mark_min_words == 3
+        await _finish(pipe, ws)
 
     asyncio.run(run())
 
@@ -264,21 +309,21 @@ def test_audiocpp_merges_pieces_cut_while_busy_into_one_request():
     async def run():
         engine, ws = _BusyEngine(), _WS()
         pipe = _pipe(engine, AudioCppTTSStreamPipeline, clause_first_words=2, **_NO_TIMER)
-        await pipe.feed_text("Hi,", False, ws, "r1", chunking="clause")
-        await _until(lambda: engine.texts == ["Hi,"])
+        await pipe.feed_text("Hi there friend,", False, ws, "r1", chunking="clause")
+        await _until(lambda: engine.texts == ["Hi there friend,"])
         # Two pieces become ready while the first request is still synthesizing:
         # one at a clause mark, one at the first-piece word count.
-        await pipe.feed_text(" Well,", False, ws, "r1")
+        await pipe.feed_text(" Well, I see,", False, ws, "r1")
         await pipe.feed_text(" one two", False, ws, "r1")
         assert pipe._clause_chunker.held_text == ""  # both were cut, none held
         await asyncio.sleep(0.05)
-        assert engine.texts == ["Hi,"]
+        assert engine.texts == ["Hi there friend,"]
         engine.release.set()
         # They arrive as ONE next request, joined by a space, punctuation kept.
         await _until(lambda: len(engine.calls) == 2)
-        assert engine.texts == ["Hi,", "Well, one two"]
+        assert engine.texts == ["Hi there friend,", "Well, I see, one two"]
         await _finish(pipe, ws)
-        assert engine.texts == ["Hi,", "Well, one two"]
+        assert engine.texts == ["Hi there friend,", "Well, I see, one two"]
         assert ws.kinds() == ["audio_start", "bytes", "bytes", "audio_end"]
 
     asyncio.run(run())
@@ -303,13 +348,13 @@ def test_later_frames_cannot_change_the_mode():
     async def run():
         engine, ws = _Engine(), _WS()
         pipe = _pipe(engine, **_NO_TIMER)
-        await pipe.feed_text("Yes, ", False, ws, "r1", chunking="clause")
-        await pipe.feed_text("and no, ", False, ws, "r1", chunking="sentence")
-        await pipe.feed_text("or maybe; ", False, ws, "r1")
+        await pipe.feed_text("Yes, I agree, ", False, ws, "r1", chunking="clause")
+        await pipe.feed_text("and no more, ", False, ws, "r1", chunking="sentence")
+        await pipe.feed_text("or maybe not; ", False, ws, "r1")
         await pipe.feed_text("fine", False, ws, "r1", chunking="sentence")
         await _until(lambda: len(engine.calls) == 3)
         await _finish(pipe, ws)
-        assert engine.texts == ["Yes,", "and no,", "or maybe;", "fine"]
+        assert engine.texts == ["Yes, I agree,", "and no more,", "or maybe not;", "fine"]
 
         # Opened without the field: sentence rule, whatever later frames say.
         engine.calls.clear()
@@ -354,10 +399,10 @@ def test_flush_sends_held_text_and_leaves_the_request_open(cls):
         await asyncio.sleep(0.02)
         assert ws.audio_ends() == []
         # Same request, still the clause rule.
-        await pipe.feed_text(" more text, here", False, ws, "r1")
-        await _until(lambda: engine.texts == ["two words", "more text,"])
+        await pipe.feed_text(" more text again, here", False, ws, "r1")
+        await _until(lambda: engine.texts == ["two words", "more text again,"])
         await _finish(pipe, ws)
-        assert engine.texts == ["two words", "more text,", "here"]
+        assert engine.texts == ["two words", "more text again,", "here"]
         assert len(ws.audio_ends()) == 1
 
     asyncio.run(run())
@@ -493,3 +538,27 @@ def test_the_handler_builds_the_chunker_from_settings(monkeypatch, fresh_setting
             _receive_until_audio_end(ws)
     # Two first words sends "one two" alone; the default of 4 would hold all three.
     assert engine.texts == ["one two", "three"]
+
+
+def test_the_handler_passes_the_mark_minimum(monkeypatch, fresh_settings):
+    monkeypatch.setattr("voicemanager.transport.websocket.STTPipeline", _FakeSTT)
+    monkeypatch.setenv("VM_TTS_CLAUSE_MARK_MIN_WORDS", "1")
+    monkeypatch.setenv("VM_TTS_CLAUSE_FIRST_DEADLINE_MS", "60000")
+    engine = _Engine()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        app = create_app()
+        app.state.stt_engine_type = "whisper"
+        app.state.session_registry = SessionRegistry()
+        app.state.tts_engine_type = "openvoice"
+        app.state.tts_engine = engine
+        app.state.tts_executor = executor
+        client = TestClient(app)
+        with authkit.ws_connect(client, "/ws/stream") as ws:
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_json({"type": "tts_stream", "request_id": "r1", "text": "Yes, I",
+                          "chunking": "clause"})
+            ws.send_json({"type": "tts_stream", "request_id": "r1", "text": "",
+                          "done": True})
+            _receive_until_audio_end(ws)
+    # A minimum of 1 cuts at "Yes,"; the default of 3 would send "Yes, I" whole.
+    assert engine.texts == ["Yes,", "I"]
