@@ -29,6 +29,21 @@ import websockets.exceptions
 
 logger = logging.getLogger("voicemanager.client")
 
+# The tts_stream chunking modes the server accepts.
+CHUNKING_MODES = ("sentence", "clause")
+
+
+def _check_chunking(chunking: str | None) -> None:
+    """Refuse an unknown chunking mode before a request opens.
+
+    The server drops a first frame with a bad value (an invalid_request error that the
+    streaming calls do not read) and the next frame then opens the request in sentence
+    mode, so the first chunk's words would be lost without an error.
+    """
+    if chunking is not None and chunking not in CHUNKING_MODES:
+        raise ValueError(
+            f"chunking must be one of {CHUNKING_MODES} or None, got {chunking!r}")
+
 
 # ---------------------------------------------------------------------------
 # Exception hierarchy
@@ -543,7 +558,7 @@ class VoiceManagerClient:
             chunking: Text cut mode, "sentence" or "clause". Sent on the first
                 tts_stream message; the server fixes it at request start. When
                 omitted, no chunking field is sent and the server default applies.
-                A bad value comes back as an invalid_request error frame.
+                Any other value raises ValueError before anything is sent.
 
         Returns:
             Tuple of (pcm_bytes, sample_rate). Use sample_rate when writing
@@ -551,7 +566,9 @@ class VoiceManagerClient:
 
         Raises:
             TTSError: If the connection is lost or times out.
+            ValueError: If chunking is not None, "sentence" or "clause".
         """
+        _check_chunking(chunking)
         request_id = str(uuid.uuid4())
         self.last_tts_request_id = request_id  # reachable so a caller can cancel_tts()
         audio_buf = bytearray()
@@ -660,14 +677,16 @@ class VoiceManagerClient:
             chunking: Text cut mode, "sentence" or "clause". Sent on the first
                 tts_stream message; the server fixes it at request start. When
                 omitted, no chunking field is sent and the server default applies.
-                A bad value comes back as an invalid_request error frame.
+                Any other value raises ValueError before anything is sent.
 
         Yields:
             Raw PCM bytes per audio chunk from the server.
 
         Raises:
             TTSError: If the connection is lost or times out.
+            ValueError: If chunking is not None, "sentence" or "clause".
         """
+        _check_chunking(chunking)
         if request_id is None:
             request_id = str(uuid.uuid4())
         # Expose the id so the caller can reach the request it just started.

@@ -1306,3 +1306,38 @@ class TestStreamChunking:
         assert frames[0]["voice"] == "Carter"
         assert frames[0]["chunking"] == "clause"
         assert all("voice" not in f and "chunking" not in f for f in frames[1:])
+
+
+class TestStreamChunkingValidation:
+    """An unknown chunking value fails in the caller, before any frame is sent.
+
+    The server would drop that first frame with an invalid_request error that these
+    methods never read, and the next frame would open the request in sentence mode,
+    so the first chunk's words would be lost without an error.
+    """
+
+    @pytest.mark.parametrize("method", ["stream_tts", "stream_tts_live"])
+    async def test_unknown_chunking_raises_before_sending(self, client, method):
+        client._ws = AsyncMock()
+        client._ws.send = AsyncMock()
+
+        async def _text():
+            yield "one two three"
+
+        async def _call():
+            if method == "stream_tts":
+                await client.stream_tts(_text(), chunking="clauses")
+            else:
+                async for _ in client.stream_tts_live(_text(), chunking="clauses"):
+                    pass
+
+        # The bound keeps a call that sends and then waits for audio from hanging.
+        with pytest.raises(ValueError, match="chunking"):
+            await asyncio.wait_for(_call(), timeout=2)
+        client._ws.send.assert_not_awaited()
+
+    @pytest.mark.parametrize("method", ["stream_tts", "stream_tts_live"])
+    @pytest.mark.parametrize("mode", ["sentence", "clause"])
+    async def test_known_chunking_values_are_sent(self, client, method, mode):
+        frames = await _chunking_frames(client, method, chunking=mode)
+        assert frames[0]["chunking"] == mode
