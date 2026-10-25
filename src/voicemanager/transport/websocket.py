@@ -522,6 +522,11 @@ async def websocket_endpoint(websocket: WebSocket):
         tts_stream_pipeline = stream_pipeline_cls(
             tts_pipeline=tts_pipeline,
             language=settings.tts_language,
+            # Thresholds for chunking="clause" requests; sentence requests ignore them.
+            clause_first_words=settings.tts_clause_first_words,
+            clause_first_deadline_ms=settings.tts_clause_first_deadline_ms,
+            clause_later_words=settings.tts_clause_later_words,
+            clause_margin_ms=settings.tts_clause_margin_ms,
             **stream_kwargs,
         )
 

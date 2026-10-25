@@ -11,15 +11,20 @@ import io
 import logging
 import os
 import tempfile
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 
 import numpy as np
 import soundfile as sf
 import torch
 
+from voicemanager.pipeline.clause_chunker import ClauseChunker
 from voicemanager.pipeline.sentence_split import split_sentence
 
 logger = logging.getLogger(__name__)
+
+# Floor on the clause timer's wait when a deadline lands within rounding of now.
+_CLAUSE_TIMER_MIN_S = 0.002
 
 
 class TTSEngine(ABC):
@@ -434,9 +439,26 @@ class TTSStreamPipeline:
     and flushes the remainder on done=True or timeout.
 
     One instance per WebSocket connection, created alongside TTSPipeline.
+
+    A request opened with chunking="clause" takes a different cut: its text goes
+    through a ClauseChunker (one per request) instead of the sentence splitter, a
+    per-request timer task polls the chunker at its next deadline, and the synthesis
+    loop reports every PCM chunk it sends through ``_report_audio`` so the chunker
+    knows how much audio is still unplayed. A sentence request never touches any of
+    that.
     """
 
-    def __init__(self, tts_pipeline: TTSPipeline, language: str = "EN", voice: str | None = None):
+    def __init__(
+        self,
+        tts_pipeline: TTSPipeline,
+        language: str = "EN",
+        voice: str | None = None,
+        clause_first_words: int = 4,
+        clause_first_deadline_ms: int = 600,
+        clause_later_words: int = 12,
+        clause_margin_ms: int = 500,
+        clause_clock: Callable[[], float] = time.monotonic,
+    ):
         self._tts_pipeline = tts_pipeline
         self._language = language
         self._text_buffer: str = ""
@@ -452,6 +474,19 @@ class TTSStreamPipeline:
         self._voice: str | None = voice
         # The open request's chunking mode, fixed at request start like voice.
         self._chunking: str = "sentence"
+        # Clause-mode thresholds; each clause request gets a fresh chunker built from
+        # them. The clock is injectable so tests can drive the deadline rule.
+        self._clause_settings = {
+            "first_piece_words": clause_first_words,
+            "first_piece_deadline_ms": clause_first_deadline_ms,
+            "later_piece_words": clause_later_words,
+            "unplayed_margin_ms": clause_margin_ms,
+        }
+        self._clause_clock = clause_clock
+        # Per-request clause state: None on a sentence request.
+        self._clause_chunker: ClauseChunker | None = None
+        self._clause_timer: asyncio.Task | None = None
+        self._clause_wake: asyncio.Event | None = None
 
     @property
     def chunking(self) -> str:
@@ -521,6 +556,12 @@ class TTSStreamPipeline:
             self._synthesis_task = asyncio.create_task(
                 self._synthesis_loop(websocket, request_id)
             )
+            if chunking == "clause":
+                self._start_clause(request_id)
+
+        if self._clause_chunker is not None:
+            await self._feed_clause(chunk, done, flush)
+            return
 
         self._text_buffer += chunk
 
@@ -558,7 +599,15 @@ class TTSStreamPipeline:
         Called by WebSocket handler when asyncio.wait_for times out during
         active streaming. Flushes buffer and signals end of sentences.
         """
-        if self._request_id == request_id and self._text_buffer.strip():
+        if self._clause_chunker is not None and self._request_id == request_id:
+            self._stop_clause_timer()
+            for piece in self._clause_chunker.drain():
+                logger.warning(
+                    "Flush timeout triggered for request_id=%s, flushing %d held chars",
+                    request_id, len(piece),
+                )
+                await self._sentence_queue.put(piece)
+        elif self._request_id == request_id and self._text_buffer.strip():
             logger.warning(
                 "Flush timeout triggered for request_id=%s, flushing %d chars",
                 request_id, len(self._text_buffer),
@@ -567,6 +616,106 @@ class TTSStreamPipeline:
             self._text_buffer = ""
         self._done_received = True
         await self._sentence_queue.put(None)
+
+    # --- clause mode ----------------------------------------------------------
+
+    def _start_clause(self, request_id: str) -> None:
+        """Give a new clause request its own chunker and timer task."""
+        chunker = ClauseChunker(**self._clause_settings, clock=self._clause_clock)
+        wake = asyncio.Event()
+        timer = asyncio.create_task(
+            self._clause_timer_loop(chunker, wake, self._sentence_queue))
+        self._clause_chunker = chunker
+        self._clause_wake = wake
+        self._clause_timer = timer
+        # The timer lives only as long as the request's synthesis: a synthesis that
+        # ends on its own (an error included) takes the timer with it.
+        self._synthesis_task.add_done_callback(lambda _task: timer.cancel())
+        logger.debug("Clause chunking for request_id=%s", request_id)
+
+    async def _feed_clause(self, chunk: str, done: bool, flush: bool) -> None:
+        """feed_text for a clause request: hold the text and send what the rule cuts.
+
+        done and flush both send everything held as one piece; done then ends the
+        request with the sentinel (one audio_end), flush leaves it open.
+        """
+        chunker = self._clause_chunker
+        chunker.feed(chunk)
+        if done:
+            self._done_received = True
+            self._stop_clause_timer()
+            for piece in chunker.drain():
+                await self._sentence_queue.put(piece)
+            await self._sentence_queue.put(None)
+            return
+        for piece in chunker.drain() if flush else chunker.poll():
+            await self._sentence_queue.put(piece)
+        self._wake_clause_timer()
+
+    def _report_audio(self, request_id: str, n_samples: int, sample_rate: int) -> None:
+        """Tell the clause chunker that a PCM chunk of the request was just sent.
+
+        Every synthesis loop calls this after each chunk it sends, so the chunker's
+        unplayed-audio estimate tracks what the client is playing. A no-op on a
+        sentence request and for a request that is no longer the current one (a
+        superseded task still unwinding).
+        """
+        chunker = self._clause_chunker
+        if chunker is None or request_id != self._request_id or sample_rate <= 0:
+            return
+        chunker.record_audio(n_samples / sample_rate)
+        if self._done_received:
+            return  # done already sent everything held
+        for piece in chunker.poll():
+            self._sentence_queue.put_nowait(piece)
+        self._wake_clause_timer()
+
+    async def _clause_timer_loop(
+        self, chunker: ClauseChunker, wake: asyncio.Event, queue: asyncio.Queue
+    ) -> None:
+        """Poll the chunker at its next deadline, so a time trigger is not missed.
+
+        Sleeps until next_deadline() or until ``wake`` is set (a feed or an audio
+        report changed the deadline), then asks again. Runs until cancelled with the
+        request.
+        """
+        while True:
+            wake.clear()
+            deadline = chunker.next_deadline()
+            if deadline is None:
+                await wake.wait()  # nothing held: only a new feed can cut a piece
+                continue
+            delay = deadline - self._clause_clock()
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    continue  # re-armed: the deadline may have moved
+            pieces = chunker.poll()
+            for piece in pieces:
+                logger.debug("Clause timer sent %d chars", len(piece))
+                queue.put_nowait(piece)
+            if not pieces:
+                # The deadline sits within rounding of now; give the clock a moment
+                # rather than spin.
+                await asyncio.sleep(_CLAUSE_TIMER_MIN_S)
+
+    def _wake_clause_timer(self) -> None:
+        if self._clause_wake is not None:
+            self._clause_wake.set()
+
+    def _stop_clause_timer(self) -> None:
+        if self._clause_timer is not None:
+            self._clause_timer.cancel()
+        self._clause_timer = None
+        self._clause_wake = None
+
+    def _stop_clause(self) -> None:
+        """Drop the request's clause state: timer cancelled, chunker gone."""
+        self._stop_clause_timer()
+        self._clause_chunker = None
 
     async def _synthesis_loop(self, websocket, request_id: str) -> None:
         """Consume sentences from queue and synthesize sequentially.
@@ -618,6 +767,7 @@ class TTSStreamPipeline:
                     )
                     pcm_bytes = float32_to_pcm16(audio_np)
                     await websocket.send_bytes(pcm_bytes)
+                    self._report_audio(request_id, len(audio_np), sr)
                 elif getattr(self._tts_pipeline._engine, "is_batch", False):
                     # Batch engine, no voice profile -- offload the blocking
                     # inference so the receive loop keeps reading while we speak.
@@ -632,6 +782,7 @@ class TTSStreamPipeline:
                     )
                     pcm_bytes = float32_to_pcm16(audio_np)
                     await websocket.send_bytes(pcm_bytes)
+                    self._report_audio(request_id, len(audio_np), sr)
                 else:
                     kwargs = {
                         "speaker_key": self._tts_pipeline._speaker_key,
@@ -645,6 +796,8 @@ class TTSStreamPipeline:
                     async for chunk_np in self._tts_pipeline._engine.stream_synthesize(sentence, **kwargs):
                         pcm_bytes = float32_to_pcm16(chunk_np)
                         await websocket.send_bytes(pcm_bytes)
+                        self._report_audio(
+                            request_id, len(chunk_np), self._tts_pipeline._engine.sample_rate)
                 sentences_synthesized += 1
                 logger.debug(
                     "Streamed TTS sentence: request_id=%s sentence=%s",
@@ -684,6 +837,7 @@ class TTSStreamPipeline:
                 await self._synthesis_task
             except asyncio.CancelledError:
                 pass
+        self._stop_clause()
         self._text_buffer = ""
         self._request_id = None
         self._done_received = False
@@ -706,6 +860,7 @@ class TTSStreamPipeline:
             task.cancel()
             self._abandoned = [t for t in self._abandoned if not t.done()]
             self._abandoned.append(task)
+        self._stop_clause()
         self._text_buffer = ""
         self._request_id = None
         self._done_received = False
@@ -717,6 +872,7 @@ class TTSStreamPipeline:
         """Clean up on disconnect. Cancel task, clear state."""
         if self._synthesis_task is not None and not self._synthesis_task.done():
             self._synthesis_task.cancel()
+        self._stop_clause()
         self._text_buffer = ""
         self._request_id = None
         self._synthesis_task = None
