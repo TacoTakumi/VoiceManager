@@ -141,3 +141,74 @@ def test_tts_new_utterance_new_id():
                 (NOVOICE, "Open a window.")])
     assert sink.calls[-2:] == [("text", "req-2", "Open a window."), ("flush", "req-2")]
     assert orch.request_id == "req-2"
+
+
+class ChunkingSink(FakeSink):
+    """A FakeSink whose text calls also record the chunking value passed, if any."""
+
+    async def send_text(self, request_id: str, text: str, chunking: str | None = None) -> None:
+        self.calls.append(("text", request_id, text, chunking))
+
+
+SCRIPTED = [(NOVOICE, LISTEN), (NOVOICE, "Do not mix"), (NOVOICE, "those chemicals."),
+            (NOVOICE, "Open a window."), (NOVOICE, LISTEN), (NOVOICE, LISTEN)]
+
+
+def test_clause_mode_sequence():
+    sink, player = ChunkingSink(), FakePlayer()
+    orch = mc.TTSOrchestrator(sink, player, new_id=_ids(), mode="clause")
+    _run(orch, SCRIPTED)
+    assert sink.calls == [
+        ("text", "req-1", "Do not mix", "clause"),
+        ("text", "req-1", " those chemicals.", None),
+        ("text", "req-1", " Open a window.", None),
+        ("done", "req-1"),
+    ]
+    assert not [c for c in sink.calls if c[0] == "flush"]
+
+
+def test_flush_mode_sequence():
+    sink, player = ChunkingSink(), FakePlayer()
+    orch = mc.TTSOrchestrator(sink, player, new_id=_ids(), mode="flush")
+    _run(orch, SCRIPTED)
+    assert sink.calls == [
+        ("text", "req-1", "Do not mix", None), ("flush", "req-1"),
+        ("text", "req-1", " those chemicals.", None), ("flush", "req-1"),
+        ("text", "req-1", " Open a window.", None), ("flush", "req-1"),
+        ("done", "req-1"),
+    ]
+
+
+def test_orchestrator_default_mode_is_flush():
+    sink, player, orch = _make()
+    assert orch.mode == "flush"
+
+
+def test_orchestrator_rejects_unknown_mode():
+    import pytest
+
+    with pytest.raises(ValueError):
+        mc.TTSOrchestrator(FakeSink(), FakePlayer(), mode="word")
+
+
+def test_clause_mode_new_utterance_chunking_again():
+    sink, player = ChunkingSink(), FakePlayer()
+    orch = mc.TTSOrchestrator(sink, player, new_id=_ids(), mode="clause")
+    _run(orch, [(NOVOICE, "Do not mix"), (NOVOICE, LISTEN), ("okay", LISTEN),
+                (NOVOICE, "Open a window.")])
+    assert sink.calls[-1] == ("text", "req-2", "Open a window.", "clause")
+
+
+def test_clause_mode_cutin_cancels_and_clears():
+    sink, player = ChunkingSink(), FakePlayer()
+    orch = mc.TTSOrchestrator(sink, player, new_id=_ids(), mode="clause")
+    _run(orch, [(NOVOICE, "Do not mix")])
+    player.playing, player.queue = True, [b"chunk1", b"chunk2"]
+    _run(orch, [("wait stop", LISTEN)])
+    assert [c for c in sink.calls if c[0] == "cancel"] == [("cancel", "req-1")]
+    assert not [c for c in sink.calls if c[0] == "done"]
+    assert player.queue == []
+    assert orch.cutins == 1
+    before = list(sink.calls)
+    _run(orch, [(NOVOICE, LISTEN)])
+    assert sink.calls == before

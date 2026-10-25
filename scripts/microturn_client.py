@@ -16,14 +16,18 @@ adapter card's demo call; a script file has one heard string per line, empty for
 
 Live mode is a real call over VoiceManager: the microphone streams to its STT, each tick
 sends the new words to the model, and the model's words go to its streaming TTS and play
-on the speaker. It writes one JSON line per tick and per utterance (turn time, delay from
-the last heard word to the first audio) and a WAV of what played. Use headphones: there
+on the speaker. ``--tts-mode clause`` (the default) opens each utterance with chunking
+"clause", so the server cuts the held words into small pieces itself; ``--tts-mode flush``
+flushes each speaking tick's words instead. It writes one JSON line per tick and per
+utterance (turn time, delay from the last heard word to the first audio, and the TTS mode
+on each tick line) and a WAV of what played. Use headphones: there
 is no echo cancellation, so the microphone would hear the assistant. The bearer token
 comes from the ``VOICEMANAGER_TOKEN`` environment variable.
 
     python scripts/microturn_client.py replay [--script FILE] [--url URL] [--model NAME]
     python scripts/microturn_client.py live [--vm-host HOST] [--vm-port PORT] [--voice NAME]
-        [--duration SECONDS] [--log FILE] [--wav FILE] [--url URL] [--model NAME]
+        [--duration SECONDS] [--log FILE] [--wav FILE] [--tts-mode {clause,flush}]
+        [--url URL] [--model NAME]
 """
 import argparse
 import asyncio
@@ -229,8 +233,12 @@ class TTSSink(Protocol):
     buffered and keeps it open, ``done`` ends it and ``cancel`` stops it (``tts_cancel``).
     """
 
-    async def send_text(self, request_id: str, text: str) -> None:
-        """Append text to the request, opening it on first use."""
+    async def send_text(self, request_id: str, text: str, chunking: str | None = None) -> None:
+        """Append text to the request, opening it on first use.
+
+        ``chunking`` is passed only on the first call of a request, and only in clause
+        mode; the server fixes it when the request starts.
+        """
         ...
 
     async def flush(self, request_id: str) -> None:
@@ -258,18 +266,27 @@ class Player(Protocol):
         ...
 
 
+TTS_MODES = ("clause", "flush")
+
+
 class TTSOrchestrator:
     """Turns each tick's decision into VoiceManager streaming TTS calls.
 
-    One request per assistant utterance, with a flush per speaking tick, so the audio
-    of each tick's words starts within a tick. The first LISTEN after speech ends the
-    request with ``done``. The model is never told what audio is playing, so the client
+    One request per assistant utterance. In ``flush`` mode each speaking tick's words
+    are flushed, so their audio starts within a tick. In ``clause`` mode the first text
+    of a request carries chunking "clause" and no flush is sent: the server cuts the
+    held words into small pieces itself. In both modes the first LISTEN after speech
+    ends the request with ``done``. The model is never told what audio is playing, so the client
     stops playback itself when the user talks over it: user words, a LISTEN and audio
     still playing cancel the request and clear the player.
     """
 
     def __init__(self, sink: TTSSink, player: Player,
-                 new_id: Callable[[], str] = lambda: str(uuid.uuid4())):
+                 new_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+                 mode: str = "flush"):
+        if mode not in TTS_MODES:
+            raise ValueError(f"unknown TTS mode {mode!r}; expected one of {TTS_MODES}")
+        self.mode = mode
         self.sink = sink
         self.player = player
         self.new_id = new_id
@@ -282,12 +299,15 @@ class TTSOrchestrator:
         """Send the TTS calls for one tick: what was heard and what the model said."""
         if said != LISTEN:
             if self.open:
-                text = f" {said}"
+                await self.sink.send_text(self.request_id, f" {said}")
             else:
                 self.request_id, self.open, self.live = self.new_id(), True, True
-                text = said
-            await self.sink.send_text(self.request_id, text)
-            await self.sink.flush(self.request_id)
+                if self.mode == "clause":
+                    await self.sink.send_text(self.request_id, said, chunking="clause")
+                else:
+                    await self.sink.send_text(self.request_id, said)
+            if self.mode == "flush":
+                await self.sink.flush(self.request_id)
             return
         user_spoke = bool(heard) and heard != NOVOICE
         if user_spoke and self.player.is_playing():
@@ -355,13 +375,17 @@ class WsTTSSink:
         self.voice = voice
         self._opened: set[str] = set()
 
-    async def send_text(self, request_id: str, text: str) -> None:
-        """Append text to the request; the first frame of a request carries the voice."""
+    async def send_text(self, request_id: str, text: str, chunking: str | None = None) -> None:
+        """Append text to the request; its first frame carries the voice and chunking."""
         payload = {"type": "tts_stream", "request_id": request_id, "text": text,
                    "done": False}
-        # The server fixes the voice when the request starts.
-        if self.voice is not None and request_id not in self._opened:
-            payload["voice"] = self.voice
+        # The server fixes the voice and the chunking when the request starts, so later
+        # frames leave them out.
+        if request_id not in self._opened:
+            if self.voice is not None:
+                payload["voice"] = self.voice
+            if chunking is not None:
+                payload["chunking"] = chunking
         self._opened.add(request_id)
         await self.client._ws.send(json.dumps(payload))
 
@@ -507,6 +531,7 @@ class LiveSession:
             "said": result.said, "p_listen": round(result.p_listen, 4),
             "turn_ms": round(result.turn_ms, 1), "requests": result.requests,
             "revised": self.slicer.last_revised, "revisions": self.slicer.revisions,
+            "tts_mode": self.orchestrator.mode,
         })
         return result
 
@@ -539,7 +564,7 @@ class LiveSession:
         return True
 
     def summary_line(self) -> str:
-        """One line for the end of a call: turn time, first-audio delay, budget, cut-ins."""
+        """One line for the end of a call: turn time, first audio, budget, cut-ins, mode."""
         turns = [r.turn_ms for r in self.results]
         turn = f"{statistics.median(turns):.0f} ms" if turns else "n/a"
         first = (f"{statistics.median(self.first_audio_ms):.0f} ms"
@@ -547,7 +572,7 @@ class LiveSession:
         over = sum(t > TICK * 1000 for t in turns)
         return (f"{len(turns)} ticks, median turn {turn}, median first audio {first}, "
                 f"{over} over budget, {self.slicer.revisions} revisions, "
-                f"{self.orchestrator.cutins} cut-ins")
+                f"{self.orchestrator.cutins} cut-ins, tts mode {self.orchestrator.mode}")
 
 
 async def _mic_task(client) -> None:
@@ -651,7 +676,7 @@ async def live(args: argparse.Namespace) -> None:
         raise
     player = AudioPlayer()
     sink = WsTTSSink(client, voice=args.voice)
-    orchestrator = TTSOrchestrator(sink, player)
+    orchestrator = TTSOrchestrator(sink, player, mode=args.tts_mode)
     engine = LlamaServerEngine(args.url, model=args.model)
     try:
         with open(log_path, "w") as log:
@@ -711,6 +736,9 @@ def _parser() -> argparse.ArgumentParser:
                     help="JSON lines log (default: runs/microturn/microturn-<stamp>.jsonl)")
     lv.add_argument("--wav", default=None,
                     help="WAV of the audio played (default: runs/microturn/microturn-<stamp>.wav)")
+    lv.add_argument("--tts-mode", choices=TTS_MODES, default="clause",
+                    help="clause: the server cuts each utterance into small pieces; "
+                         "flush: flush each speaking tick's words (default: clause)")
     return parser
 
 

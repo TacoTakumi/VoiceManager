@@ -320,3 +320,78 @@ def test_live_explicit_paths_override_run_directory(tmp_path, monkeypatch):
     args = mc._parser().parse_args(["live", "--log", "a.jsonl", "--wav", "b.wav"])
     assert mc.live_output_paths(args) == ("a.jsonl", "b.wav")
     assert not (tmp_path / "runs").exists()
+
+
+class ChunkingSink(FakeSink):
+    """A FakeSink whose text calls also take the chunking value."""
+
+    async def send_text(self, request_id: str, text: str, chunking: str | None = None) -> None:
+        self.calls.append(("text", request_id, text, chunking))
+
+
+def _mode_session(mode: str, replies: list[str]):
+    ids = iter(f"r{i}" for i in range(1, 100))
+    orch = mc.TTSOrchestrator(ChunkingSink(), FakePlayer(), new_id=lambda: next(ids),
+                              mode=mode)
+    log = io.StringIO()
+    session = mc.LiveSession(ScriptedEngine(replies), mc.TickSlicer(), orch, log,
+                             clock=lambda: 100.0)
+    return session, log
+
+
+def test_live_tick_log_names_tts_mode():
+    for mode in ("clause", "flush"):
+        session, log = _mode_session(mode, ["Do not", LISTEN])
+
+        async def run():
+            await session.run_tick(100.6)
+            await session.run_tick(101.2)
+
+        asyncio.run(run())
+        assert [line["tts_mode"] for line in _lines(log)] == [mode, mode]
+
+
+def test_live_summary_names_tts_mode():
+    for mode in ("clause", "flush"):
+        session, _ = _mode_session(mode, [])
+        assert f"tts mode {mode}" in session.summary_line()
+
+
+def test_live_sink_clause_chunking_on_first_frame():
+    client = FakeClient()
+    sink = mc.WsTTSSink(client, voice="alice")
+
+    async def run():
+        await sink.send_text("r1", "Do not", chunking="clause")
+        await sink.send_text("r1", " mix")
+        await sink.done("r1")
+
+    asyncio.run(run())
+    frames = [json.loads(m) for m in client._ws.sent]
+    assert frames == [
+        {"type": "tts_stream", "request_id": "r1", "text": "Do not", "done": False,
+         "voice": "alice", "chunking": "clause"},
+        {"type": "tts_stream", "request_id": "r1", "text": " mix", "done": False},
+        {"type": "tts_stream", "request_id": "r1", "text": "", "done": True},
+    ]
+    assert client.calls == []
+
+
+def test_live_sink_chunking_only_on_first_frame():
+    client = FakeClient()
+    sink = mc.WsTTSSink(client)
+
+    async def run():
+        await sink.send_text("r1", "Do not")
+        await sink.send_text("r1", " mix", chunking="clause")
+
+    asyncio.run(run())
+    assert all("chunking" not in json.loads(m) for m in client._ws.sent)
+
+
+def test_live_cli_tts_mode():
+    assert mc._parser().parse_args(["live"]).tts_mode == "clause"
+    args = mc._parser().parse_args(["live", "--tts-mode", "flush"])
+    assert args.tts_mode == "flush"
+    with pytest.raises(SystemExit):
+        mc._parser().parse_args(["live", "--tts-mode", "word"])
