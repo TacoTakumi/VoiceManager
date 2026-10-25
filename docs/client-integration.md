@@ -303,7 +303,7 @@ await client.cancel_tts(rid)   # fire-and-forget; server acks with an immediate 
 with exactly one `audio_end` carrying `reason: "cancelled"`, and the client
 discards any PCM still in flight for that id until the ack lands. A cancelled
 `request_id` is permanently dead - **mint a fresh id for the next reply**. See
-behaviours 5 and 6 in [Turn-taking protocol surface](#turn-taking-protocol-surface).
+behaviours 6 and 7 in [Turn-taking protocol surface](#turn-taking-protocol-surface).
 
 ### 7. Tear down
 
@@ -711,7 +711,7 @@ again).
 
 ## Turn-taking protocol surface
 
-The `realtime-turn-taking` work landed six behaviours on top of the base
+The `realtime-turn-taking` work and clause mode add seven behaviours on top of the base
 STT/TTS protocol, all **additive and opt-in** - a client that ignores them keeps
 the pre-turn-taking behaviour unchanged. Each behaviour below names the source
 symbol that defines it, so you can diff the contract against current code.
@@ -760,7 +760,7 @@ A cut at a clause mark sends the text up to the last qualifying mark and keeps t
   path, including the `VM_TTS_STREAM_FLUSH_TIMEOUT` idle-flush close, which is a
   normal completion, not an interruption.
 - `"cancelled"` - a `tts_cancel`, or a supersede by a newer `request_id`,
-  stopped the reply (see behaviour 5).
+  stopped the reply (see behaviour 6).
 - `"error"` - synthesis failed after the stream opened: the request is
   over and delivered no further audio. The session survives a request-scoped
   failure - the next `tts` on the same connection proceeds normally. (A
@@ -1353,7 +1353,7 @@ that run when the confirmed final arrives finds the final filtered out as "old" 
 the watermark blocks the very supersede it was built to enable.
 
 Use `turn_id` for turn scoping instead (see
-[Turn-taking, behaviours 3 and 4](#turn-taking-protocol-surface)). Open a turn
+[Turn-taking, behaviours 4 and 5](#turn-taking-protocol-surface)). Open a turn
 with `turn_start`, take the `turn_id` from the `turn_started` ack, and filter
 transcription frames by that id. This fences out stale prior-turn utterances
 without ever discarding an in-place revision of the current turn's own
