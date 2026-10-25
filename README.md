@@ -13,6 +13,7 @@ VoiceManager is made for voice agents that talk with a person in real time. One 
 - **Barge-in.** `tts_cancel` stops a reply at once. The server sends one `audio_end` with `reason: "cancelled"` and no more audio for that request, so the agent can stop talking when the person starts.
 - **Turns.** `turn_start` opens a new turn, and each transcript carries the `turn_id` of the audio it came from. A client can then drop late transcripts that belong to a turn it already ended.
 - **Flush.** A `tts_stream` frame with `flush: true` speaks the buffered text now and keeps the request open for more text.
+- **Clause mode.** A client that streams a few words at a time can set `chunking: "clause"` on the first `tts_stream` frame. The server then holds the text and cuts pieces by clause marks, word counts and how much audio is still unplayed, so the speech is smoother. The default is `"sentence"`. `flush` and `done` keep their meaning. Four settings tune it: `VM_TTS_CLAUSE_FIRST_WORDS` (4), `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` (600), `VM_TTS_CLAUSE_LATER_WORDS` (12) and `VM_TTS_CLAUSE_MARGIN_MS` (500). See [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause).
 
 These features are optional. A client that does not use them gets plain STT and TTS. [Turn-taking protocol surface](docs/client-integration.md#turn-taking-protocol-surface) in `docs/client-integration.md` gives the frames and the rules a client must follow.
 

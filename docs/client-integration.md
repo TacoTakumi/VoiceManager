@@ -734,7 +734,24 @@ puts exactly one `flush: true, done: false` frame on the wire.
 Flush only at a boundary **you** have determined is the end of a speakable
 unit; flushing mid-word produces a clipped, unnatural segment seam.
 
-### 2. Why an audio stream ended: `reason` on `audio_end`
+### 2. Clause mode: `chunking: "clause"`
+
+A client that sends 2-3 words per frame, and flushes after each one, gets choppy speech: the server makes one synthesis per fragment. Set `chunking` to `"clause"` on the **first** `tts_stream` frame of a request to avoid this. The server then holds the text and cuts pieces itself, with a rule that looks at how much audio of the request is still unplayed. The default is `"sentence"`, which is the behavior described elsewhere in this guide and does not change. Later `chunking` values on the same request are ignored. A value other than `"sentence"` or `"clause"` gets an `error` frame with `error_type` `"invalid_request"`. The frame is dropped and the connection stays open.
+
+```json
+{ "type": "tts_stream", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "text": "Sure, I can", "chunking": "clause", "done": false }
+```
+
+The cut rule has two cases. A clause mark is one of `,` `;` `:` `.` `?` `!` that ends a word (so `3.5` holds no mark).
+
+- **First piece** (nothing is playing): the server sends a piece at a clause mark, when it holds `VM_TTS_CLAUSE_FIRST_WORDS` words, or `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` after the first held word arrived. The first of the three that happens wins.
+- **Later pieces** (audio is playing): the server sends a piece at a clause mark, when it holds `VM_TTS_CLAUSE_LATER_WORDS` words, or when the estimated unplayed audio drops below `VM_TTS_CLAUSE_MARGIN_MS`. The estimate is the duration of all audio sent for the request, minus the time since the first audio chunk was sent, and never below 0. When it reaches 0, the first-piece rule applies again.
+
+A cut at a clause mark sends the text up to the last mark and keeps the words after it held. A cut by word count or time sends all held text. Punctuation stays in the text. Because later pieces wait while audio plays, they grow longer and the speech gets smoother.
+
+`flush` and `done` keep their meaning in clause mode. `flush: true` sends all held text now and keeps the request open. `done: true` sends all held text and ends the request with one `audio_end`. A client that uses clause mode can still flush at its own boundaries. On the audiocpp engine, pieces that queue while it is busy are merged by its existing coalescing. The four settings are in [Configuration](#configuration).
+
+### 3. Why an audio stream ended: `reason` on `audio_end`
 
 `AudioEndMessage` carries a `reason` field (`AudioEndMessage.reason`, default
 `"complete"`). It tells a client *why* a TTS reply stopped:
@@ -759,7 +776,7 @@ over, exactly as before.
 { "type": "audio_end", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "reason": "cancelled" }
 ```
 
-### 3. `turn_id` on transcription frames
+### 4. `turn_id` on transcription frames
 
 Every `TranscriptionMessage` carries a `turn_id` (`TranscriptionMessage.turn_id`,
 default `0`). It identifies the turn an utterance **belongs to** - the turn that
@@ -774,7 +791,7 @@ Python client guarantees the key is present on every transcription dict via
 { "type": "transcription", "text": "book me a flight to boston", "is_final": true, "turn_id": 4, "segment_index": 3 }
 ```
 
-### 4. The `turn_start` / `turn_started` control frames
+### 5. The `turn_start` / `turn_started` control frames
 
 A client opens a new conversation turn by sending the bare control frame
 `{"type": "turn_start"}` (no payload). The **server owns the turn counter**: it
@@ -794,7 +811,7 @@ server -> { "type": "turn_started", "turn_id": 5 }
 Opening turns is optional; it exists so a consumer can fence out
 now-stale utterances from a previous turn after a barge-in.
 
-### 5. Cancel: an immediate `audio_end`, then no PCM
+### 6. Cancel: an immediate `audio_end`, then no PCM
 
 Cancelling a TTS reply is fire-and-forget by design. The client sends a
 `tts_cancel` frame (`TTSCancelMessage`) - or the Python client's
@@ -811,7 +828,7 @@ discard PCM for a cancelled `request_id` until its `audio_end` lands; the
 [Gotchas](#gotchas) section covers this rule and the client's `_cancelled_tts`
 mechanism in full.
 
-### 6. A cancelled `request_id` is permanently dead
+### 7. A cancelled `request_id` is permanently dead
 
 Once a `request_id` is cancelled, it is **dead for the life of the connection**.
 A later `tts` or `tts_stream` frame carrying that same id is ignored outright by
@@ -946,6 +963,7 @@ semantics.
 | `done` | boolean | `false` | `true` closes the request; the server synthesizes the remainder and emits a trailing `audio_end`. |
 | `flush` | boolean | `false` | `true` synthesizes the buffer so far and leaves the request open; no `audio_end`. |
 | `voice` | string or null | `null` | Preset voice (VibeVoice and audiocpp); honored on the first frame, which fixes the reply's voice. |
+| `chunking` | string | `"sentence"` | How the server cuts the streamed text into synthesis pieces: `"sentence"` or `"clause"`. The first frame of a request fixes it and later values are ignored, like `voice`. Any other value gets an `error` frame with `error_type` `"invalid_request"`. The server drops that frame and keeps the connection open. See [Clause mode](#2-clause-mode-chunking-clause). |
 
 #### `tts_cancel` - `TTSCancelMessage`
 
@@ -1109,6 +1127,10 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_STT_ENDPOINT_HOLD_MS` | `1000` | Speculative endpoint-hold window; `> 0` enables provisional `endpoint` frames, `0` disables them (immediate finals). |
 | `VM_SESSION_TIMEOUT` | `300` | Inactivity seconds before a `1001` close (with a ~30s `timeout_warning`). |
 | `VM_TTS_STREAM_FLUSH_TIMEOUT` | `10` | Idle seconds before a streaming reply auto-flushes and completes with `reason: "complete"`. |
+| `VM_TTS_CLAUSE_FIRST_WORDS` | `4` | Clause mode: words held before the first piece is sent, if no clause mark comes first. |
+| `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` | `600` | Clause mode: milliseconds after the first held word before the first piece is sent. |
+| `VM_TTS_CLAUSE_LATER_WORDS` | `12` | Clause mode: words held before a later piece is sent, while audio is playing. |
+| `VM_TTS_CLAUSE_MARGIN_MS` | `500` | Clause mode: a later piece is sent when the estimated unplayed audio drops below this. |
 | `VM_DEVICE` | `auto` | Compute device (`auto`, `cpu`, `cuda`, `cuda:N`); affects latency, not the protocol. |
 
 The server has many more `VM_` variables for model selection and tuning

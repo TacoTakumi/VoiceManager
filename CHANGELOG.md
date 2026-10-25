@@ -4,10 +4,23 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1]
+## [0.3.0]
 
 ### Added
 
+- `tts_stream` has a `chunking` field: `"sentence"` (the default, unchanged) or
+  `"clause"`. In clause mode the server holds the streamed text and cuts
+  playback-aware pieces at clause marks, word counts or when the unplayed
+  audio runs low, so a client that sends a few words at a time gets smooth
+  speech. The first frame of a request fixes the mode. Any other value gets an
+  `invalid_request` error frame and the connection stays open. `flush` and
+  `done` keep their meaning. Works on the shared and the audiocpp pipelines.
+- Settings `VM_TTS_CLAUSE_FIRST_WORDS` (4), `VM_TTS_CLAUSE_FIRST_DEADLINE_MS`
+  (600), `VM_TTS_CLAUSE_LATER_WORDS` (12) and `VM_TTS_CLAUSE_MARGIN_MS` (500).
+- `chunking` argument in `stream_tts` and `stream_tts_live` of the Python
+  client. It is sent on the first frame only.
+- `--tts-mode clause|flush` in `scripts/microturn_client.py` live mode (clause
+  is the default), and run files go to `runs/microturn/` by default.
 - `scripts/microturn_client.py`, a reference client for micro-turn full-duplex
   voice: every 0.6 s a text LLM with the micro-turn LoRA decides to speak a few
   words or to listen. Replay mode runs a scripted call as text. Live mode runs
