@@ -120,7 +120,10 @@ def _other_tasks() -> set:
     return {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
 
 
-PIPELINES = [TTSStreamPipeline, AudioCppTTSStreamPipeline]
+PIPELINES = [
+    pytest.param(TTSStreamPipeline, id="shared"),
+    pytest.param(AudioCppTTSStreamPipeline, id="audiocpp"),
+]
 
 
 # --- routing ----------------------------------------------------------------
@@ -166,10 +169,11 @@ def test_the_first_piece_goes_at_the_first_piece_word_count(cls):
     asyncio.run(run())
 
 
-def test_the_first_piece_deadline_follows_the_injected_clock():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_the_first_piece_deadline_follows_the_injected_clock(cls):
     async def run():
         engine, ws, clock = _Engine(), _WS(), _Clock()
-        pipe = _pipe(engine, clause_first_deadline_ms=600, clause_clock=clock)
+        pipe = _pipe(engine, cls, clause_first_deadline_ms=600, clause_clock=clock)
         await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
         clock.t = 0.5
         await pipe.feed_text(" there", False, ws, "r1")
@@ -183,10 +187,11 @@ def test_the_first_piece_deadline_follows_the_injected_clock():
     asyncio.run(run())
 
 
-def test_the_timer_sends_the_first_piece_at_the_deadline():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_the_timer_sends_the_first_piece_at_the_deadline(cls):
     async def run():
         engine, ws = _Engine(), _WS()
-        pipe = _pipe(engine, clause_first_deadline_ms=80)
+        pipe = _pipe(engine, cls, clause_first_deadline_ms=80)
         loop = asyncio.get_running_loop()
         t0 = loop.time()
         await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
@@ -199,12 +204,13 @@ def test_the_timer_sends_the_first_piece_at_the_deadline():
     asyncio.run(run())
 
 
-def test_held_words_wait_for_the_margin_while_audio_plays():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_held_words_wait_for_the_margin_while_audio_plays(cls):
     async def run():
         # Each piece is 0.4 s of audio; the margin is 0.1 s, so text held while
         # the first piece plays goes about 0.3 s after its audio was sent.
         engine, ws = _Engine(audio_s=0.4, sample_rate=1000), _WS()
-        pipe = _pipe(engine, clause_first_words=2, clause_first_deadline_ms=40,
+        pipe = _pipe(engine, cls, clause_first_words=2, clause_first_deadline_ms=40,
                      clause_later_words=12, clause_margin_ms=100)
         await pipe.feed_text("One two", False, ws, "r1", chunking="clause")
         await _until(lambda: len(engine.calls) == 1)
@@ -221,10 +227,11 @@ def test_held_words_wait_for_the_margin_while_audio_plays():
     asyncio.run(run())
 
 
-def test_the_later_piece_word_count_sends_while_audio_plays():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_the_later_piece_word_count_sends_while_audio_plays(cls):
     async def run():
         engine, ws = _Engine(audio_s=5.0, sample_rate=1000), _WS()
-        pipe = _pipe(engine, clause_first_words=2, clause_later_words=4, **_NO_TIMER)
+        pipe = _pipe(engine, cls, clause_first_words=2, clause_later_words=4, **_NO_TIMER)
         await pipe.feed_text("One two", False, ws, "r1", chunking="clause")
         await _until(lambda: len(engine.calls) == 1)
         await pipe.feed_text(" three four five", False, ws, "r1")
@@ -237,10 +244,51 @@ def test_the_later_piece_word_count_sends_while_audio_plays():
     asyncio.run(run())
 
 
-def test_audio_reports_are_ignored_on_a_sentence_request():
+class _BusyEngine(_Engine):
+    """An engine whose first request stays in flight until ``release`` is set."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.release = asyncio.Event()
+
+    async def stream_synthesize(self, text: str, **kwargs):
+        first = not self.calls
+        self.calls.append((text, asyncio.get_running_loop().time()))
+        if first:
+            await self.release.wait()
+        n = 0 if self._audio_s is None else int(round(self._audio_s * self._sample_rate))
+        yield np.zeros(n, dtype=np.float32)
+
+
+def test_audiocpp_merges_pieces_cut_while_busy_into_one_request():
+    async def run():
+        engine, ws = _BusyEngine(), _WS()
+        pipe = _pipe(engine, AudioCppTTSStreamPipeline, clause_first_words=2, **_NO_TIMER)
+        await pipe.feed_text("Hi,", False, ws, "r1", chunking="clause")
+        await _until(lambda: engine.texts == ["Hi,"])
+        # Two pieces become ready while the first request is still synthesizing:
+        # one at a clause mark, one at the first-piece word count.
+        await pipe.feed_text(" Well,", False, ws, "r1")
+        await pipe.feed_text(" one two", False, ws, "r1")
+        assert pipe._clause_chunker.held_text == ""  # both were cut, none held
+        await asyncio.sleep(0.05)
+        assert engine.texts == ["Hi,"]
+        engine.release.set()
+        # They arrive as ONE next request, joined by a space, punctuation kept.
+        await _until(lambda: len(engine.calls) == 2)
+        assert engine.texts == ["Hi,", "Well, one two"]
+        await _finish(pipe, ws)
+        assert engine.texts == ["Hi,", "Well, one two"]
+        assert ws.kinds() == ["audio_start", "bytes", "bytes", "audio_end"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_audio_reports_are_ignored_on_a_sentence_request(cls):
     async def run():
         engine, ws = _Engine(), _WS()
-        pipe = _pipe(engine)
+        pipe = _pipe(engine, cls)
         await pipe.feed_text("Hello there", False, ws, "r1")
         pipe._report_audio("r1", 48000, 24000)  # no chunker: a no-op
         await _finish(pipe, ws)
@@ -315,10 +363,11 @@ def test_flush_sends_held_text_and_leaves_the_request_open(cls):
     asyncio.run(run())
 
 
-def test_flush_timeout_sends_held_text_and_ends_the_request():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_flush_timeout_sends_held_text_and_ends_the_request(cls):
     async def run():
         engine, ws = _Engine(), _WS()
-        pipe = _pipe(engine, **_NO_TIMER)
+        pipe = _pipe(engine, cls, **_NO_TIMER)
         await pipe.feed_text("two words", False, ws, "r1", chunking="clause")
         await pipe.flush_timeout(ws, "r1")
         await asyncio.wait_for(pipe.synthesis_task, 2.0)
@@ -332,10 +381,11 @@ def test_flush_timeout_sends_held_text_and_ends_the_request():
 
 # --- the timer goes with the request ----------------------------------------
 
-def test_abandon_stops_the_timer():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_abandon_stops_the_timer(cls):
     async def run():
         engine, ws = _Engine(), _WS()
-        pipe = _pipe(engine, clause_first_deadline_ms=40)
+        pipe = _pipe(engine, cls, clause_first_deadline_ms=40)
         await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
         task = pipe.abandon()
         await asyncio.sleep(0.12)
@@ -349,11 +399,12 @@ def test_abandon_stops_the_timer():
     asyncio.run(run())
 
 
-def test_cancel_and_dispose_stop_the_timer():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_cancel_and_dispose_stop_the_timer(cls):
     async def run():
         for stop in ("cancel", "dispose"):
             engine, ws = _Engine(), _WS()
-            pipe = _pipe(engine, clause_first_deadline_ms=40)
+            pipe = _pipe(engine, cls, clause_first_deadline_ms=40)
             await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
             task = pipe.synthesis_task
             if stop == "cancel":
@@ -371,11 +422,12 @@ def test_cancel_and_dispose_stop_the_timer():
     asyncio.run(run())
 
 
-def test_a_superseding_request_stops_the_old_timer():
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_a_superseding_request_stops_the_old_timer(cls):
     async def run():
         engine, ws = _Engine(), _WS()
         tts = TTSPipeline(engine=engine, executor=None)
-        pipe = TTSStreamPipeline(tts, clause_first_deadline_ms=40)
+        pipe = cls(tts, clause_first_deadline_ms=40)
         session = TTSSession(websocket=ws, tts_pipeline=tts, tts_stream_pipeline=pipe)
         await session.feed_stream(chunk="Hi", done=False, request_id="r1",
                                   chunking="clause")

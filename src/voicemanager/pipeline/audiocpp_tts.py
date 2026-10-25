@@ -786,6 +786,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     base class itself is untouched - other engines' tts_stream behavior stays
     byte-identical. This class is selected only when the audiocpp
     engine is (the websocket layer's engine selection branch).
+
+    A chunking="clause" request needs nothing extra beyond the inherited
+    chunker and timer: the loop reports each PCM chunk it sends, as the base
+    loop does, and clause pieces that are cut while a request synthesizes are
+    queued like sentences, so the same drain merges them into one next request.
     """
 
     def __init__(self, *args, coalesce_ms: int = 0, **kwargs) -> None:
@@ -893,6 +898,10 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                     kwargs["voice"] = effective_voice
                 async for chunk_np in engine.stream_synthesize(text, **kwargs):
                     await websocket.send_bytes(float32_to_pcm16(chunk_np))
+                    # Clause mode's unplayed-audio estimate needs every chunk sent;
+                    # a no-op on a sentence request. Clause pieces cut while this
+                    # request synthesizes queue up and the drain above merges them.
+                    self._report_audio(request_id, len(chunk_np), engine.sample_rate)
                 batches += 1
                 logger.debug(
                     "Streamed coalesced TTS batch: request_id=%s parts=%d text=%s",
