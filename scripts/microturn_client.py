@@ -613,6 +613,22 @@ def check_stt_engine(name: str) -> None:
                          "(VM_STT_ENGINE=audiocpp, qwen or nemotron)")
 
 
+RUN_DIR = pathlib.Path("runs") / "microturn"
+
+
+def live_output_paths(args: argparse.Namespace) -> tuple[str, str]:
+    """The log and WAV paths for a live run; defaults go in ``runs/microturn/``.
+
+    The directory is under the current directory, is git-ignored and is created when
+    missing. ``--log`` and ``--wav`` override the defaults.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if not (args.log and args.wav):
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+    return (args.log or str(RUN_DIR / f"microturn-{stamp}.jsonl"),
+            args.wav or str(RUN_DIR / f"microturn-{stamp}.wav"))
+
+
 async def live(args: argparse.Namespace) -> None:
     """Run a live call over VoiceManager until Ctrl-C or ``--duration`` seconds."""
     token = os.environ.get("VOICEMANAGER_TOKEN")
@@ -621,9 +637,7 @@ async def live(args: argparse.Namespace) -> None:
     from voicemanager.client import VoiceManagerClient, VoiceManagerError
     from websockets.exceptions import ConnectionClosed
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    log_path = args.log or f"microturn-{stamp}.jsonl"
-    wav_path = args.wav or f"microturn-{stamp}.wav"
+    log_path, wav_path = live_output_paths(args)
     print("warning: use headphones; there is no echo cancellation")
     client = VoiceManagerClient(host=args.vm_host, port=args.vm_port, token=token)
     try:
@@ -694,9 +708,9 @@ def _parser() -> argparse.ArgumentParser:
     lv.add_argument("--duration", type=float, default=None,
                     help="stop after this many seconds (default: at Ctrl-C)")
     lv.add_argument("--log", default=None,
-                    help="JSON lines log (default: microturn-<stamp>.jsonl)")
+                    help="JSON lines log (default: runs/microturn/microturn-<stamp>.jsonl)")
     lv.add_argument("--wav", default=None,
-                    help="WAV of the audio played (default: microturn-<stamp>.wav)")
+                    help="WAV of the audio played (default: runs/microturn/microturn-<stamp>.wav)")
     return parser
 
 

@@ -302,3 +302,21 @@ def test_live_engine_check_refuses_whisper():
 def test_live_engine_check_allows_streaming_engines():
     for name in ("audiocpp", "qwen", "nemotron"):
         mc.check_stt_engine(name)
+
+
+def test_live_default_paths_are_in_run_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = mc._parser().parse_args(["live"])
+    log_path, wav_path = mc.live_output_paths(args)
+    run_dir = tmp_path / "runs" / "microturn"
+    assert run_dir.is_dir()
+    assert pathlib.Path(log_path).parent == pathlib.Path("runs/microturn")
+    assert pathlib.Path(wav_path).parent == pathlib.Path("runs/microturn")
+    assert str(log_path).endswith(".jsonl") and str(wav_path).endswith(".wav")
+
+
+def test_live_explicit_paths_override_run_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = mc._parser().parse_args(["live", "--log", "a.jsonl", "--wav", "b.wav"])
+    assert mc.live_output_paths(args) == ("a.jsonl", "b.wav")
+    assert not (tmp_path / "runs").exists()

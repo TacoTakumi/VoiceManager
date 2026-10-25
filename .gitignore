@@ -33,3 +33,6 @@ voice_design/
 
 # Listen-test clips stay on disk, never in git
 tts_evidence/
+
+# Live-run logs and WAVs from scripts/microturn_client.py
+runs/
