@@ -593,6 +593,22 @@ async def websocket_endpoint(websocket: WebSocket):
         warning_sent = False
         timeout = settings.session_timeout
 
+        # The idle clock of the open tts_stream request: the monotonic time of its
+        # last tts_stream frame, None when no request is open or its flush already ran.
+        # It is deliberately separate from last_activity. A full-duplex client sends
+        # mic audio every ~100 ms, and every frame resets last_activity, so a flush cap
+        # measured from "any frame" never expires and a flushed-but-never-closed request
+        # stays open for the whole session. Only tts_stream frames re-arm this clock.
+        tts_stream_last_frame: float | None = None
+
+        def _tts_stream_idle_left() -> float | None:
+            """Seconds until the open request's idle flush is due; None when not armed."""
+            if (tts_session is None or tts_session.active_stream_request_id is None
+                    or tts_stream_last_frame is None):
+                return None
+            return settings.tts_stream_flush_timeout - (
+                time.monotonic() - tts_stream_last_frame)
+
         while True:
             elapsed = time.monotonic() - last_activity
             remaining = timeout - elapsed
@@ -632,10 +648,19 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 wait_for = remaining - WARNING_LEAD
 
-            # Use flush timeout when streaming TTS is active
+            # While a tts_stream request is open, cap the receive timeout to what is
+            # LEFT of its idle window, and run the idle flush right away when the window
+            # has already passed (the loop was kept awake by audio frames, which must not
+            # extend it). The clock is cleared before the flush so the flush runs once per
+            # request, even if the request takes an iteration or two to wind down.
             effective_timeout = wait_for
-            if tts_session is not None and tts_session.active_stream_request_id is not None:
-                effective_timeout = min(wait_for, settings.tts_stream_flush_timeout)
+            idle_left = _tts_stream_idle_left()
+            if idle_left is not None:
+                if idle_left <= 0:
+                    tts_stream_last_frame = None
+                    await tts_session.flush_timeout()
+                    continue
+                effective_timeout = min(wait_for, idle_left)
             # While a speculative endpoint is held, cap the receive timeout to
             # the hold window so a client that stops sending audio still gets its confirmed
             # final within a bounded wall-clock time (via this same receive-timeout path),
@@ -654,8 +679,13 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=effective_timeout)
             except asyncio.TimeoutError:
-                # Flush streaming TTS buffer on timeout
-                if tts_session is not None and tts_session.active_stream_request_id is not None:
+                # Flush the open tts_stream request once its idle window has elapsed
+                # (the quiet-client case). A wake from one of the shorter caps below
+                # falls through: the request is not idle yet, and the next iteration
+                # re-arms the remaining window.
+                idle_left = _tts_stream_idle_left()
+                if idle_left is not None and idle_left <= 0:
+                    tts_stream_last_frame = None
                     await tts_session.flush_timeout()
                     continue
                 # Wall-clock fallback - flush the held (possibly stitched) text as
@@ -929,6 +959,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         flush=tts_stream_msg.flush,  # speak the buffer now
                         chunking=tts_stream_msg.chunking,  # fixed at request start
                     )
+                    # Re-arm the idle flush from THIS frame (a new request starts its
+                    # own window). done=true closes the request, so nothing is armed.
+                    if tts_session.active_stream_request_id is not None:
+                        tts_stream_last_frame = time.monotonic()
+                    else:
+                        tts_stream_last_frame = None
 
                 elif msg_type == "tts_cancel" and tts_session is not None:
                     cancel_req = TTSCancelMessage.model_validate(parsed)
