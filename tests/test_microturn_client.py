@@ -145,3 +145,54 @@ def test_script_not_collected():
     assert not _PATH.name.startswith("test_")
     assert _PATH.parent.name == "scripts"
     assert "tests" not in _PATH.parent.parts[-1:]
+
+
+def test_http_default_timeout_covers_a_cold_model_load():
+    # llama-swap can take longer than 30 s to load the model on the first tick.
+    assert mc.LlamaServerEngine("http://127.0.0.1:8080").timeout == 120.0
+
+
+def _replay_args(tmp_path):
+    script = tmp_path / "call.txt"
+    script.write_text("hello\n")
+    return mc._parser().parse_args(["replay", "--script", str(script)])
+
+
+def test_replay_read_timeout_is_one_line(tmp_path, monkeypatch):
+    def urlopen(*args, **kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", urlopen)
+    with pytest.raises(SystemExit) as exc:
+        mc._run_replay(_replay_args(tmp_path))
+    message = str(exc.value)
+    assert message.count("\n") == 0 and message.startswith("error:")
+    assert "timed out after 120 s" in message
+
+
+def test_replay_http_error_is_one_line(tmp_path, monkeypatch):
+    import urllib.error
+
+    def urlopen(*args, **kwargs):
+        raise urllib.error.HTTPError("http://127.0.0.1:8080/completion", 503,
+                                     "Service Unavailable", {}, None)
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", urlopen)
+    with pytest.raises(SystemExit) as exc:
+        mc._run_replay(_replay_args(tmp_path))
+    message = str(exc.value)
+    assert message.count("\n") == 0 and message.startswith("error:")
+    assert "503" in message and "cannot reach" not in message
+
+
+def test_replay_unreachable_is_one_line(tmp_path, monkeypatch):
+    import urllib.error
+
+    def urlopen(*args, **kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", urlopen)
+    with pytest.raises(SystemExit) as exc:
+        mc._run_replay(_replay_args(tmp_path))
+    message = str(exc.value)
+    assert message.count("\n") == 0 and "cannot reach" in message

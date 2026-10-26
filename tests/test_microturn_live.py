@@ -290,7 +290,29 @@ def test_live_cli_options():
 
 
 def test_live_no_sounddevice_at_import():
-    assert "sounddevice" not in vars(mc)
+    """The script must not import sounddevice at module scope.
+
+    The functions that need it import it as ``sd``, so a module-scope
+    ``import sounddevice as sd`` binds the name ``sd``, not ``sounddevice``: a check of
+    the name alone would still pass. So every attribute of the module object is
+    compared with the sounddevice module itself, under any name. When no earlier test
+    has loaded sounddevice, a fresh load of the script must also leave it out of
+    sys.modules.
+    """
+    loaded = sys.modules.get("sounddevice")
+    for name, value in vars(mc).items():
+        assert getattr(value, "__name__", None) != "sounddevice", name
+        if loaded is not None:
+            assert value is not loaded, name
+    if loaded is None:
+        spec = importlib.util.spec_from_file_location("microturn_client_fresh", _PATH)
+        fresh = importlib.util.module_from_spec(spec)
+        sys.modules["microturn_client_fresh"] = fresh
+        try:
+            spec.loader.exec_module(fresh)
+        finally:
+            del sys.modules["microturn_client_fresh"]
+        assert "sounddevice" not in sys.modules
 
 
 def test_live_engine_check_refuses_whisper():
@@ -395,3 +417,137 @@ def test_live_cli_tts_mode():
     assert args.tts_mode == "flush"
     with pytest.raises(SystemExit):
         mc._parser().parse_args(["live", "--tts-mode", "word"])
+
+
+def test_live_last_word_time_ignores_recase_and_punctuation():
+    session, _, _ = _session([])
+    session.on_transcription(_frame("bleach and ammonia"), 100.3)
+    assert session.last_word_t == 100.3
+    session.on_transcription(_frame("Bleach, and ammonia.", final=True), 100.9)
+    assert session.last_word_t == 100.3
+    session.on_transcription(_frame("Bleach and ammonia"), 101.1)
+    assert session.last_word_t == 100.3
+
+
+def test_live_last_word_time_moves_when_words_are_added():
+    session, _, _ = _session([])
+    session.on_transcription(_frame("bleach and"), 100.3)
+    session.on_transcription(_frame("Bleach, and ammonia"), 101.0)
+    assert session.last_word_t == 101.0
+    session.on_transcription(_frame("here", seg=1), 101.4)
+    assert session.last_word_t == 101.4
+
+
+class TogglePlayer:
+    """A player whose playing state the test sets."""
+
+    def __init__(self):
+        self.playing = False
+        self.cleared = 0
+
+    def is_playing(self) -> bool:
+        return self.playing
+
+    def clear(self) -> None:
+        self.playing = False
+        self.cleared += 1
+
+
+def test_live_utterance_cancelled_by_cut_in():
+    ids = iter(f"r{i}" for i in range(1, 100))
+    player = TogglePlayer()
+    sink = FakeSink()
+    orch = mc.TTSOrchestrator(sink, player, new_id=lambda: next(ids))
+    log = io.StringIO()
+    session = mc.LiveSession(ScriptedEngine(["Do not", LISTEN, LISTEN, "Stop", LISTEN]),
+                             mc.TickSlicer(), orch, log, clock=lambda: 100.0)
+
+    async def run():
+        session.on_transcription(_frame("bleach"), 100.2)
+        await session.run_tick(100.6)  # opens r1
+        session.on_audio_start("r1", 24000, 100.8)
+        assert session.on_audio(b"\x01\x00", 100.9) is True
+        player.playing = True
+        session.on_transcription(_frame("wait no", seg=1), 101.0)
+        await session.run_tick(101.2)  # user talks over r1: cut-in cancels it
+        session.on_audio_end("r1")
+        await session.run_tick(101.8)
+        await session.run_tick(102.4)  # opens r2
+        session.on_audio_start("r2", 24000, 102.6)
+        assert session.on_audio(b"\x02\x00", 102.7) is True
+        session.on_audio_end("r2")
+        await session.run_tick(103.0)  # done for r2
+
+    asyncio.run(run())
+    assert ("cancel", "r1") in sink.calls and orch.cutins == 1
+    utterances = [line for line in _lines(log) if line["type"] == "utterance"]
+    final = {line["request_id"]: line["cancelled"] for line in utterances}
+    assert final == {"r1": True, "r2": False}
+    cut = [line for line in utterances if line["cancelled"]]
+    assert cut[0]["request_id"] == "r1" and cut[0]["t"] == pytest.approx(1.2)
+    assert cut[0]["first_audio_ms"] == pytest.approx((100.9 - 100.2) * 1000)
+
+
+class FakeLiveClient:
+    """Stands in for VoiceManagerClient in live(): connects, reports whisper, records."""
+
+    instances: list = []
+
+    def __init__(self, host, port, token):
+        self.host, self.port, self.token = host, port, token
+        self.stt_engine = "whisper"
+        self.last_tts_sample_rate = 22050
+        self._cancelled_tts: set[str] = set()
+        self.connected = False
+        self.disconnected = False
+        FakeLiveClient.instances.append(self)
+
+    async def _connect(self) -> None:
+        self.connected = True
+
+    async def _disconnect(self) -> None:
+        self.disconnected = True
+
+
+def test_live_checks_stt_engine_before_starting_tasks(tmp_path, monkeypatch):
+    """live() must refuse a whisper server after connecting and before any task runs."""
+    import types
+
+    import voicemanager.client as vmclient
+
+    started: list[str] = []
+
+    def task_stub(name):
+        async def stub(*args):
+            started.append(name)
+        return stub
+
+    for name in ("_mic_task", "_stt_task", "_tts_task", "_tick_task"):
+        monkeypatch.setattr(mc, name, task_stub(name))
+
+    def no_http(*args, **kwargs):
+        raise AssertionError("HTTP request made")
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", no_http)
+
+    def no_stream(*args, **kwargs):
+        raise AssertionError("audio stream opened")
+
+    fake_sd = types.SimpleNamespace(RawInputStream=no_stream, RawOutputStream=no_stream)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    monkeypatch.setattr(vmclient, "VoiceManagerClient", FakeLiveClient)
+    monkeypatch.setenv("VOICEMANAGER_TOKEN", "vmp_test")
+    FakeLiveClient.instances.clear()
+    log_path, wav_path = tmp_path / "call.jsonl", tmp_path / "call.wav"
+    args = mc._parser().parse_args(["live", "--duration", "0.1", "--log", str(log_path),
+                                   "--wav", str(wav_path)])
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(mc.live(args))
+
+    assert "whisper" in str(exc.value)
+    assert len(FakeLiveClient.instances) == 1
+    client = FakeLiveClient.instances[0]
+    assert client.connected and client.disconnected
+    assert started == []
+    assert not log_path.exists() and not wav_path.exists()

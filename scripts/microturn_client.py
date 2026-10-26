@@ -20,9 +20,10 @@ on the speaker. ``--tts-mode clause`` (the default) opens each utterance with ch
 "clause", so the server cuts the held words into small pieces itself; ``--tts-mode flush``
 flushes each speaking tick's words instead. It writes one JSON line per tick and per
 utterance (turn time, delay from the last heard word to the first audio, and the TTS mode
-on each tick line) and a WAV of what played. Use headphones: there
-is no echo cancellation, so the microphone would hear the assistant. The bearer token
-comes from the ``VOICEMANAGER_TOKEN`` environment variable.
+on each tick line; an utterance that a cut-in stops gets its line again with cancelled
+true) and a WAV of what played. Use headphones: there is no echo cancellation, so the
+microphone would hear the assistant. The bearer token comes from the
+``VOICEMANAGER_TOKEN`` environment variable.
 
     python scripts/microturn_client.py replay [--script FILE] [--url URL] [--model NAME]
     python scripts/microturn_client.py live [--vm-host HOST] [--vm-port PORT] [--voice NAME]
@@ -36,6 +37,7 @@ import logging
 import math
 import os
 import pathlib
+import re
 import statistics
 import threading
 import time
@@ -161,7 +163,8 @@ class CompletionEngine(Protocol):
 class LlamaServerEngine:
     """CompletionEngine over HTTP to llama-server (or llama-swap) with the stdlib only."""
 
-    def __init__(self, base_url: str, model: str | None = None, timeout: float = 30.0):
+    # llama-swap may take more than 30 s to cold-load the model on the first tick.
+    def __init__(self, base_url: str, model: str | None = None, timeout: float = 120.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
@@ -177,6 +180,22 @@ class LlamaServerEngine:
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.load(resp)
+
+
+def http_error_message(engine: LlamaServerEngine, exc: BaseException) -> str | None:
+    """One line for an HTTP failure of a tick, or None when ``exc`` is not one.
+
+    An ``HTTPError`` names its status, a timeout (also one wrapped in a ``URLError``)
+    the timeout, and any other ``URLError`` is an unreachable server.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"error: {engine.base_url} answered HTTP {exc.code} {exc.reason}"
+    if isinstance(exc, TimeoutError) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)):
+        return f"error: {engine.base_url} timed out after {engine.timeout:g} s"
+    if isinstance(exc, urllib.error.URLError):
+        return f"error: cannot reach {engine.base_url}: {exc.reason}"
+    return None
 
 
 @dataclass
@@ -474,11 +493,20 @@ def write_wav(path: str | pathlib.Path, pcm: bytes, sample_rate: int) -> None:
         wf.writeframes(pcm)
 
 
+def _heard_words(text: str) -> list[str]:
+    """The words of a transcript with case and punctuation removed."""
+    return [w for w in (re.sub(r"\W+", "", word).lower() for word in text.split()) if w]
+
+
 class LiveSession:
     """The state of one live call: history, tick log and first-audio timing.
 
     The parts are injected, so the loop runs the same over fakes as over llama-server
     and VoiceManager. Times are clock seconds; the log's ``t`` counts from the start.
+
+    An utterance line is written at a request's first audio. When a cut-in cancels that
+    request later, the line is written again with ``cancelled`` true and ``t`` the time
+    of the cut-in, so the last utterance line per request id is its final state.
     """
 
     def __init__(self, engine: CompletionEngine, slicer: TickSlicer,
@@ -500,6 +528,8 @@ class LiveSession:
         # Per request: the time of the last word heard before the tick that opened it.
         self._opened_at: dict[str, float | None] = {}
         self._logged: set[str] = set()
+        # Per logged request: its first_audio_ms, written again when a cut-in cancels it.
+        self._first_audio: dict[str, float | None] = {}
         self._audio_id: str | None = None  # the request the next binary frames belong to
 
     def _write(self, record: dict) -> None:
@@ -507,10 +537,14 @@ class LiveSession:
         self.log.flush()
 
     def on_transcription(self, frame: dict, now: float) -> None:
-        """Feed a transcription frame; a changed text marks the time of the last word."""
+        """Feed a transcription frame; a segment that gains words marks the last word's time.
+
+        A final that only re-cases or re-punctuates the words already heard is not a
+        new word, so it leaves the time alone and first_audio_ms is not understated.
+        """
         self.slicer.feed(frame)
         seg, text = frame.get("segment_index", 0), frame.get("text", "")
-        if text and text != self._text.get(seg):
+        if len(_heard_words(text)) > len(_heard_words(self._text.get(seg, ""))):
             self.last_word_t = now
         self._text[seg] = text
 
@@ -522,10 +556,14 @@ class LiveSession:
         result = await asyncio.to_thread(decide, self.engine, self.history, heard)
         self.history += [("user", heard), ("assistant", result.said)]
         self.results.append(result)
-        before = self.orchestrator.request_id
+        before, cutins = self.orchestrator.request_id, self.orchestrator.cutins
         await self.orchestrator.on_tick(heard, result.said)
         if self.orchestrator.request_id != before:
             self._opened_at[self.orchestrator.request_id] = word_t
+        # The orchestrator counts the cut-in itself, so this does not depend on when the
+        # client's cancel mark for the request is set or dropped.
+        if self.orchestrator.cutins > cutins and before in self._logged:
+            self._write_utterance(before, now, self._first_audio[before], cancelled=True)
         self._write({
             "type": "tick", "t": round(now - self._t0, 3), "heard": heard,
             "said": result.said, "p_listen": round(result.p_listen, 4),
@@ -556,12 +594,17 @@ class LiveSession:
             delay = None if word_t is None else (now - word_t) * 1000.0
             if delay is not None:
                 self.first_audio_ms.append(delay)
-            self._write({
-                "type": "utterance", "request_id": rid, "t": round(now - self._t0, 3),
-                "first_audio_ms": None if delay is None else round(delay, 1),
-                "cancelled": False,
-            })
+            self._first_audio[rid] = delay
+            self._write_utterance(rid, now, delay, cancelled=False)
         return True
+
+    def _write_utterance(self, rid: str, now: float, delay: float | None,
+                         cancelled: bool) -> None:
+        self._write({
+            "type": "utterance", "request_id": rid, "t": round(now - self._t0, 3),
+            "first_audio_ms": None if delay is None else round(delay, 1),
+            "cancelled": cancelled,
+        })
 
     def summary_line(self) -> str:
         """One line for the end of a call: turn time, first audio, budget, cut-ins, mode."""
@@ -698,7 +741,8 @@ async def live(args: argparse.Namespace) -> None:
             for task, outcome in zip(tasks, await asyncio.gather(*tasks,
                                                                  return_exceptions=True)):
                 if isinstance(outcome, Exception):
-                    logger.error("%s stopped: %r", task.get_coro().__name__, outcome)
+                    logger.error("%s stopped: %s", task.get_coro().__name__,
+                                 http_error_message(engine, outcome) or repr(outcome))
             if orchestrator.open:
                 try:
                     await sink.done(orchestrator.request_id)
@@ -749,8 +793,8 @@ def _run_replay(args: argparse.Namespace) -> None:
     results: list[TickResult] = []
     try:
         replay(engine, script, results=results)
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"error: cannot reach {args.url}: {exc}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise SystemExit(http_error_message(engine, exc)) from exc
     print(summary(results))
 
 
