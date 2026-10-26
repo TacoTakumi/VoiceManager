@@ -5,8 +5,10 @@ the additive TTS frame set (sidecar/PROTOCOL.md): HELLO selects the model_task
 (dots-tts-streaming by default, or voxcpm2-tts-streaming), each synthesis request is
 one TEXT frame, and the reply is a stream of TTS_AUDIO frames (raw s16le mono at the
 READY-stated rate: 48 kHz for dots and voxcpm2, 24 kHz for breeze-tts-streaming)
-closed by exactly one TTS_DONE. Audio passes through untouched - no server-side
-resampling, ever.
+closed by exactly one TTS_DONE. Output audio passes through untouched - no
+server-side resampling, ever (only a preset clip composed into a later clause
+piece's reference is brought to the engine rate first; see the composed-reference
+section below).
 
 v1 voice selection is named presets from the frozen voices/designed/ assets:
 each refs.json entry pairs reference audio with its exact transcript
@@ -31,8 +33,10 @@ layer), which surfaces the defined session error and closes that one session.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
+import math
 import os
 import socket
 import struct
@@ -46,7 +50,9 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
 
 import numpy as np
+import soundfile as sf
 
+from voicemanager.config import get_settings
 from voicemanager.pipeline.audiocpp_stt import SidecarError, SidecarFault
 from voicemanager.pipeline.tts import TTSEngine, TTSStreamPipeline, float32_to_pcm16
 
@@ -182,6 +188,73 @@ def resolve_preset(presets: dict[str, PresetVoice], name: str | None) -> PresetV
         raise UnknownVoiceError(
             f"unknown voice {name!r}; valid presets: {', '.join(sorted(presets))}")
     return preset
+
+
+# --- composed references for the later clause pieces ---------------------------------
+#
+# Breeze re-conditions the speaker from the reference (clip + transcript) on every
+# request, and audio.cpp continues a voice only inside one request. A clause-mode
+# tts_stream request is many engine requests, so the voice would be re-sampled at
+# every piece. The stream pipeline closes that seam itself: for each engine request
+# after the first one it writes a temporary WAV of the preset clip followed by the
+# previous piece's own audio, and extends the transcript with that piece's text.
+# The files live in one per-process directory and belong to the request that made
+# them; the directory itself goes at process exit.
+
+_clause_ref_dir_path: str | None = None
+_clause_ref_dir_lock = threading.Lock()
+
+
+def clause_ref_dir() -> str:
+    """The per-process directory that holds the composed reference WAVs."""
+    global _clause_ref_dir_path
+    with _clause_ref_dir_lock:
+        if _clause_ref_dir_path is None:
+            _clause_ref_dir_path = tempfile.mkdtemp(prefix="vm-audiocpp-clause-ref-")
+            atexit.register(shutil.rmtree, _clause_ref_dir_path, ignore_errors=True)
+        return _clause_ref_dir_path
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug("could not remove composed reference %s", path, exc_info=True)
+
+
+def _float32_to_int16(audio: np.ndarray) -> np.ndarray:
+    # The engine made these floats from the sidecar's s16le by /32768, so *32768
+    # and rounding gives the sidecar's samples back exactly.
+    return np.clip(np.rint(audio * 32768.0), -32768, 32767).astype(np.int16)
+
+
+def read_preset_clip(wav_path: str, sample_rate: int) -> np.ndarray:
+    """The preset clip as int16 mono at `sample_rate`, resampled when it differs.
+
+    Blocking (file read, maybe a polyphase resample): call from a worker thread.
+    A stereo clip keeps its first channel.
+    """
+    data, clip_rate = sf.read(wav_path, dtype="int16", always_2d=True)
+    mono = data[:, 0]
+    if int(clip_rate) == sample_rate:
+        return mono.copy()
+    from scipy.signal import resample_poly
+
+    divisor = math.gcd(sample_rate, int(clip_rate))
+    resampled = resample_poly(mono.astype(np.float32), sample_rate // divisor,
+                              int(clip_rate) // divisor)
+    return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16)
+
+
+def write_composed_reference(path: str, preset_clip: np.ndarray, tail: np.ndarray,
+                             sample_rate: int) -> None:
+    """Write the preset clip followed by the previous piece's tail as 16-bit mono WAV.
+
+    Blocking: call from a worker thread.
+    """
+    sf.write(path, np.concatenate([preset_clip, tail]), sample_rate, subtype="PCM_16")
 
 
 class _TtsSidecarClient:
@@ -642,6 +715,15 @@ class AudioCppTTSEngine(TTSEngine):
             raise SidecarError("not_loaded", "AudioCppTTSEngine.load() was never called")
         return resolve_preset(self._presets, voice or self._default_voice)
 
+    def resolve_voice(self, voice: str | None) -> PresetVoice:
+        """The preset a request with this voice name clones from (None: the default).
+
+        The stream pipeline reads the preset's clip and transcript from it to
+        compose the reference for a later clause piece. Raises UnknownVoiceError
+        for a name that is not a loaded preset, as a dispatch would.
+        """
+        return self._resolve(voice)
+
     @staticmethod
     def _payload_to_float32(payload: bytes) -> np.ndarray:
         # s16le -> float32 by the engine's own /32768 convention. A dtype view plus
@@ -655,8 +737,14 @@ class AudioCppTTSEngine(TTSEngine):
             voice: preset name from voices/designed/refs.json (default: the
                    configured default preset). Unknown names raise
                    UnknownVoiceError BEFORE anything is dispatched.
+            ref_wav: a reference WAV to clone from instead of the preset's clip,
+                   with ref_text as its transcript. The stream pipeline passes a
+                   composed reference for a later clause piece; without it the
+                   preset's own clip and transcript ride the request.
         """
         preset = self._resolve(kwargs.get("voice"))
+        ref_wav = kwargs.get("ref_wav") or preset.wav_path
+        ref_text = kwargs.get("ref_text") if kwargs.get("ref_wav") else preset.ref_text
         client = self._client
         # The wire generation OUR dispatch owns, captured so the
         # unwind below can scope its cancel. None until send_text returns - an
@@ -668,7 +756,7 @@ class AudioCppTTSEngine(TTSEngine):
             # dots always has a non-empty transcript (the loader enforces it); a
             # voxcpm2 preset may omit it and send_text then drops the key.
             generation = await asyncio.to_thread(client.send_text, text,
-                                                 preset.wav_path, preset.ref_text)
+                                                 ref_wav, ref_text or "")
             while True:
                 mtype, payload = await asyncio.to_thread(client.recv_frame)
                 if mtype == _TTS_AUDIO:
@@ -758,6 +846,45 @@ class AudioCppTTSEngine(TTSEngine):
                          name="audiocpp-tts-dispose", daemon=True).start()
 
 
+class _ClauseReference:
+    """One clause request's composed-reference state.
+
+    Collects the audio of the engine request in flight (int16, capped at the tail
+    length as it arrives, so a long piece never holds more than the cap), promotes
+    it to the previous piece when that request completes, and remembers every
+    composed WAV it wrote so the request's end can remove them.
+    """
+
+    def __init__(self, preset: PresetVoice) -> None:
+        self.preset = preset
+        self.preset_clip: np.ndarray | None = None  # read once, at the engine rate
+        self.cap = 1  # samples of the previous piece kept; set per engine request
+        self.previous_text: str | None = None
+        self.previous_tail: list[np.ndarray] = []
+        self.paths: list[str] = []
+        self._current: list[np.ndarray] = []
+        self._current_samples = 0
+
+    def start_piece(self) -> None:
+        self._current = []
+        self._current_samples = 0
+
+    def add_audio(self, chunk: np.ndarray) -> None:
+        if len(chunk) == 0:
+            return
+        self._current.append(_float32_to_int16(chunk))
+        self._current_samples += len(chunk)
+        # Keep the end: drop whole leading chunks while the rest still covers the cap.
+        while self._current and self._current_samples - len(self._current[0]) >= self.cap:
+            self._current_samples -= len(self._current.pop(0))
+
+    def finish_piece(self, text: str) -> None:
+        self.previous_text = text
+        self.previous_tail = self._current
+        self._current = []
+        self._current_samples = 0
+
+
 class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     """tts_stream batching for the audiocpp engine.
 
@@ -791,17 +918,75 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     chunker and timer: the loop reports each PCM chunk it sends, as the base
     loop does, and clause pieces that are cut while a request synthesizes are
     queued like sentences, so the same drain merges them into one next request.
+
+    With `clause_continue` on, a clause request's later engine requests clone
+    from a composed reference (see the module's composed-reference section)
+    instead of the preset: the preset clip plus the previous piece's own audio
+    tail, and the preset transcript plus that piece's text. The first piece,
+    sentence requests and the setting-off case send the preset as before.
     """
 
-    def __init__(self, *args, coalesce_ms: int = 0, **kwargs) -> None:
+    def __init__(self, *args, coalesce_ms: int = 0, clause_continue: bool | None = None,
+                 clause_tail_ms: int | None = None, **kwargs) -> None:
         """Same surface as the base pipeline plus the coalescing window.
 
         `coalesce_ms` defaults to 0 - the drain-what-is-already-queued behavior
         described above - so constructing this class without it is byte-identical
         to what shipped. The websocket layer passes VM_AUDIOCPP_TTS_COALESCE_MS.
+
+        `clause_continue` and `clause_tail_ms` default to the settings
+        (VM_AUDIOCPP_TTS_CLAUSE_CONTINUE, VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS) when
+        not given, so the websocket layer need not know about them.
         """
         super().__init__(*args, **kwargs)
         self._coalesce_ms = max(0, int(coalesce_ms))
+        if clause_continue is None or clause_tail_ms is None:
+            settings = get_settings()
+            if clause_continue is None:
+                clause_continue = settings.audiocpp_tts_clause_continue
+            if clause_tail_ms is None:
+                clause_tail_ms = settings.audiocpp_tts_clause_tail_ms
+        self._clause_continue = bool(clause_continue)
+        self._clause_tail_ms = max(1, int(clause_tail_ms))
+
+    @property
+    def clause_continue(self) -> bool:
+        """Whether later clause pieces clone from a composed reference."""
+        return self._clause_continue
+
+    @property
+    def clause_tail_ms(self) -> int:
+        """How much of the previous piece's audio (its end) joins that reference."""
+        return self._clause_tail_ms
+
+    async def _write_clause_reference(self, state: "_ClauseReference", loop,
+                                      sample_rate: int) -> str:
+        """Compose the reference for the next piece into a new temp WAV, off-loop.
+
+        The path is minted and registered on the loop BEFORE the thread runs, so
+        the request's cleanup already knows it. A cancel that lands while the
+        thread is still writing leaves the removal to the write's own completion.
+        """
+        fd, path = tempfile.mkstemp(prefix="ref-", suffix=".wav", dir=clause_ref_dir())
+        os.close(fd)
+        state.paths.append(path)
+        preset = state.preset
+        tail_chunks = state.previous_tail
+        cap = state.cap
+
+        def work() -> None:
+            if state.preset_clip is None:
+                state.preset_clip = read_preset_clip(preset.wav_path, sample_rate)
+            tail = np.concatenate(tail_chunks)[-cap:]
+            write_composed_reference(path, state.preset_clip, tail, sample_rate)
+
+        future = loop.run_in_executor(None, work)
+        try:
+            await future
+        except asyncio.CancelledError:
+            future.add_done_callback(lambda _f: _remove_quietly(path))
+            raise
+        return path
 
     async def _synthesis_loop(self, websocket, request_id: str) -> None:
         from voicemanager.protocol import AudioStartMessage, AudioEndMessage
@@ -810,6 +995,19 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         loop = asyncio.get_running_loop()
         batches = 0
         ended = False
+        clause = self._chunking == "clause"
+        # Composed-reference state for this request; None when the feature is
+        # off, on a sentence request, or when the engine has no presets to read.
+        refs: _ClauseReference | None = None
+        if clause and self._clause_continue and hasattr(engine, "resolve_voice"):
+            try:
+                preset = engine.resolve_voice(self._voice or self._tts_pipeline._voice)
+            except Exception:
+                # An unknown voice fails at the dispatch below with the defined
+                # error; the reference composition just stays out of its way.
+                preset = None
+            if preset is not None:
+                refs = _ClauseReference(preset=preset)
         try:
             while not ended:
                 sentence = await self._sentence_queue.get()
@@ -896,23 +1094,64 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 effective_voice = self._voice or self._tts_pipeline._voice
                 if effective_voice is not None:
                     kwargs["voice"] = effective_voice
-                if self._chunking == "clause":
+                ref_kind = "preset"
+                if refs is not None:
+                    sample_rate = engine.sample_rate
+                    refs.cap = max(1, sample_rate * self._clause_tail_ms // 1000)
+                    if refs.previous_text is not None and refs.previous_tail:
+                        # A later piece: clone from the preset clip plus the previous
+                        # piece's audio tail, and its transcript plus that piece's
+                        # text, so Breeze re-conditions on the voice it just spoke.
+                        try:
+                            kwargs["ref_wav"] = await self._write_clause_reference(
+                                refs, loop, sample_rate)
+                            kwargs["ref_text"] = (
+                                refs.preset.ref_text + " " + refs.previous_text)
+                            ref_kind = "composed"
+                        except Exception:
+                            # The preset clip is unreadable or the temp dir is not
+                            # writable: the piece still speaks, from the preset.
+                            logger.warning(
+                                "Composed reference failed for request_id=%s; "
+                                "the piece clones from the preset", request_id,
+                                exc_info=True)
+                    refs.start_piece()
+                if clause:
                     logger.info(
-                        "Clause TTS engine request: request_id=%s parts=%d text=%r",
-                        request_id, len(parts), text,
+                        "Clause TTS engine request: request_id=%s parts=%d text=%r ref=%s",
+                        request_id, len(parts), text, ref_kind,
                     )
+                dispatched_at = time.monotonic()
+                first_chunk = True
                 async for chunk_np in engine.stream_synthesize(text, **kwargs):
+                    if first_chunk and clause:
+                        first_chunk = False
+                        logger.info(
+                            "Clause TTS first audio: request_id=%s first_audio_ms=%d",
+                            request_id, int((time.monotonic() - dispatched_at) * 1000),
+                        )
                     await websocket.send_bytes(float32_to_pcm16(chunk_np))
                     # Clause mode's unplayed-audio estimate needs every chunk sent;
                     # a no-op on a sentence request. Clause pieces cut while this
                     # request synthesizes queue up and the drain above merges them.
                     self._report_audio(request_id, len(chunk_np), engine.sample_rate)
+                    if refs is not None:
+                        refs.add_audio(chunk_np)
+                if refs is not None:
+                    refs.finish_piece(text)
                 batches += 1
                 logger.debug(
                     "Streamed coalesced TTS batch: request_id=%s parts=%d text=%s",
                     request_id, len(parts), text[:50],
                 )
         finally:
+            # The composed references belong to this request: gone on done,
+            # cancel, the flush timeout and disconnect alike. Unlinks only, so
+            # this stays safe inline on a cancellation unwind.
+            if refs is not None:
+                for path in refs.paths:
+                    _remove_quietly(path)
+                refs.paths.clear()
             # Same terminal framing as the base loop: a request that never
             # produced audio still gets its audio_start/audio_end pair.
             if not self._audio_started:

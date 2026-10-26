@@ -269,6 +269,17 @@ class Settings(BaseSettings):
     # drain. Never applies to the first batch - first audio is never gated on
     # text that has not arrived yet.
     audiocpp_tts_coalesce_ms: int = Field(default=350)       # VM_AUDIOCPP_TTS_COALESCE_MS
+    # Composed reference for the later pieces of a chunking="clause" request.
+    # Breeze re-conditions the speaker from the reference on every request, and
+    # audio.cpp continues a voice only inside one request, so the seam after the
+    # first piece of a reply is audible. On, every engine request after the first
+    # one clones from a temporary WAV of the preset clip followed by the previous
+    # piece's own audio, with the preset transcript plus that piece's text as its
+    # ref_text. The first piece, sentence requests and other engines are untouched.
+    audiocpp_tts_clause_continue: bool = Field(default=False)  # VM_AUDIOCPP_TTS_CLAUSE_CONTINUE
+    # How much of the previous piece's audio joins the composed reference: its
+    # last this-many ms (the head is dropped), so a long piece stays a short clip.
+    audiocpp_tts_clause_tail_ms: int = Field(default=4000, gt=0)  # VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS
 
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
