@@ -285,9 +285,10 @@ class Settings(BaseSettings):
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
     # when the piece up to it holds at least mark_min_words words. The first piece
     # goes out at such a mark, after this many words or this many ms, whichever
-    # comes first; later pieces wait for such a mark or this many words, and are
-    # held back while more than the margin of audio is still unplayed (estimated
-    # from a play cursor, so a playback gap is not counted as audio played).
+    # comes first; a later piece goes out at such a mark, after this many words,
+    # or once less than the margin of audio is still unplayed, whichever comes
+    # first (the unplayed audio is estimated from a play cursor, so a playback
+    # gap is not counted as audio played).
     tts_clause_first_words: int = Field(default=4, gt=0)          # VM_TTS_CLAUSE_FIRST_WORDS
     tts_clause_first_deadline_ms: int = Field(default=600, gt=0)  # VM_TTS_CLAUSE_FIRST_DEADLINE_MS
     tts_clause_later_words: int = Field(default=12, gt=0)         # VM_TTS_CLAUSE_LATER_WORDS

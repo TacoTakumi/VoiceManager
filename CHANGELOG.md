@@ -12,8 +12,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `"clause"`. In clause mode the server holds the streamed text and cuts
   playback-aware pieces at clause marks, word counts or when the unplayed
   audio runs low (a clause mark cuts only after at least 3 words, and the
-  unplayed estimate is a play cursor that ignores playback gaps), so a client that sends a few words at a time gets smooth
-  speech. The first frame of a request fixes the mode. Any other value gets an
+  unplayed estimate is a play cursor that ignores playback gaps), so a client
+  that sends a few words at a time gets smooth speech. The first frame of a
+  request fixes the mode. Any other value gets an
   `invalid_request` error frame and the connection stays open. `flush` and
   `done` keep their meaning. Works on the shared and the audiocpp pipelines.
   Each engine request of a clause-mode request logs its text at INFO.
