@@ -927,7 +927,8 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     """
 
     def __init__(self, *args, coalesce_ms: int = 0, clause_continue: bool | None = None,
-                 clause_tail_ms: int | None = None, **kwargs) -> None:
+                 clause_tail_ms: int | None = None, start_buffer_ms: int | None = None,
+                 **kwargs) -> None:
         """Same surface as the base pipeline plus the coalescing window.
 
         `coalesce_ms` defaults to 0 - the drain-what-is-already-queued behavior
@@ -937,17 +938,21 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         `clause_continue` and `clause_tail_ms` default to the settings
         (VM_AUDIOCPP_TTS_CLAUSE_CONTINUE, VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS) when
         not given, so the websocket layer need not know about them.
+        `start_buffer_ms` likewise defaults to VM_AUDIOCPP_TTS_START_BUFFER_MS.
         """
         super().__init__(*args, **kwargs)
         self._coalesce_ms = max(0, int(coalesce_ms))
-        if clause_continue is None or clause_tail_ms is None:
+        if clause_continue is None or clause_tail_ms is None or start_buffer_ms is None:
             settings = get_settings()
             if clause_continue is None:
                 clause_continue = settings.audiocpp_tts_clause_continue
             if clause_tail_ms is None:
                 clause_tail_ms = settings.audiocpp_tts_clause_tail_ms
+            if start_buffer_ms is None:
+                start_buffer_ms = settings.audiocpp_tts_start_buffer_ms
         self._clause_continue = bool(clause_continue)
         self._clause_tail_ms = max(1, int(clause_tail_ms))
+        self._start_buffer_ms = max(0, int(start_buffer_ms))
 
     @property
     def clause_continue(self) -> bool:
@@ -958,6 +963,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     def clause_tail_ms(self) -> int:
         """How much of the previous piece's audio (its end) joins that reference."""
         return self._clause_tail_ms
+
+    @property
+    def start_buffer_ms(self) -> int:
+        """How much audio each engine request holds before its first send."""
+        return self._start_buffer_ms
 
     async def _write_clause_reference(self, state: "_ClauseReference", loop,
                                       sample_rate: int) -> str:
@@ -1121,6 +1131,14 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                         "Clause TTS engine request: request_id=%s parts=%d text=%r ref=%s",
                         request_id, len(parts), text, ref_kind,
                     )
+                # Start buffer: the first frames of a synthesis arrive at about
+                # real-time speed, so a client that plays on arrival runs dry
+                # between them. Hold this request's audio until the buffer is full
+                # and send it as one chunk; later chunks go out as they arrive.
+                # Audio still held when a cancel lands is dropped with the task.
+                hold_samples = engine.sample_rate * self._start_buffer_ms // 1000
+                held: list[np.ndarray] = []
+                held_samples = 0
                 dispatched_at = time.monotonic()
                 first_chunk = True
                 async for chunk_np in engine.stream_synthesize(text, **kwargs):
@@ -1130,13 +1148,26 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                             "Clause TTS first audio: request_id=%s first_audio_ms=%d",
                             request_id, int((time.monotonic() - dispatched_at) * 1000),
                         )
+                    if refs is not None:
+                        refs.add_audio(chunk_np)
+                    if hold_samples > 0:
+                        held.append(chunk_np)
+                        held_samples += len(chunk_np)
+                        if held_samples < hold_samples:
+                            continue
+                        chunk_np = np.concatenate(held)
+                        held = []
+                        hold_samples = 0  # buffer sent: the rest pass through
                     await websocket.send_bytes(float32_to_pcm16(chunk_np))
                     # Clause mode's unplayed-audio estimate needs every chunk sent;
                     # a no-op on a sentence request. Clause pieces cut while this
                     # request synthesizes queue up and the drain above merges them.
                     self._report_audio(request_id, len(chunk_np), engine.sample_rate)
-                    if refs is not None:
-                        refs.add_audio(chunk_np)
+                if held:
+                    # The request ended before the buffer filled: send what it made.
+                    block = np.concatenate(held)
+                    await websocket.send_bytes(float32_to_pcm16(block))
+                    self._report_audio(request_id, len(block), engine.sample_rate)
                 if refs is not None:
                     refs.finish_piece(text)
                 batches += 1

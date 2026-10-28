@@ -280,6 +280,11 @@ class Settings(BaseSettings):
     # How much of the previous piece's audio joins the composed reference: its
     # last this-many ms (the head is dropped), so a long piece stays a short clip.
     audiocpp_tts_clause_tail_ms: int = Field(default=4000, gt=0)  # VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS
+    # Start buffer per engine request: hold its first audio until this many ms
+    # are in hand and send them as one chunk. The first frames of a synthesis
+    # arrive at about real-time speed, so a client that plays on arrival runs
+    # dry between them; later frames run ahead of playback. 0 sends on arrival.
+    audiocpp_tts_start_buffer_ms: int = Field(default=150, ge=0)  # VM_AUDIOCPP_TTS_START_BUFFER_MS
 
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
