@@ -284,7 +284,7 @@ class Settings(BaseSettings):
     # are in hand and send them as one chunk. The first frames of a synthesis
     # arrive at about real-time speed, so a client that plays on arrival runs
     # dry between them; later frames run ahead of playback. 0 sends on arrival.
-    audiocpp_tts_start_buffer_ms: int = Field(default=150, ge=0)  # VM_AUDIOCPP_TTS_START_BUFFER_MS
+    audiocpp_tts_start_buffer_ms: int = Field(default=250, ge=0)  # VM_AUDIOCPP_TTS_START_BUFFER_MS
 
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only

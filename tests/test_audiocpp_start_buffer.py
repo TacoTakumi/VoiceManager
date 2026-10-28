@@ -189,6 +189,6 @@ def test_the_buffer_defaults_to_the_setting(monkeypatch):
 def test_the_setting_has_its_default_and_env_name():
     from voicemanager.config import Settings
 
-    assert Settings(_env_file=None).audiocpp_tts_start_buffer_ms == 150
+    assert Settings(_env_file=None).audiocpp_tts_start_buffer_ms == 250
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
-    assert "# VM_AUDIOCPP_TTS_START_BUFFER_MS=150" in text
+    assert "# VM_AUDIOCPP_TTS_START_BUFFER_MS=250" in text
