@@ -289,8 +289,8 @@ class Settings(BaseSettings):
     # or once less than the margin of audio is still unplayed, whichever comes
     # first (the unplayed audio is estimated from a play cursor, so a playback
     # gap is not counted as audio played).
-    tts_clause_first_words: int = Field(default=4, gt=0)          # VM_TTS_CLAUSE_FIRST_WORDS
-    tts_clause_first_deadline_ms: int = Field(default=600, gt=0)  # VM_TTS_CLAUSE_FIRST_DEADLINE_MS
+    tts_clause_first_words: int = Field(default=3, gt=0)          # VM_TTS_CLAUSE_FIRST_WORDS
+    tts_clause_first_deadline_ms: int = Field(default=300, gt=0)  # VM_TTS_CLAUSE_FIRST_DEADLINE_MS
     tts_clause_later_words: int = Field(default=12, gt=0)         # VM_TTS_CLAUSE_LATER_WORDS
     tts_clause_margin_ms: int = Field(default=1000, gt=0)         # VM_TTS_CLAUSE_MARGIN_MS
     tts_clause_mark_min_words: int = Field(default=3, gt=0)       # VM_TTS_CLAUSE_MARK_MIN_WORDS

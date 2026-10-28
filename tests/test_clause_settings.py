@@ -10,8 +10,8 @@ import authkit  # test auth env; must be imported before voicemanager
 from voicemanager.config import Settings
 
 CASES = [
-    ("VM_TTS_CLAUSE_FIRST_WORDS", "tts_clause_first_words", 4, 7),
-    ("VM_TTS_CLAUSE_FIRST_DEADLINE_MS", "tts_clause_first_deadline_ms", 600, 250),
+    ("VM_TTS_CLAUSE_FIRST_WORDS", "tts_clause_first_words", 3, 7),
+    ("VM_TTS_CLAUSE_FIRST_DEADLINE_MS", "tts_clause_first_deadline_ms", 300, 250),
     ("VM_TTS_CLAUSE_LATER_WORDS", "tts_clause_later_words", 12, 20),
     ("VM_TTS_CLAUSE_MARGIN_MS", "tts_clause_margin_ms", 1000, 900),
     ("VM_TTS_CLAUSE_MARK_MIN_WORDS", "tts_clause_mark_min_words", 3, 5),
