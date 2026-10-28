@@ -482,6 +482,9 @@ per model_task, see below), the voice model, and the latency/seam behavior. Chec
 | `VM_AUDIOCPP_TTS_VOICE` | `designed_female_s101` | Default preset used when a request sends no `voice`. |
 | `VM_AUDIOCPP_TTS_SEAM_SILENCE_MS` | `400` | Cap on the silence gap at an internal chunk seam (see the batching section below); `0` disables the trim. |
 | `VM_AUDIOCPP_TTS_COALESCE_MS` | `350` | On `tts_stream`, how long to keep collecting sentences before synthesizing, once the first batch has dispatched (see the batching section below). The first sentence is never delayed. `0` dispatches whatever is queued at that instant. |
+| `VM_AUDIOCPP_TTS_START_BUFFER_MS` | `250` | On `tts_stream`, hold the first audio of each engine request (each batch or clause piece) until this many ms are in hand, then send it as one chunk. `0` sends every chunk on arrival. See [Clause mode](#2-clause-mode-chunking-clause). |
+| `VM_AUDIOCPP_TTS_CLAUSE_CONTINUE` | `0` (off) | Clause mode only: clone each engine request after the first from the preset clip plus the end of the previous piece's audio and its text. See [Clause mode](#2-clause-mode-chunking-clause). |
+| `VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS` | `4000` | With `VM_AUDIOCPP_TTS_CLAUSE_CONTINUE` on: how many ms from the end of the previous piece's audio join the reference. |
 | `VM_AUDIOCPP_TTS_REQUEST_OPTIONS` | *(empty)* | Comma-separated `KEY=VALUE` overrides merged over the model's pinned request options (`text_chunk_size=200`, `max_tokens=500`, `text_chunk_mode=default`) - operator tuning, e.g. a larger chunk budget for fewer seams at more drift risk. |
 
 The sidecar binary and its compute knobs are shared with the STT engine:
@@ -750,6 +753,10 @@ The cut rule has two cases. A clause mark is one of `,` `;` `:` `.` `?` `!` that
 A cut at a clause mark sends the text up to the last qualifying mark and keeps the words after it held. A cut by word count or time sends all held text. Punctuation stays in the text. Because later pieces wait while audio plays, they grow longer and the speech gets smoother.
 
 `flush` and `done` keep their meaning in clause mode. `flush: true` sends all held text now and keeps the request open. `done: true` sends all held text and ends the request with one `audio_end`. A client that uses clause mode can still flush at its own boundaries. On the audiocpp engine, pieces that queue while it is busy are merged by its existing coalescing. The five settings are in [Configuration](#configuration). To debug a dropped or odd piece, look for the INFO log line `Clause TTS engine request: request_id=... parts=N text='...'`, which the server writes for each engine request of a clause-mode request.
+
+**Start buffer (audiocpp).** The first frames of a synthesis arrive at about real-time speed, so a client that plays audio on arrival can run dry a few times at the start of each piece. To prevent this, the audiocpp engine holds the first `VM_AUDIOCPP_TTS_START_BUFFER_MS` (default 250 ms) of audio of each engine request, which is each clause piece or batch, and sends it as one chunk. Later chunks go out as they arrive. A request that makes less audio than that is sent when it ends. A client sees the first binary frame of each piece carry about 250 ms of audio and arrive up to that much later. The protocol does not change and clients need no change. `0` turns the buffer off. It applies to sentence mode too.
+
+**Continuation (audiocpp, off by default).** The audiocpp engine starts the voice again from the preset clip on each engine request, so the voice can change a little at the seam between two pieces. With `VM_AUDIOCPP_TTS_CLAUSE_CONTINUE` on, each engine request of a clause-mode request after the first clones from the preset clip plus the last `VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS` (default 4000) ms of the previous piece's audio, with that piece's text added to the reference transcript. The first piece, sentence mode and the other engines do not change. It is off by default because those pieces start about 440 ms later and, in tests, the voice still changed at seams.
 
 ### 3. Why an audio stream ended: `reason` on `audio_end`
 
@@ -1126,12 +1133,15 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_AUDIOCPP_TTS_VOICE` | `designed_female_s101` | Default preset voice when neither the request nor the token names a voice (audiocpp); the full `VM_AUDIOCPP_TTS_*` set is documented [in its section](#the-audiocpp-tts-engine-presets-per-model-sample-rate-one-request-batching). |
 | `VM_STT_ENDPOINT_HOLD_MS` | `1000` | Speculative endpoint-hold window; `> 0` enables provisional `endpoint` frames, `0` disables them (immediate finals). |
 | `VM_SESSION_TIMEOUT` | `300` | Inactivity seconds before a `1001` close (with a ~30s `timeout_warning`). |
-| `VM_TTS_STREAM_FLUSH_TIMEOUT` | `10` | Idle seconds before a streaming reply auto-flushes and completes with `reason: "complete"`. |
-| `VM_TTS_CLAUSE_FIRST_WORDS` | `4` | Clause mode: words held before the first piece is sent, if no clause mark comes first. |
-| `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` | `600` | Clause mode: milliseconds after the first held word before the first piece is sent. |
+| `VM_TTS_STREAM_FLUSH_TIMEOUT` | `10` | Idle seconds before a streaming reply auto-flushes and completes with `reason: "complete"`. The clock starts at the last `tts_stream` frame of the request, so microphone audio on the same socket does not hold it off. |
+| `VM_TTS_CLAUSE_FIRST_WORDS` | `3` | Clause mode: words held before the first piece is sent, if no clause mark comes first. |
+| `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` | `300` | Clause mode: milliseconds after the first held word before the first piece is sent. |
 | `VM_TTS_CLAUSE_LATER_WORDS` | `12` | Clause mode: words held before a later piece is sent, while audio is playing. |
 | `VM_TTS_CLAUSE_MARGIN_MS` | `1000` | Clause mode: a later piece is sent when the estimated unplayed audio drops below this. The default covers the audiocpp coalescing wait plus the engine start. |
 | `VM_TTS_CLAUSE_MARK_MIN_WORDS` | `3` | Clause mode: a clause mark cuts only when the held text up to it holds at least this many words. |
+| `VM_AUDIOCPP_TTS_CLAUSE_CONTINUE` | `0` (off) | Clause mode, audiocpp: each engine request after the first clones from the preset clip plus the end of the previous piece's audio and its text. Later pieces start about 440 ms later. See [Clause mode](#2-clause-mode-chunking-clause). |
+| `VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS` | `4000` | Clause mode, audiocpp: how many ms from the end of the previous piece's audio join that reference, when continuation is on. |
+| `VM_AUDIOCPP_TTS_START_BUFFER_MS` | `250` | audiocpp `tts_stream`: the first audio of each engine request is held until this many ms are in hand and sent as one chunk. Adds up to this much to the first audio of each piece. `0` sends every chunk on arrival. |
 | `VM_DEVICE` | `auto` | Compute device (`auto`, `cpu`, `cuda`, `cuda:N`); affects latency, not the protocol. |
 
 The server has many more `VM_` variables for model selection and tuning
