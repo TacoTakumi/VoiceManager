@@ -974,8 +974,12 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         """Compose the reference for the next piece into a new temp WAV, off-loop.
 
         The path is minted and registered on the loop BEFORE the thread runs, so
-        the request's cleanup already knows it. A cancel that lands while the
-        thread is still writing leaves the removal to the write's own completion.
+        the request's cleanup already knows it. A cancel unwinds this task at
+        once, while the thread may still be writing, so the request's cleanup can
+        unlink the path before the thread creates the file. The cancel therefore
+        sets a flag, and the thread removes the file itself once it is done with
+        it; a thread that finished before the flag was set has written a file
+        that the cleanup (which runs after the flag is set) still removes.
         """
         fd, path = tempfile.mkstemp(prefix="ref-", suffix=".wav", dir=clause_ref_dir())
         os.close(fd)
@@ -983,18 +987,22 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         preset = state.preset
         tail_chunks = state.previous_tail
         cap = state.cap
+        cancelled = threading.Event()
 
         def work() -> None:
-            if state.preset_clip is None:
-                state.preset_clip = read_preset_clip(preset.wav_path, sample_rate)
-            tail = np.concatenate(tail_chunks)[-cap:]
-            write_composed_reference(path, state.preset_clip, tail, sample_rate)
+            try:
+                if state.preset_clip is None:
+                    state.preset_clip = read_preset_clip(preset.wav_path, sample_rate)
+                tail = np.concatenate(tail_chunks)[-cap:]
+                write_composed_reference(path, state.preset_clip, tail, sample_rate)
+            finally:
+                if cancelled.is_set():
+                    _remove_quietly(path)
 
-        future = loop.run_in_executor(None, work)
         try:
-            await future
+            await loop.run_in_executor(None, work)
         except asyncio.CancelledError:
-            future.add_done_callback(lambda _f: _remove_quietly(path))
+            cancelled.set()
             raise
         return path
 

@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 import authkit  # noqa: F401  test auth env; must be imported before voicemanager
@@ -343,6 +344,56 @@ def test_the_composed_files_are_removed_when_the_request_ends(tmp_path, ending):
     assert composed_path != fake.requests[0]["voice_wav"]
     assert not os.path.exists(composed_path), f"{ending}: the composed WAV was left behind"
     assert _composed_files() == [], f"{ending}: {_composed_files()}"
+
+
+def test_a_cancel_during_the_write_leaves_no_composed_file(tmp_path, monkeypatch):
+    """Cancel lands while the worker thread is still writing the composed WAV.
+
+    The task unwinds at once and the request's cleanup unlinks the paths, but the
+    thread goes on and creates the file after that. The file must still be gone
+    once the thread has finished.
+    """
+    writing = threading.Event()
+    release = threading.Event()
+    real_write = audiocpp_tts.write_composed_reference
+
+    def held_write(*args):
+        writing.set()
+        assert release.wait(5.0), "the test never released the write"
+        real_write(*args)
+
+    monkeypatch.setattr(audiocpp_tts, "write_composed_reference", held_write)
+
+    preset = audiocpp_tts.PresetVoice(name="p", wav_path=str(tmp_path / "unused.wav"),
+                                      ref_text=TRANSCRIPT)
+    state = audiocpp_tts._ClauseReference(preset)
+    state.preset_clip = _preset_samples(240)
+    state.previous_tail = [_piece_samples(240)]
+    state.cap = 120
+    pipe = _pipe(object())
+    minted: list[str] = []
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(pipe._write_clause_reference(state, loop, ENGINE_RATE))
+        await _until(writing.is_set)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # What the request's own cleanup does on the cancellation unwind.
+        minted.extend(state.paths)
+        for path in state.paths:
+            audiocpp_tts._remove_quietly(path)
+        state.paths.clear()
+        release.set()
+
+    # asyncio.run shuts the default executor down, so the worker thread has
+    # finished by the time it returns.
+    asyncio.run(run())
+
+    assert minted, "the call must have registered its path"
+    for path in minted:
+        assert not os.path.exists(path), f"the composed WAV was left behind: {path}"
 
 
 # --- logging --------------------------------------------------------------------------
