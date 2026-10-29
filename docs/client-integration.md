@@ -626,6 +626,18 @@ What changes for a client:
   are unchanged.
 - The voice is a preset from `VM_VOXTREAM_VOICES` (the reference WAV of each
   entry; the transcript is unused), chosen as in [Voice selection](#voice-selection).
+  An unknown `voice` ends the request with an `error` frame (`error_type`
+  `"unknown_voice"`, `message` naming the presets), then `audio_start` and one
+  `audio_end` with `reason: "error"`; the connection stays open.
+- A generation that fails before the engine finishes (the sidecar is
+  unreachable, refuses the request, or drops the connection mid-reply) ends the
+  request with `audio_start` (if not yet sent) and one `audio_end` with
+  `reason: "error"`, so an empty reply and a failed one are distinguishable.
+  The connection stays open.
+- One generation is capped at 60 s of audio by the shipped generator config. A
+  request whose speech would run past 60 s is cut there with a normal
+  `audio_end` (`reason: "complete"`) and the rest of its text is dropped, so
+  keep one request to one reply.
   Cloning from `/voice/upload` is not offered on this engine.
 
 The sidecar is one process shared by every session and it speaks one generation
@@ -642,7 +654,11 @@ For engines with preset voices (VibeVoice, audiocpp and voxtream), the voice of 
 1. **The request's `voice` field**, when it is set. An unknown name behaves as
    before: under audiocpp it fails the request; under VibeVoice the server logs
    a warning and speaks with the configured default (`VM_VIBEVOICE_VOICE`)
-   instead. Pick names from `available_voices` to avoid both.
+   instead. Under voxtream an unknown name on `tts_stream` ends that request
+   and nothing else: the server sends an `error` frame with `error_type`
+   `"unknown_voice"` whose `message` lists the valid presets, then `audio_start`
+   and one `audio_end` with `reason: "error"`, and the connection stays open
+   for the next request. Pick names from `available_voices` to avoid all three.
 2. **The token's voice**, when the token that opened the connection has one and
    the running engine offers it. Set it with
    `voicemanager user token voice USER NAME VOICE` (clear it with `--clear`),
@@ -950,7 +966,7 @@ Marks the end of one TTS reply. Exactly one `audio_end` is emitted per
 |---|---|---|---|
 | `type` | string | `"audio_end"` | Frame discriminator. |
 | `request_id` | string or null | `null` | The completed reply's `request_id`. |
-| `reason` | string | `"complete"` | Why the reply ended: `"complete"`, `"cancelled"`, or (reserved) `"interrupted"`. See [Turn-taking](#turn-taking-protocol-surface). |
+| `reason` | string | `"complete"` | Why the reply ended: `"complete"`, `"cancelled"`, `"error"`, or (reserved) `"interrupted"`. See [Turn-taking](#turn-taking-protocol-surface). |
 
 #### `turn_started` - `TurnStartedMessage`
 
@@ -1299,7 +1315,7 @@ multipart form with a `file` field containing the WAV sample.
 | Status | When |
 |---|---|
 | `200` | Success - body `{"status": "voice profile updated"}`. |
-| `400` | The server runs VibeVoice or audiocpp (cloning unsupported - presets only), or the sample is empty or too short. |
+| `400` | The server runs VibeVoice, audiocpp or voxtream (cloning unsupported - presets only), or the sample is empty or too short. |
 | `401` | No `Authorization: Bearer` header, or the token is unknown or revoked. |
 | `404` | `session_id` is not a live session of the token's user (an unknown id and another user's session answer the same). |
 | `503` | The session registry or TTS engine is unavailable. |
