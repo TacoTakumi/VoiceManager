@@ -216,15 +216,43 @@ def test_voice_selection_reaches_init_and_defaults(fake):
                      str(VOICES_DIR / "designed_male_s202.wav")]
 
 
-def test_unknown_voice_fails_before_any_connection(fake):
+def test_unknown_voice_ends_the_request_with_an_error_frame_and_no_connection(fake):
+    ws = _WS()
+
     async def run():
         pipe = _pipe(_engine(fake))
-        with pytest.raises(UnknownVoiceError) as exc:
-            await pipe.feed_text("hello", False, _WS(), "r1", voice="nope")
-        assert "designed_female_s101" in str(exc.value)
-        assert pipe.synthesis_task is None
+        await pipe.feed_text("hello", False, ws, "r1", voice="nope")  # must not raise
+        await asyncio.wait_for(pipe.synthesis_task, 3.0)
     asyncio.run(run())
+
+    errors = ws.texts("error")
+    assert len(errors) == 1
+    assert "nope" in errors[0]["message"] and "designed_female_s101" in errors[0]["message"]
+    assert ws.kinds() == ["error", "audio_start", "audio_end"]
     assert fake.connections == 0
+
+
+def test_unknown_voice_over_the_endpoint_keeps_the_connection_open(fake, monkeypatch):
+    monkeypatch.setattr(ws_module, "QwenSTTPipeline", _InstantSTT)
+    engine = _engine(fake)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        client = TestClient(_tts_app(engine, executor))
+        with authkit.ws_connect(client, "/ws/stream") as ws:
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_json({"type": "tts_stream", "text": "hello", "done": True,
+                          "request_id": "bad", "voice": "nope"})
+            frames = [ws.receive_json() for _ in range(3)]
+            assert [f["type"] for f in frames] == ["error", "audio_start", "audio_end"]
+            assert "designed_female_s101" in frames[0]["message"]
+            assert frames[2]["request_id"] == "bad"
+            # The connection is still open: a valid request plays normally.
+            ws.send_json({"type": "tts_stream", "text": "still here", "done": True,
+                          "request_id": "good"})
+            assert ws.receive_json()["type"] == "audio_start"
+            assert ws.receive()["bytes"] is not None
+            assert json.loads(ws.receive()["text"])["type"] == "audio_end"
+    assert fake.connections == 1
+    assert fake.chunks[0] == ["still here"]
 
 
 # --- wired per connection ------------------------------------------------------------
