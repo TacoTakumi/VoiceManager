@@ -52,8 +52,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8256
 CONFIG_DIR = Path(__file__).with_name("voxtream_configs")
 # How long the connection handler waits for the generation thread to wind down after
-# a cancel before giving the generation lock back. A frame is 80 ms; the generator
-# polls its text feed at least once per frame, so one second is generous.
+# a cancel before giving the generation lock back. A frame is 80 ms and the generator
+# polls its text feed at least once per frame, so it notices a cancel within a frame;
+# five seconds leaves room for the generator's own close on a busy GPU.
 _WORKER_JOIN_S = 5.0
 
 
@@ -237,8 +238,11 @@ async def _serve_generation(ws: WebSocket, generator: Any, prompt_path: Path,
         except (WebSocketDisconnect, RuntimeError):
             stop()
 
-    await ws.send_text(json.dumps({"type": "config", "sample_rate": SAMPLE_RATE,
-                                   "dtype": "float32", "channels": 1}))
+    try:
+        await ws.send_text(json.dumps({"type": "config", "sample_rate": SAMPLE_RATE,
+                                       "dtype": "float32", "channels": 1}))
+    except (WebSocketDisconnect, RuntimeError):
+        return  # the client left while this connection waited for the generation lock
     worker = threading.Thread(
         target=_run_generation, args=(generator, prompt_path, feed, out, loop, cancelled),
         name="voxtream-generation", daemon=True)

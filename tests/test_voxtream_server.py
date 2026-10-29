@@ -5,6 +5,7 @@ error frame when generation fails; one generation at a time across connections; 
 connection that closes early stops its generation, and the next one is served;
 /health is 503 before the model is set and 200 after; the default bind is loopback.
 """
+import asyncio
 import json
 import struct
 import threading
@@ -247,6 +248,31 @@ def test_early_close_stops_generation_and_next_connection_is_served(prompt_wav):
     assert texts[-1] == {"type": "eos"}
     assert len(blobs) == 2
     assert len(fake.starts) == 2
+
+
+def test_a_client_gone_before_its_config_frame_ends_the_handler_quietly(prompt_wav):
+    # A connection parked behind the generation lock whose client left meanwhile:
+    # under uvicorn the config send raises WebSocketDisconnect. The handler must
+    # swallow it and never start a generation (TestClient's queue accepts a send to
+    # a closed client, so this is pinned on a stub websocket).
+    from starlette.websockets import WebSocketDisconnect
+
+    class _GoneWS:
+        async def send_text(self, _data):
+            raise WebSocketDisconnect(code=1006)
+
+        async def send_bytes(self, _data):
+            raise WebSocketDisconnect(code=1006)
+
+        async def receive(self):
+            return {"type": "websocket.disconnect"}
+
+        async def close(self, code=1000):
+            pass
+
+    fake = FakeGenerator()
+    asyncio.run(voxtream_server._serve_generation(_GoneWS(), fake, prompt_wav, "", True))
+    assert fake.starts == []
 
 
 def test_health_reports_loading_then_ready():

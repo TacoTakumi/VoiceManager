@@ -1,6 +1,7 @@
 """ML model lifecycle management for STT and TTS pipelines."""
 import concurrent.futures
 import logging
+import os
 import threading
 
 import torch
@@ -575,7 +576,8 @@ def _load_voxtream_tts(settings) -> dict:
     sidecar = VoxtreamSidecar(
         python=settings.voxtream_py,
         port=settings.voxtream_port,
-        device=VoxtreamSidecar.device_argument(resolved_device),
+        device=VoxtreamSidecar.device_argument(
+            resolved_device, visible=os.environ.get("CUDA_VISIBLE_DEVICES")),
         ready_timeout_s=settings.voxtream_ready_timeout,
         compile_model=settings.voxtream_compile,
     )

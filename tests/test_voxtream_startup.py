@@ -89,6 +89,16 @@ def test_device_argument_maps_resolved_device():
     assert VoxtreamSidecar.device_argument("cpu") == "-1"
 
 
+def test_device_argument_maps_a_logical_index_through_the_parents_visible_devices():
+    # Under CUDA_VISIBLE_DEVICES=2,3 torch's cuda:1 is physical GPU 3; the sidecar
+    # gets its own CUDA_VISIBLE_DEVICES, so it needs the physical index.
+    assert VoxtreamSidecar.device_argument("cuda:1", visible="2,3") == "3"
+    assert VoxtreamSidecar.device_argument("cuda:0", visible="2,3") == "2"
+    assert VoxtreamSidecar.device_argument("cuda:1", visible="") == "1"
+    assert VoxtreamSidecar.device_argument("cuda:5", visible="2,3") == "5"  # out of range: as given
+    assert VoxtreamSidecar.device_argument("cpu", visible="2,3") == "-1"
+
+
 # --- spawn, ready, shutdown ----------------------------------------------------------
 
 def test_engine_loads_against_a_ready_fake_and_stops_it(fake_sidecar, tmp_path):

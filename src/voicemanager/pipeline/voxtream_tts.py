@@ -67,14 +67,23 @@ class VoxtreamSidecar:
         self.process: subprocess.Popen | None = None
 
     @staticmethod
-    def device_argument(resolved_device: str) -> str | None:
+    def device_argument(resolved_device: str, visible: str | None = None) -> str | None:
         """Map a resolved VM_DEVICE to the sidecar's --device value.
 
         ``cuda:N`` pins GPU N; ``cuda`` inherits whatever CUDA_VISIBLE_DEVICES says
-        (None, no argument); ``cpu`` hides every GPU with -1.
+        (None, no argument); ``cpu`` hides every GPU with -1. The sidecar gets its
+        value as its own CUDA_VISIBLE_DEVICES, so N, a logical index in this
+        process, is mapped through ``visible`` (this process's CUDA_VISIBLE_DEVICES)
+        to the physical index when that is set; an index past the list is passed
+        as given.
         """
         if resolved_device.startswith("cuda:"):
-            return resolved_device.split(":", 1)[1]
+            index = resolved_device.split(":", 1)[1]
+            if visible:
+                physical = [d.strip() for d in visible.split(",") if d.strip()]
+                if index.isdigit() and int(index) < len(physical):
+                    return physical[int(index)]
+            return index
         if resolved_device == "cpu":
             return "-1"
         return None

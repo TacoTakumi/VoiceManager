@@ -354,6 +354,53 @@ def test_sidecar_dropping_the_connection_mid_generation_ends_with_reason_error()
     assert ws.texts("audio_end")[0]["reason"] == "error"
 
 
+def test_a_pump_that_fails_mid_generation_leaves_no_unretrieved_exception(fake):
+    # The sidecar connection dies under the pump's push while frames are still
+    # pending (a sidecar drop, or its own stop while text keeps arriving). The pump
+    # task fails on its own; the pipeline must retrieve that exception, or asyncio
+    # reports it through the loop's exception handler when the task is collected.
+    import gc
+
+    class _StubGeneration:
+        sample_rate = 24000
+
+        async def start(self):
+            pass
+
+        async def push(self, chunk):
+            raise RuntimeError("socket gone under the pump")
+
+        async def end(self):
+            pass
+
+        async def frames(self):
+            yield np.zeros(FRAME_SAMPLES, dtype=np.float32)
+            await asyncio.sleep(0.05)  # the pump fails while this is pending
+            raise VoxtreamGenerationError("connection dropped")
+
+        async def close(self):
+            pass
+
+    unhandled: list[dict] = []
+    ws = _WS()
+
+    async def run():
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, context: unhandled.append(context))
+        engine = _engine(fake)
+        engine.open_generation = lambda voice: _StubGeneration()
+        pipe = _pipe(engine)
+        await pipe.feed_text("hello", True, ws, "r1")
+        await asyncio.wait_for(pipe.synthesis_task, 3.0)
+        del pipe
+        gc.collect()
+        await asyncio.sleep(0)
+    asyncio.run(run())
+    assert ws.kinds() == ["audio_start", "bytes", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
+    assert unhandled == []
+
+
 def test_no_sidecar_on_the_port_ends_with_reason_error():
     fake = FakeVoxtreamSidecar().start()
     fake.stop()  # the port is now closed; the engine still points at it
