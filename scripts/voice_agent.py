@@ -18,7 +18,8 @@ a WAV of what played under ``runs/``. The bearer token comes from the
 ``VOICEMANAGER_TOKEN`` environment variable.
 
     python scripts/voice_agent.py classic [--vm-host HOST] [--vm-port PORT] [--voice NAME]
-        [--url URL] [--model NAME] [--tts-mode {clause,sentence}] [--duration SECONDS]
+        [--url URL] [--model NAME] [--tts-mode {clause,sentence}] [--think]
+        [--duration SECONDS]
     python scripts/voice_agent.py microturn [...the options of the micro-turn live mode]
     python scripts/voice_agent.py replay [--script FILE] [--url URL] [--model NAME]
 """
@@ -56,12 +57,16 @@ class ChatStream:
     """
 
     def __init__(self, base_url: str, model: str | None, messages: list[dict],
-                 timeout: float = 120.0):
+                 timeout: float = 120.0, think: bool = False):
         self.base_url = base_url.rstrip("/")
         self.url = f"{self.base_url}/v1/chat/completions"
         self.body: dict = {"messages": messages, "stream": True}
         if model:
             self.body["model"] = model
+        if not think:
+            # A thinking model reasons for seconds before its first spoken word and
+            # those deltas carry no content (gemma-4 12B: 14 s against 0.2 s without).
+            self.body["chat_template_kwargs"] = {"enable_thinking": False}
         self.timeout = timeout
         self.text = ""
         self._queue: asyncio.Queue | None = None
@@ -363,11 +368,11 @@ class ClassicSession:
 
 
 async def warm_up_chat(base_url: str, model: str | None, say: Callable[[str], None] = print,
-                       timeout: float = 300.0) -> bool:
+                       timeout: float = 300.0, think: bool = False) -> bool:
     """Send one short chat request so llama-swap loads the model before the first turn."""
     say(f"loading the chat model{' ' + model if model else ''} at {base_url} ...")
     chat = ChatStream(base_url, model, [{"role": "user", "content": "Say ready."}],
-                      timeout=timeout)
+                      timeout=timeout, think=think)
     try:
         chat.start(asyncio.get_running_loop())
         async for _ in chat.deltas():
@@ -397,7 +402,7 @@ async def classic(args: argparse.Namespace) -> None:
 
     log_path, wav_path = classic_output_paths(args)
     print("warning: use headphones; there is no echo cancellation", flush=True)
-    if not await warm_up_chat(args.url, args.model):
+    if not await warm_up_chat(args.url, args.model, think=args.think):
         raise SystemExit(2)
     client = VoiceManagerClient(host=args.vm_host, port=args.vm_port, token=token)
     try:
@@ -414,7 +419,8 @@ async def classic(args: argparse.Namespace) -> None:
         async with client.duplex() as duplex:
             with open(log_path, "w") as log:
                 session = ClassicSession(
-                    duplex, lambda messages: ChatStream(args.url, args.model, messages),
+                    duplex, lambda messages: ChatStream(args.url, args.model, messages,
+                                                        think=args.think),
                     player, log, voice=args.voice, chunking=args.tts_mode, say=say)
                 await session.open_turn()
                 say(f"listening (stt {client.stt_engine}, tts {client.tts_engine}); "
@@ -484,6 +490,9 @@ def add_classic_arguments(parser: argparse.ArgumentParser) -> None:
                         help="WAV of the audio played (default: runs/classic/classic-<stamp>.wav)")
     parser.add_argument("--tts-mode", choices=("clause", "sentence"), default="clause",
                         help="chunking of the reply's tts_stream request (default: clause)")
+    parser.add_argument("--think", action="store_true",
+                        help="let a thinking model reason before it answers (default: off, "
+                             "since the reasoning delays the first spoken word by seconds)")
 
 
 def main(argv: list[str] | None = None) -> None:

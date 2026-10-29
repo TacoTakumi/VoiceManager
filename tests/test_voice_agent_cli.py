@@ -25,7 +25,8 @@ def test_classic_defaults():
     assert args.vm_host == "localhost" and args.vm_port == 8255
     assert args.url == "http://127.0.0.1:8080" and args.model is None
     assert args.tts_mode == "clause" and args.voice is None and args.duration is None
-    assert args.log is None and args.wav is None
+    assert args.log is None and args.wav is None and args.think is False
+    assert va.build_parser().parse_args(["classic", "--think"]).think is True
 
 
 def test_classic_options():

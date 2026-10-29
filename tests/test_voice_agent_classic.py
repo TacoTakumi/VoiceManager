@@ -316,6 +316,18 @@ def test_chat_stream_yields_the_deltas_in_order(sse_server):
     deltas, text = asyncio.run(run())
     assert deltas == ["Hello", " there", "."] and text == "Hello there."
     assert _SSEHandler.bodies[0]["model"] == "m1" and _SSEHandler.bodies[0]["stream"] is True
+    # Thinking is off unless asked: a reasoning pass delays the first spoken word.
+    assert _SSEHandler.bodies[0]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_chat_stream_keeps_thinking_when_asked(sse_server):
+    async def run():
+        chat = va.ChatStream(sse_server, None, [{"role": "user", "content": "hi"}], think=True)
+        chat.start(asyncio.get_running_loop())
+        return [d async for d in chat.deltas()]
+    asyncio.run(run())
+    assert "chat_template_kwargs" not in _SSEHandler.bodies[-1]
+    assert "model" not in _SSEHandler.bodies[-1]
 
 
 def test_an_http_failure_is_one_line_and_the_loop_goes_on(sse_server):
