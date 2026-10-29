@@ -519,3 +519,94 @@ def test_the_question_growing_in_the_same_segment_keeps_the_whole_text():
     asyncio.run(run())
     assert factory.messages[1][-1]["content"] == "book me a flight to boston"
     assert [m["role"] for m in factory.messages[1]] == ["system", "user"]
+
+
+# --- history after cancels and failures ------------------------------------------------
+
+def test_a_barge_in_after_the_stream_ended_records_the_reply_once():
+    # The chat stream finished and done() was sent; the audio is still arriving when
+    # the person interrupts. The reply must appear once in the history.
+    factory = ChatFactory(FakeChat(["Short", " reply."]), FakeChat(["Yes."]))
+    session, duplex, player, log, clock = _session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("question", endpoint=True), 100.9)
+        await asyncio.wait_for(session.reply.task, 2.0)  # the stream ended, done() sent
+        await session.on_event(("audio_start", {"type": "audio_start", "request_id": "r1",
+                                                "sample_rate": 24000}), 101.2)
+        await session.on_event(("pcm", b"\x01\x00", "r1"), 101.2)
+        await session.on_transcript(_frame("wait", seg=1), 101.5)  # new segment: barge-in
+        await _settle()
+        await session.on_transcript(_frame("wait a second", seg=1, endpoint=True), 102.0)
+        await _settle()
+    asyncio.run(run())
+    assert [m["content"] for m in factory.messages[1][1:]] == [
+        "question", "Short reply.", "wait a second"]
+    assert [m["role"] for m in factory.messages[1]] == ["system", "user", "assistant", "user"]
+
+
+def test_on_a_finals_only_engine_an_interruption_is_a_barge_in_not_a_supersede():
+    # Whisper sends only finals. An interruption arrives as a final of a new segment:
+    # it is the person's next utterance, not a revision of the dispatched one.
+    factory = ChatFactory(FakeChat(["Long", " answer"], hold=True), FakeChat(["Fine."]))
+    session, duplex, player, log, clock = _session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("first question", final=True), 100.9)
+        await _settle()
+        await session.on_event(("audio_start", {"type": "audio_start", "request_id": "r1",
+                                                "sample_rate": 24000}), 101.2)
+        await session.on_event(("pcm", b"\x01\x00", "r1"), 101.2)
+        await session.on_transcript(_frame("Stop that.", seg=1, final=True), 102.0)
+        await _settle()
+    asyncio.run(run())
+    assert duplex.requests[0].cancelled
+    assert _lines(log)[0]["reason"] == "barge-in"
+    assert [m["content"] for m in factory.messages[1][1:]] == [
+        "first question", "Long answer", "Stop that."]
+
+
+def test_a_revision_of_the_dispatched_segment_is_superseded_and_replaces_the_message():
+    factory = ChatFactory(FakeChat(["Where", " to?"], hold=True), FakeChat(["Boston."]))
+    session, duplex, player, log, clock = _session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("fly me to", endpoint=True), 100.9)
+        await _settle()
+        await session.on_transcript(_frame("fly me to boston", final=True), 101.9)
+        await _settle()
+    asyncio.run(run())
+    assert _lines(log)[0]["reason"] == "superseded"
+    assert [m["role"] for m in factory.messages[1]] == ["system", "user"]
+    assert factory.messages[1][-1]["content"] == "fly me to boston"
+
+
+def test_no_user_message_is_left_without_a_reply():
+    # A reply that fails before any text, then a barge-in before the first token: the
+    # next request must still alternate user and assistant.
+    failed = FakeChat([], fail=RuntimeError("down"))
+    factory = ChatFactory(failed, FakeChat([], hold=True), FakeChat(["Okay."]))
+    errors: list[str] = []
+    session, duplex, player, log, clock = _session(factory, errors)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("one", endpoint=True), 100.9)
+        await asyncio.wait_for(session.reply.task, 2.0)
+        await session.on_event(("audio_end", {"type": "audio_end", "request_id": "r1",
+                                              "reason": "complete"}), 101.0)
+        assert session.history == []  # nothing was answered
+        await session.on_transcript(_frame("two", turn_id=2, endpoint=True), 102.0)
+        await _settle()
+        await session.on_transcript(_frame("three", turn_id=2, seg=1), 102.5)  # before any token
+        await _settle()
+        await session.on_transcript(_frame("three four", turn_id=2, seg=1, endpoint=True), 103.0)
+        await _settle()
+    asyncio.run(run())
+    assert len(errors) == 1
+    roles = [m["role"] for m in factory.messages[2]]
+    assert roles == ["system", "user"], roles
+    assert factory.messages[2][-1]["content"] == "three four"

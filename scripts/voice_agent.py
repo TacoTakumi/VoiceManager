@@ -161,6 +161,7 @@ class Reply:
         self.cancelled = False
         self.reason = "complete"
         self.failed = False
+        self.recorded = False  # its assistant message is in the history
 
 
 class ClassicSession:
@@ -238,13 +239,17 @@ class ClassicSession:
         if self.reply is not None and not self.reply.ended:
             if words == self.dispatched_words:
                 return  # a confirmation (or a re-casing) of what was dispatched
-            await self._cancel_reply(now, "superseded" if endpointed else "barge-in")
-            if seg not in self._dispatched_keys:
-                # The interruption is a new utterance, not the question growing: the
-                # answered segments leave the text and the history keeps the exchange.
+            if seg in self._dispatched_keys:
+                # The dispatched segment itself changed: the endpoint hold revised it,
+                # or the person went on with the same sentence. The revision replaces
+                # the question.
+                await self._cancel_reply(now, "superseded")
+            else:
+                # A new segment: the person's next utterance, said over the reply. The
+                # answered segments leave the text; the history keeps the exchange.
+                await self._cancel_reply(now, "barge-in")
                 for key in self._dispatched_keys:
                     self.segments.pop(key, None)
-                self._user_index = None
                 text = self.turn_text()
                 words = _heard_words(text)
                 if not words:
@@ -278,7 +283,7 @@ class ClassicSession:
             async for delta in chat.deltas():
                 await reply.request.send(delta)  # every token, as it arrives
             await reply.request.done()
-            self.history.append({"role": "assistant", "content": chat.text})
+            self._settle_history(reply)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -291,6 +296,7 @@ class ClassicSession:
                 await reply.request.done()  # the server answers with one audio_end
             except Exception:
                 reply.ended = True
+                self._settle_history(reply)
                 self._write_utterance(reply)
                 await self.open_turn()
 
@@ -309,10 +315,26 @@ class ClassicSession:
         self.player.clear()
         if reason == "superseded":
             del self.history[self._user_index:]  # the revision replaces the message
-            self._user_index = None
-        elif reply.chat.text:
-            self.history.append({"role": "assistant", "content": reply.chat.text})
+        else:
+            self._settle_history(reply)
+        self._user_index = None
         self._write_utterance(reply)
+
+    def _settle_history(self, reply: Reply) -> None:
+        """Leave the history alternating after ``reply``: its answer, or no question.
+
+        The assistant message goes in once, with whatever text arrived. A reply that
+        produced nothing (it failed, or was cut before its first token) takes its
+        question out with it, since a user message without an answer would make every
+        later request two user messages in a row.
+        """
+        if reply.recorded:
+            return
+        reply.recorded = True
+        if reply.chat.text:
+            self.history.append({"role": "assistant", "content": reply.chat.text})
+        elif self._user_index is not None:
+            del self.history[self._user_index:]
 
     # --- the audio events -----------------------------------------------------------
 
@@ -340,6 +362,7 @@ class ClassicSession:
                 await reply.task
             except (asyncio.CancelledError, Exception):
                 pass
+        self._settle_history(reply)
         self._write_utterance(reply)
         await self.open_turn()
 
