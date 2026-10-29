@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A `voxtream` TTS engine (`VM_TTS_ENGINE=voxtream`): VoXtream2.1 reads streamed
+  text at the speaking rate, so a `tts_stream` request is one continuous
+  generation from its first word to its last, with no seams between pieces.
+  `flush` has no effect on it, `chunking` makes no difference, and the client
+  protocol is unchanged. VoXtream pins its own PyTorch, so it runs as one
+  sidecar process from its own virtual environment (`venv-voxtream`, three
+  commands in the README), spawned at startup on the `VM_DEVICE` GPU and
+  stopped at shutdown; startup refuses with the setting named when the
+  interpreter is missing or the sidecar is not ready in time. The voice is a
+  preset from the designed presets file (the reference WAV only). Settings
+  `VM_VOXTREAM_PY`, `VM_VOXTREAM_PORT`, `VM_VOXTREAM_VOICES`,
+  `VM_VOXTREAM_VOICE`, `VM_VOXTREAM_READY_TIMEOUT` and `VM_VOXTREAM_COMPILE`.
+  English only; the weights are CC BY-NC 4.0.
 - `tts_stream` has a `chunking` field: `"sentence"` (the default, unchanged) or
   `"clause"`. In clause mode the server holds the streamed text and cuts
   playback-aware pieces at clause marks, word counts or when the unplayed

@@ -30,6 +30,7 @@ You select one STT engine and one TTS engine at startup with `.env`.
 | TTS | `VM_TTS_ENGINE=audiocpp` | Breeze-TTS 2, Qwen3-TTS, dots.tts or VoxCPM2 in an audio.cpp sidecar | Default (Breeze-TTS 2). Preset voices from `voices/designed/refs.json`. |
 | TTS | `VM_TTS_ENGINE=openvoice` | OpenVoice v2 + MeloTTS | The only engine with voice cloning (`/voice/upload`). |
 | TTS | `VM_TTS_ENGINE=vibevoice` | VibeVoice-Realtime-0.5B | Preset voices. |
+| TTS | `VM_TTS_ENGINE=voxtream` | VoXtream2.1 in its own Python sidecar | Reads streamed text at the speaking rate: one generation per `tts_stream` request, no seams. Preset voices from `voices/designed/refs.json`. English. |
 
 ### Why there are so many engines
 
@@ -163,6 +164,26 @@ python setup_models.py vibevoice
 ```
 
 Set `VM_TTS_ENGINE=vibevoice`. The voice is `VM_VIBEVOICE_VOICE` (for example Carter, Davis, Emma, Frank, Grace or Mike).
+
+### VoXtream
+
+VoXtream (https://github.com/herimor/voxtream) is a streaming TTS model that takes text word by word and speaks it in one continuous generation. The other engines synthesize each sentence or clause piece on its own, so a reply that arrives a few words at a time restarts its delivery at every piece. VoXtream reads the text at the speaking rate, so a `tts_stream` request is one generation from its first word to its last and `flush` has nothing to do. It pins an older PyTorch than VoiceManager, so it runs as a separate process from its own virtual environment, which VoiceManager starts and stops with the server.
+
+```bash
+python3.12 -m venv venv-voxtream
+venv-voxtream/bin/pip install "voxtream>=0.2"
+sudo apt install espeak-ng     # the phonemizer runs the espeak-ng program
+```
+
+Set `VM_TTS_ENGINE=voxtream`. The first start downloads the weights (about 2.5 GB) into the Hugging Face cache. Settings, all optional:
+
+- `VM_VOXTREAM_PY`: the python of that environment (default `venv-voxtream/bin/python`, relative to the VoiceManager home).
+- `VM_VOXTREAM_PORT`: the loopback port the sidecar listens on (default 8256).
+- `VM_VOXTREAM_VOICES`, `VM_VOXTREAM_VOICE`: the preset voices file (default `voices/designed/refs.json`, the reference WAV of each entry is the voice) and the default voice (`designed_female_s101`). A request's `voice` picks another preset.
+- `VM_VOXTREAM_READY_TIMEOUT`: seconds to wait for the sidecar to load (default 180).
+- `VM_VOXTREAM_COMPILE`: `torch.compile` the model for a lower first-packet latency at the cost of minutes of startup (default off).
+
+The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM. Voice cloning from an upload (`/voice/upload`) is not offered on this engine; it is English only; and the weights are published under CC BY-NC 4.0, so check the licence before any commercial use.
 
 ## Configuration
 

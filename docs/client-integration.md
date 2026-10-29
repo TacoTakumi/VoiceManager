@@ -604,9 +604,39 @@ If the session's TTS sidecar process dies mid-request, the session receives an
 TTS analog of `stt_backend_fault` in [Close codes](#close-codes); reconnecting
 gets a fresh sidecar.
 
+### The VoXtream TTS engine: one generation per request
+
+With `VM_TTS_ENGINE=voxtream` a `tts_stream` request is one continuous
+generation: the first frame opens it with the request's voice, every later frame's
+`text` goes straight in as it arrives, and the engine reads the words at its own
+speaking rate. Nothing is cut into sentences or clause pieces, so a reply that
+arrives a few words at a time keeps one delivery from its first word to its last.
+What changes for a client:
+
+- `flush` has no effect. The generation already has every word; the frame is
+  accepted and ignored.
+- `chunking` is accepted but makes no difference: `"sentence"` and `"clause"`
+  behave the same, and the `VM_TTS_CLAUSE_*` settings are unused.
+- `done` (or the `VM_TTS_STREAM_FLUSH_TIMEOUT` idle flush) ends the text; the
+  request ends with one `audio_end` when the generation finishes speaking.
+- `audio_start` carries `sample_rate: 24000`, mono, 16-bit PCM, like audiocpp's
+  24 kHz models.
+- `tts_cancel`, a new `request_id` and a disconnect stop the generation at once;
+  the cancel semantics in [Turn-taking protocol surface](#turn-taking-protocol-surface)
+  are unchanged.
+- The voice is a preset from `VM_VOXTREAM_VOICES` (the reference WAV of each
+  entry; the transcript is unused), chosen as in [Voice selection](#voice-selection).
+  Cloning from `/voice/upload` is not offered on this engine.
+
+The sidecar is one process shared by every session and it speaks one generation
+at a time: a request on a second session waits for the first to end. The forward-
+every-token rule in [Gotchas](#gotchas) matters more here than anywhere: the
+engine waits for the next word only when it has run out of them, so text that
+arrives faster than speech never gaps, and text that arrives slower does.
+
 ## Voice selection
 
-For engines with preset voices (VibeVoice and audiocpp), the voice of a `tts` or
+For engines with preset voices (VibeVoice, audiocpp and voxtream), the voice of a `tts` or
 `tts_stream` request is chosen in this order:
 
 1. **The request's `voice` field**, when it is set. An unknown name behaves as
