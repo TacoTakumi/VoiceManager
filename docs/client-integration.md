@@ -18,6 +18,7 @@ implementation of it. Every symbol named here exists in current source - see
 - [Turn-taking protocol surface](#turn-taking-protocol-surface)
 - [WebSocket message-schema reference](#websocket-message-schema-reference)
 - [Client method reference](#client-method-reference)
+  - [Full duplex: `duplex()`](#full-duplex-duplex)
 - [Close codes](#close-codes)
 - [Configuration](#configuration)
 - [Voice cloning](#voice-cloning)
@@ -1088,6 +1089,64 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 | `stream_tts_live` | `(text_chunks, voice=None, request_id=None)` | `AsyncIterator[bytes]` | Stream text and yield PCM chunks as they arrive; supply or read `request_id` for barge-in. |
 | `cancel_tts` | `(request_id)` | `None` | Fire-and-forget cancel; returns as soon as the `tts_cancel` frame is sent. |
 | `flush_tts` | `(request_id)` | `None` | Synthesize the buffered text for an in-flight streaming request now, leaving it open (one `flush:true, done:false` frame). |
+
+### Full duplex: `duplex()`
+
+The methods above each run one direction at a time: `stream_stt_live` and
+`stream_tts_live` read replies only between the chunks they send. A voice agent
+that listens while it speaks uses a `DuplexSession` instead. `client.duplex()`
+returns one on a connected client (use it as `async with client.duplex() as
+session:` or call `close()`); while it is open, the one-sided methods raise
+`VoiceManagerError`, because they read the same reply queues. Its send methods
+and its read iterators are independent, so one task can stream the microphone,
+another read transcripts, a third feed a reply and a fourth play audio.
+
+| Symbol | Signature | Returns | Purpose |
+|---|---|---|---|
+| `duplex()` | `()` | `DuplexSession` | Open the session (one at a time per client). Not a coroutine. |
+| `DuplexSession.send_audio` | `(pcm)` | `None` | Send one binary frame of 16 kHz mono 16-bit PCM to STT. |
+| `DuplexSession.transcripts` | `()` | `AsyncIterator[dict]` | Yield every transcription dict as it arrives, `turn_id` stamped; ends when the connection closes. |
+| `DuplexSession.turn_start` | `(timeout=5.0)` | `int` | Open a turn and return the server's `turn_id` (as `client.turn_start`). |
+| `DuplexSession.tts_request` | `(voice=None, chunking=None, request_id=None)` | `TTSRequest` | Make a streaming TTS request; nothing is sent until its first `send`. Not a coroutine. |
+| `TTSRequest.send` | `(text, flush=False)` | `None` | Append text (the first frame carries `voice` and `chunking`); with `flush` the server speaks the held text now. |
+| `TTSRequest.flush` | `()` | `None` | Speak the held text now and keep the request open. |
+| `TTSRequest.done` | `()` | `None` | End the text; the server answers with one `audio_end`. A later `send` raises. |
+| `TTSRequest.cancel` | `()` | `None` | Stop the reply; the server answers with one `audio_end` carrying `reason: "cancelled"`. |
+| `DuplexSession.audio` | `()` | `AsyncIterator[tuple]` | Yield `("audio_start", frame)`, `("pcm", bytes, request_id)` and `("audio_end", frame)` in arrival order. The pcm of a cancelled request is dropped until its `audio_end`, which is still yielded. |
+| `DuplexSession.errors` | `()` | `AsyncIterator[dict]` | Yield the server's `error` frames (timeout warnings, invalid requests). |
+| `DuplexSession.close` | `()` | `None` | End the session; the one-sided methods work again. |
+
+A classic turn loop in outline (the full version, with supersede on a revised
+endpoint and barge-in, is `scripts/voice_agent.py classic`):
+
+```python
+async with VoiceManagerClient(token=token) as client:
+    async with client.duplex() as session:
+        turn_id = await session.turn_start()
+        segments: dict[int, str] = {}
+
+        async def listen():
+            nonlocal turn_id
+            async for frame in session.transcripts():
+                if frame["turn_id"] != turn_id:
+                    continue                                   # a stale turn
+                segments[frame["segment_index"]] = frame["text"]  # upsert
+                if frame["endpoint"] or frame["is_final"]:
+                    text = " ".join(segments[k] for k in sorted(segments))
+                    reply = session.tts_request(chunking="clause")
+                    async for token in llm_stream(text):       # any chat LLM
+                        await reply.send(token)                # every token, as it arrives
+                    await reply.done()
+
+        async def play():
+            async for event in session.audio():
+                if event[0] == "audio_start":
+                    speaker.start(event[1]["sample_rate"])
+                elif event[0] == "pcm":
+                    speaker.write(event[1])
+
+        await asyncio.gather(microphone_to(session.send_audio), listen(), play())
+```
 
 ### Voice cloning and REST
 

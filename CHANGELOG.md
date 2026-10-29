@@ -63,13 +63,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   piece. No protocol change.
 - `chunking` argument in `stream_tts` and `stream_tts_live` of the Python
   client. It is sent on the first frame only.
-- `--tts-mode clause|flush` in `scripts/microturn_client.py` live mode (clause
-  is the default), and run files go to `runs/microturn/` by default.
-- `scripts/microturn_client.py`, a reference client for micro-turn full-duplex
-  voice: every 0.6 s a text LLM with the micro-turn LoRA decides to speak a few
-  words or to listen. Replay mode runs a scripted call as text. Live mode runs
-  a real call over VoiceManager (headphones required) and logs the turn time
-  and the delay to the first audio.
+- `--tts-mode clause|flush` in the micro-turn live mode (clause is the
+  default), and its run files go to `runs/microturn/` by default.
+- `scripts/voice_agent.py`, the reference voice agent, with three subcommands.
+  `classic` is the turn pattern with any OpenAI-compatible chat model: one
+  `turn_start` per utterance, dispatch on the first endpointed transcript (the
+  final on engines without an endpoint frame), supersede when the final revises
+  the text, the reply streamed token by token into one clause-mode `tts_stream`
+  request, cancel when the person talks over it, run files under
+  `runs/classic/`. `microturn` is the micro-turn full-duplex loop: every 0.6 s
+  a text LLM with the micro-turn LoRA decides to speak a few words or to
+  listen, over a real call with headphones, logging the turn time and the
+  delay to the first audio. `replay` runs that loop on a scripted call as
+  text. The micro-turn loop stays in `scripts/microturn_client.py` as a module;
+  its own command line is gone.
+- `VoiceManagerClient.duplex()`: a `DuplexSession` that runs STT and TTS at the
+  same time on one connection, with `send_audio`, `transcripts()`,
+  `turn_start()`, `tts_request()` (a `TTSRequest` with `send`, `flush`, `done`
+  and `cancel`), `audio()` and `errors()`. The one-sided methods raise while a
+  session is open.
 
 - README: a "Conversation with a text LLM" section on the two ways to build
   an agent on VoiceManager, the classic turn pattern with any LLM and the
