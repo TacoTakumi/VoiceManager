@@ -610,3 +610,15 @@ def test_no_user_message_is_left_without_a_reply():
     roles = [m["role"] for m in factory.messages[2]]
     assert roles == ["system", "user"], roles
     assert factory.messages[2][-1]["content"] == "three four"
+
+
+def test_drain_errors_prints_one_line_per_error_frame():
+    class _Duplex:
+        async def errors(self):
+            yield {"type": "error", "error_type": "unknown_voice", "message": "no such voice"}
+            yield {"type": "error", "error_type": "invalid_request"}
+
+    said: list[str] = []
+    asyncio.run(va.drain_errors(_Duplex(), said.append))
+    assert said == ["server error: unknown_voice: no such voice",
+                    "server error: invalid_request: "]

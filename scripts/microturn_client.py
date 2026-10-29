@@ -660,6 +660,13 @@ async def _tts_task(duplex, session: LiveSession, player: AudioPlayer) -> None:
             session.on_audio_end(event[1].get("request_id"))
 
 
+async def _errors_task(duplex) -> None:
+    """Print the server's error frames; voice_agent.py's drain_errors does the same."""
+    async for frame in duplex.errors():
+        print(f"server error: {frame.get('error_type', 'error')}: {frame.get('message', '')}",
+              flush=True)
+
+
 async def _tick_task(session: LiveSession) -> None:
     """Run a tick every TICK seconds on a monotonic schedule."""
     next_at = session.clock() + TICK
@@ -727,7 +734,8 @@ async def live(args: argparse.Namespace) -> None:
                                       cancelled=sink.is_cancelled)
                 tasks = [asyncio.create_task(c) for c in (
                     _mic_task(duplex), _stt_task(duplex, session),
-                    _tts_task(duplex, session, player), _tick_task(session))]
+                    _tts_task(duplex, session, player), _tick_task(session),
+                    _errors_task(duplex))]
                 try:
                     await asyncio.wait(tasks, timeout=args.duration,
                                        return_when=asyncio.FIRST_COMPLETED)

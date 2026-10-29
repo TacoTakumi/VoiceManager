@@ -421,6 +421,16 @@ async def warm_up_chat(base_url: str, model: str | None, say: Callable[[str], No
     return True
 
 
+async def drain_errors(duplex, say: Callable[[str], None] = print) -> None:
+    """Print the server's error frames (an unknown voice, a bad request, a timeout warning).
+
+    Without a reader the frames sit in the session's queue and a reply that the
+    server refused ends with no audio and no explanation on the terminal.
+    """
+    async for frame in duplex.errors():
+        say(f"server error: {frame.get('error_type', 'error')}: {frame.get('message', '')}")
+
+
 def classic_output_paths(args: argparse.Namespace) -> tuple[str, str]:
     """The log and WAV paths of a classic run; defaults go in ``runs/classic/``."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -473,7 +483,8 @@ async def classic(args: argparse.Namespace) -> None:
                         await session.on_event(event, session.clock())
 
                 tasks = [asyncio.create_task(c) for c in (
-                    microturn_client._mic_task(duplex), transcripts(), audio())]
+                    microturn_client._mic_task(duplex), transcripts(), audio(),
+                    drain_errors(duplex, say))]
                 try:
                     await asyncio.wait(tasks, timeout=args.duration,
                                        return_when=asyncio.FIRST_COMPLETED)

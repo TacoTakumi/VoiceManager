@@ -273,6 +273,7 @@ class FakeSession:
         self.requests: dict[str, FakeRequest] = {}
         self.stt: asyncio.Queue = asyncio.Queue()
         self.tts: asyncio.Queue = asyncio.Queue()
+        self.error_frames: list[dict] = []
 
     def tts_request(self, voice=None, chunking=None, request_id=None):
         req = FakeRequest(self, request_id or f"auto{len(self.requests) + 1}", voice, chunking)
@@ -289,6 +290,10 @@ class FakeSession:
     async def audio(self):
         while (event := await self.tts.get()) is not None:
             yield event
+
+    async def errors(self):
+        for frame in self.error_frames:
+            yield frame
 
 
 def _live_args(**overrides) -> argparse.Namespace:
@@ -661,3 +666,11 @@ def test_live_tasks_over_a_session_through_a_tick_a_cut_in_and_shutdown():
     utterances = [line for line in lines if line["type"] == "utterance"]
     assert [u["cancelled"] for u in utterances] == [False, True]
     assert utterances[0]["first_audio_ms"] == pytest.approx(700.0)
+
+
+def test_live_errors_task_prints_the_servers_error_frames(capsys):
+    duplex = FakeSession()
+    duplex.error_frames = [{"type": "error", "error_type": "timeout_warning",
+                            "message": "closing in 30 s"}]
+    asyncio.run(mc._errors_task(duplex))
+    assert capsys.readouterr().out.strip() == "server error: timeout_warning: closing in 30 s"
