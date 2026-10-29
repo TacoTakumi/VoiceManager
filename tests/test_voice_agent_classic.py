@@ -409,7 +409,11 @@ def test_new_words_during_playback_cancel_once_and_the_new_utterance_dispatches_
     asyncio.run(run())
     assert len(duplex.requests) == 2
     assert player.chunks == [b"\x01\x00"] and player.cleared == 1
-    assert factory.messages[1][-1]["content"] == "Tell me a story. wait stop that"
+    # The interruption is its own utterance: the answered segment is not repeated, and
+    # the history keeps the question with the partial reply before the new message.
+    assert factory.messages[1][-1]["content"] == "wait stop that"
+    assert [m["content"] for m in factory.messages[1][1:]] == [
+        "tell me a story", "Long answer", "wait stop that"]
     lines = _lines(log)
     assert lines[0]["cancelled"] is True and lines[0]["reason"] == "barge-in"
     assert lines[0]["first_audio_ms"] == pytest.approx(400.0)
@@ -495,3 +499,23 @@ def test_words_after_audio_end_while_the_tail_still_plays_clear_the_speaker():
     asyncio.run(run())
     assert "  (playback stopped)" in said
     assert len(duplex.requests) == 2 and not duplex.requests[0].cancelled
+
+
+def test_the_question_growing_in_the_same_segment_keeps_the_whole_text():
+    # The person paused mid-question (endpoint), the reply started, and they went on
+    # in the same segment: the whole question is dispatched again, once.
+    factory = ChatFactory(FakeChat(["Where?"], hold=True), FakeChat(["Booked."]))
+    session, duplex, player, log, clock = _session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("book me a flight", endpoint=True), 100.9)
+        await _settle()
+        await session.on_transcript(_frame("book me a flight to"), 101.4)  # same segment grows
+        await _settle()
+        assert duplex.requests[0].cancelled
+        await session.on_transcript(_frame("book me a flight to boston", endpoint=True), 102.0)
+        await _settle()
+    asyncio.run(run())
+    assert factory.messages[1][-1]["content"] == "book me a flight to boston"
+    assert [m["role"] for m in factory.messages[1]] == ["system", "user"]

@@ -199,6 +199,7 @@ class ClassicSession:
         self.reply: Reply | None = None
         self.replies: list[Reply] = []
         self._user_index: int | None = None  # history index of this turn's user message
+        self._dispatched_keys: set[int] = set()  # the segments the dispatched text held
         self._t0 = clock()
 
     # --- the listening turn ---------------------------------------------------------
@@ -209,6 +210,7 @@ class ClassicSession:
         self.segments = {}
         self.dispatched_words = None
         self._user_index = None
+        self._dispatched_keys = set()
         return self.turn_id
 
     def turn_text(self) -> str:
@@ -219,7 +221,8 @@ class ClassicSession:
         if self.turn_id is not None and frame.get("turn_id", 0) != self.turn_id:
             return
         heard_before = bool(_heard_words(self.turn_text()))
-        self.segments[frame.get("segment_index", 0)] = frame.get("text", "")
+        seg = frame.get("segment_index", 0)
+        self.segments[seg] = frame.get("text", "")
         text = self.turn_text()
         words = _heard_words(text)
         endpointed = bool(frame.get("endpoint") or frame.get("is_final"))
@@ -236,11 +239,22 @@ class ClassicSession:
             if words == self.dispatched_words:
                 return  # a confirmation (or a re-casing) of what was dispatched
             await self._cancel_reply(now, "superseded" if endpointed else "barge-in")
+            if seg not in self._dispatched_keys:
+                # The interruption is a new utterance, not the question growing: the
+                # answered segments leave the text and the history keeps the exchange.
+                for key in self._dispatched_keys:
+                    self.segments.pop(key, None)
+                self._user_index = None
+                text = self.turn_text()
+                words = _heard_words(text)
+                if not words:
+                    return
         if endpointed and words != self.dispatched_words:
             await self._dispatch(text, words, now)
 
     async def _dispatch(self, text: str, words: list[str], now: float) -> None:
         self.dispatched_words = words
+        self._dispatched_keys = set(self.segments)
         if self._user_index is None:
             self._user_index = len(self.history)
             self.history.append({"role": "user", "content": text})
