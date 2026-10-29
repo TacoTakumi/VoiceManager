@@ -517,6 +517,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # Only the audiocpp variant takes the coalescing window, so the base
             # pipeline's call stays byte-identical for every other engine.
             stream_kwargs["coalesce_ms"] = settings.audiocpp_tts_coalesce_ms
+        elif tts_engine_type == "voxtream":
+            # One sidecar generation per request; the text passes straight through.
+            from voicemanager.pipeline.voxtream_tts import VoxtreamTTSStreamPipeline
+            stream_pipeline_cls = VoxtreamTTSStreamPipeline
         else:
             stream_pipeline_cls = TTSStreamPipeline
         tts_stream_pipeline = stream_pipeline_cls(

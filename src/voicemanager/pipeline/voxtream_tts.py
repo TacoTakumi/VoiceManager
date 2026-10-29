@@ -12,6 +12,8 @@ connection to the sidecar per generation.
 The voice is a preset from the designed presets file (the reference WAV only; the
 transcript is unused). Cloning from an uploaded WAV is not offered on this engine.
 """
+import asyncio
+import json
 import logging
 import subprocess
 import time
@@ -21,10 +23,12 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import numpy as np
+import websockets.asyncio.client
+import websockets.exceptions
 
 from voicemanager.pipeline import voxtream_server
 from voicemanager.pipeline.audiocpp_tts import PresetVoice, UnknownVoiceError, load_presets
-from voicemanager.pipeline.tts import TTSEngine
+from voicemanager.pipeline.tts import TTSEngine, TTSStreamPipeline, float32_to_pcm16
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +180,13 @@ class VoxtreamTTSEngine(TTSEngine):
     def sidecar(self) -> VoxtreamSidecar:
         return self._sidecar
 
-    def load(self, device: str = "", voices_path: str | Path | None = None) -> None:
-        """Validate the presets, then spawn the sidecar and wait for it."""
+    def load(self, device: str = "", voices_path: str | Path | None = None,
+             start_sidecar: bool = True) -> None:
+        """Validate the presets, then spawn the sidecar and wait for it.
+
+        ``start_sidecar=False`` loads the presets only, for an engine pointed at a
+        sidecar that is already running (tests use a fake one).
+        """
         if voices_path is None:
             raise ValueError("voices_path is required: the presets file for this engine")
         self._presets = load_presets(voices_path, ref_text_required=False)
@@ -185,7 +194,8 @@ class VoxtreamTTSEngine(TTSEngine):
             raise VoxtreamStartupError(
                 f"{VOICE_SETTING}={self._default_voice!r} is not a preset in "
                 f"{voices_path}; valid presets: {', '.join(sorted(self._presets))}")
-        self._sidecar.start()
+        if start_sidecar:
+            self._sidecar.start()
 
     @property
     def sample_rate(self) -> int:
@@ -211,13 +221,202 @@ class VoxtreamTTSEngine(TTSEngine):
                 f"unknown voice {name!r}; valid presets: {', '.join(sorted(self._presets))}")
         return preset
 
+    def open_generation(self, voice: str | None) -> "VoxtreamGeneration":
+        """A generation for the preset ``voice`` names; not yet connected.
+
+        Raises UnknownVoiceError before any connection is opened.
+        """
+        preset = self.resolve_voice(voice)
+        return VoxtreamGeneration(self._sidecar.url, preset)
+
     def synthesize(self, text: str, speaker_key: str = "EN-US", speed: float = 1.0,
                    voice: str | None = None) -> tuple[np.ndarray, int]:
-        raise NotImplementedError("voxtream synthesis arrives with the stream pipeline")
+        """One generation for the whole text, collected. Call from a worker thread."""
+        async def collect() -> list[np.ndarray]:
+            return [frame async for frame in self.stream_synthesize(text, voice=voice)]
+
+        frames = asyncio.run(collect())
+        if not frames:
+            return np.array([], dtype=np.float32), SAMPLE_RATE
+        return np.concatenate(frames), SAMPLE_RATE
 
     async def stream_synthesize(self, text: str, **kwargs) -> AsyncIterator[np.ndarray]:
-        raise NotImplementedError("voxtream synthesis arrives with the stream pipeline")
-        yield  # pragma: no cover
+        """Yield float32 frames of one generation that speaks the whole text.
+
+        The one-shot ``tts`` request lands here with its complete text; the
+        ``tts_stream`` request goes through VoxtreamTTSStreamPipeline instead, which
+        feeds the same kind of generation as the chunks arrive.
+        """
+        generation = self.open_generation(kwargs.get("voice"))
+        await generation.start()
+        try:
+            await generation.push(text)
+            await generation.end()
+            async for frame in generation.frames():
+                yield frame
+        finally:
+            await generation.close()
 
     def dispose(self) -> None:
         self._sidecar.stop()
+
+
+class VoxtreamGenerationError(RuntimeError):
+    """The sidecar answered a generation with an error frame."""
+
+
+class VoxtreamGeneration:
+    """One generation on the sidecar: one WebSocket connection, text in, frames out.
+
+    ``start`` connects and sends the init frame; ``push`` and ``end`` may be called
+    from one task while another task iterates ``frames``. ``close`` drops the
+    connection, which is how a cancel stops the sidecar's generation.
+    """
+
+    def __init__(self, url: str, preset: PresetVoice) -> None:
+        self.url = url
+        self.preset = preset
+        self.sample_rate = SAMPLE_RATE
+        self._ws = None
+
+    async def start(self) -> None:
+        self._ws = await websockets.asyncio.client.connect(self.url, max_size=None)
+        await self._ws.send(json.dumps({
+            "event": "init", "prompt_audio_path": self.preset.wav_path, "full_stream": True,
+        }))
+        first = await self._ws.recv()
+        payload = json.loads(first) if isinstance(first, str) else {}
+        if payload.get("type") == "error":
+            raise VoxtreamGenerationError(payload.get("message", "sidecar refused the request"))
+        if payload.get("type") != "config":
+            raise VoxtreamGenerationError(f"unexpected first frame from the sidecar: {first!r}")
+        self.sample_rate = int(payload.get("sample_rate", SAMPLE_RATE))
+
+    async def push(self, chunk: str) -> None:
+        if chunk and self._ws is not None:
+            await self._ws.send(json.dumps({"event": "text", "chunk": chunk}))
+
+    async def end(self) -> None:
+        if self._ws is not None:
+            await self._ws.send(json.dumps({"event": "eot"}))
+
+    async def frames(self) -> AsyncIterator[np.ndarray]:
+        """Yield each binary frame as float32 samples until eos; raise on error."""
+        if self._ws is None:
+            return
+        try:
+            async for message in self._ws:
+                if isinstance(message, (bytes, bytearray)):
+                    yield np.frombuffer(bytes(message), dtype=np.float32)
+                    continue
+                payload = json.loads(message)
+                kind = payload.get("type")
+                if kind == "eos":
+                    return
+                if kind == "error":
+                    raise VoxtreamGenerationError(payload.get("message", "generation failed"))
+        except websockets.exceptions.ConnectionClosedOK:
+            return
+        except websockets.exceptions.ConnectionClosedError as exc:
+            raise VoxtreamGenerationError(f"sidecar connection lost: {exc}") from exc
+
+    async def close(self) -> None:
+        ws, self._ws = self._ws, None
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:
+            logger.debug("Closing a VoXtream generation failed", exc_info=True)
+
+
+class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
+    """The tts_stream pipeline for the voxtream engine: one generation per request.
+
+    The first chunk of a request resolves its voice (an unknown voice fails here,
+    before anything is opened), starts the synthesis task and opens the generation.
+    Every chunk goes straight into that generation as text; ``flush`` has nothing to
+    do, since the engine paces itself on the words it has; ``done`` and the flush
+    timeout end the text, and the request ends with one audio_end after the
+    sidecar's eos. The two chunking values behave the same and the clause settings
+    are unused. Cancel, supersede and dispose close the generation through the base
+    class's abandon and dispose, which cancel the synthesis task.
+    """
+
+    async def feed_text(self, chunk: str, done: bool, websocket, request_id: str,
+                        voice: str | None = None, flush: bool = False,
+                        chunking: str = "sentence") -> None:
+        if self._request_id != request_id:
+            self.abandon()
+            engine = self._tts_pipeline._engine
+            generation = engine.open_generation(voice or self._tts_pipeline._voice)
+            self._request_id = request_id
+            self._text_buffer = ""
+            self._done_received = False
+            self._audio_started = False
+            self._sentence_queue = asyncio.Queue()
+            self._voice = voice
+            self._chunking = chunking
+            self._synthesis_task = asyncio.create_task(
+                self._run_generation(websocket, request_id, generation))
+        if self._done_received:
+            return  # a frame that arrived after done: the request is closed
+        if chunk:
+            await self._sentence_queue.put(chunk)
+        if done:
+            self._done_received = True
+            await self._sentence_queue.put(None)
+        # flush: nothing to do, the generation already has every word
+
+    async def _run_generation(self, websocket, request_id: str,
+                              generation: "VoxtreamGeneration") -> None:
+        from voicemanager.protocol import AudioEndMessage, AudioStartMessage
+
+        engine = self._tts_pipeline._engine
+        queue = self._sentence_queue
+        pump: asyncio.Task | None = None
+        frames = 0
+
+        async def pump_text() -> None:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    await generation.end()
+                    return
+                await generation.push(item)
+
+        try:
+            await generation.start()
+            pump = asyncio.create_task(pump_text())
+            async for frame in generation.frames():
+                if not self._audio_started:
+                    await websocket.send_text(AudioStartMessage(
+                        request_id=request_id, sample_rate=generation.sample_rate,
+                        channels=1, bit_depth=16, encoding="pcm").model_dump_json())
+                    self._audio_started = True
+                await websocket.send_bytes(float32_to_pcm16(frame))
+                frames += 1
+                self._report_audio(request_id, len(frame), generation.sample_rate)
+            if pump is not None and not pump.done():
+                # eos before the text ended: the sidecar stopped on its own
+                pump.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("VoXtream generation failed for request_id=%s", request_id)
+        finally:
+            if pump is not None:
+                pump.cancel()
+            await generation.close()
+            if not self._audio_started:
+                try:
+                    await websocket.send_text(AudioStartMessage(
+                        request_id=request_id, sample_rate=engine.sample_rate).model_dump_json())
+                except Exception:
+                    pass
+            try:
+                await websocket.send_text(AudioEndMessage(request_id=request_id).model_dump_json())
+            except Exception:
+                logger.debug("Could not send audio_end for request_id=%s", request_id)
+            logger.debug("VoXtream generation complete: request_id=%s frames=%d",
+                         request_id, frames)
