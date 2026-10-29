@@ -201,18 +201,31 @@ class ClassicSession:
         self.replies: list[Reply] = []
         self._user_index: int | None = None  # history index of this turn's user message
         self._dispatched_keys: set[int] = set()  # the segments the dispatched text held
+        self._answered_keys: set[int] = set()  # segments answered earlier in this turn
         self._t0 = clock()
 
     # --- the listening turn ---------------------------------------------------------
 
-    async def open_turn(self) -> int:
-        """Open the next listening turn; frames of earlier turns are ignored from now."""
-        self.turn_id = await self.duplex.turn_start()
+    def _reset_turn_state(self) -> None:
         self.segments = {}
         self.dispatched_words = None
         self._user_index = None
         self._dispatched_keys = set()
-        return self.turn_id
+        self._answered_keys = set()
+
+    async def open_turn(self) -> int:
+        """Open the next listening turn; frames of earlier turns are ignored from now.
+
+        The turn state is cleared before the server's ack is awaited, so a frame
+        that lands in that window starts a fresh utterance instead of touching the
+        answered one; a reply that such a frame started is left as it is.
+        """
+        self._reset_turn_state()
+        turn_id = await self.duplex.turn_start()
+        self.turn_id = turn_id
+        if self.reply is None or self.reply.ended:
+            self._reset_turn_state()
+        return turn_id
 
     def turn_text(self) -> str:
         return " ".join(self.segments[k] for k in sorted(self.segments)).strip()
@@ -221,8 +234,10 @@ class ClassicSession:
         """Feed one transcription frame: upsert its segment, dispatch or supersede."""
         if self.turn_id is not None and frame.get("turn_id", 0) != self.turn_id:
             return
-        heard_before = bool(_heard_words(self.turn_text()))
         seg = frame.get("segment_index", 0)
+        if seg in self._answered_keys:
+            return  # the endpoint hold confirming a segment answered before a barge-in
+        heard_before = bool(_heard_words(self.turn_text()))
         self.segments[seg] = frame.get("text", "")
         text = self.turn_text()
         words = _heard_words(text)
@@ -250,6 +265,7 @@ class ClassicSession:
                 await self._cancel_reply(now, "barge-in")
                 for key in self._dispatched_keys:
                     self.segments.pop(key, None)
+                self._answered_keys |= self._dispatched_keys
                 text = self.turn_text()
                 words = _heard_words(text)
                 if not words:
@@ -313,7 +329,7 @@ class ClassicSession:
                 pass
         await reply.request.cancel()
         self.player.clear()
-        if reason == "superseded":
+        if reason == "superseded" and self._user_index is not None:
             del self.history[self._user_index:]  # the revision replaces the message
         else:
             self._settle_history(reply)

@@ -622,3 +622,65 @@ def test_drain_errors_prints_one_line_per_error_frame():
     asyncio.run(va.drain_errors(_Duplex(), said.append))
     assert said == ["server error: unknown_voice: no such voice",
                     "server error: invalid_request: "]
+
+
+# --- late frames of an answered segment, and the window while the next turn opens -------
+
+def test_a_late_final_of_the_answered_segment_after_a_barge_in_is_ignored():
+    factory = ChatFactory(FakeChat(["Long", " answer"], hold=True), FakeChat(["Okay."]))
+    session, duplex, player, log, clock = _session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("tell me a story", endpoint=True), 100.9)
+        await _settle()
+        await session.on_event(("audio_start", {"type": "audio_start", "request_id": "r1",
+                                                "sample_rate": 24000}), 101.2)
+        await session.on_event(("pcm", b"\x01\x00", "r1"), 101.2)
+        await session.on_transcript(_frame("wait", seg=1), 101.5)  # barge-in, new segment
+        await _settle()
+        # The endpoint hold confirms the answered segment late: not a new utterance.
+        await session.on_transcript(_frame("Tell me a story.", seg=0, final=True), 101.8)
+        await _settle()
+        await session.on_transcript(_frame("wait stop", seg=1, endpoint=True), 102.2)
+        await _settle()
+    asyncio.run(run())
+    assert len(duplex.requests) == 2
+    assert factory.messages[1][-1]["content"] == "wait stop"
+
+
+def test_a_frame_arriving_while_the_next_turn_opens_does_not_touch_the_answered_exchange():
+    class GatedDuplex(FakeDuplex):
+        def __init__(self):
+            super().__init__()
+            self.gate = asyncio.Event()
+
+        async def turn_start(self) -> int:
+            if self.turns >= 1:
+                await self.gate.wait()  # the server's ack is in flight
+            return await super().turn_start()
+
+    factory = ChatFactory(FakeChat(["First."]), FakeChat(["Second."]))
+    duplex, player, log = GatedDuplex(), FakePlayer(), io.StringIO()
+    session = va.ClassicSession(duplex, factory, player, log, clock=lambda: 100.0)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("question one", endpoint=True), 100.9)
+        await asyncio.wait_for(session.reply.task, 2.0)
+        ending = asyncio.create_task(session.on_event(
+            ("audio_end", {"type": "audio_end", "request_id": "r1", "reason": "complete"}),
+            101.5))
+        await _settle()  # on_audio_end is now waiting for the turn_started ack
+        assert not ending.done()
+        await session.on_transcript(_frame("question two", seg=1, endpoint=True), 101.6)
+        await _settle()
+        duplex.gate.set()
+        await asyncio.wait_for(ending, 2.0)
+        await _settle()
+    asyncio.run(run())
+    assert len(duplex.requests) == 2
+    assert [m["content"] for m in factory.messages[1][1:]] == [
+        "question one", "First.", "question two"]
+    assert session.history[:2] == [{"role": "user", "content": "question one"},
+                                   {"role": "assistant", "content": "First."}]
