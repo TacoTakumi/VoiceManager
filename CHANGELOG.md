@@ -70,8 +70,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `turn_start` per utterance, dispatch on the first endpointed transcript (the
   final on engines without an endpoint frame), supersede when the final revises
   the text, the reply streamed token by token into one clause-mode `tts_stream`
-  request, cancel when the person talks over it, run files under
-  `runs/classic/`. `microturn` is the micro-turn full-duplex loop: every 0.6 s
+  request, cancel when the person talks over it (also during the tail of a
+  reply the server has finished sending), thinking off in the chat request
+  unless `--think` is given (a thinking model otherwise reasons for seconds
+  before its first spoken word), a warm-up request at startup so the model is
+  loaded before the first turn, run files under `runs/classic/`. `microturn`
+  is the micro-turn full-duplex loop: every 0.6 s
   a text LLM with the micro-turn LoRA decides to speak a few words or to
   listen, over a real call with headphones, logging the turn time and the
   delay to the first audio. `replay` runs that loop on a scripted call as
