@@ -153,9 +153,10 @@ def test_http_default_timeout_covers_a_cold_model_load():
 
 
 def _replay_args(tmp_path):
+    import argparse
     script = tmp_path / "call.txt"
     script.write_text("hello\n")
-    return mc._parser().parse_args(["replay", "--script", str(script)])
+    return argparse.Namespace(url="http://127.0.0.1:8080", model=None, script=script)
 
 
 def test_replay_read_timeout_is_one_line(tmp_path, monkeypatch):
@@ -164,7 +165,7 @@ def test_replay_read_timeout_is_one_line(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mc.urllib.request, "urlopen", urlopen)
     with pytest.raises(SystemExit) as exc:
-        mc._run_replay(_replay_args(tmp_path))
+        mc.run_replay(_replay_args(tmp_path))
     message = str(exc.value)
     assert message.count("\n") == 0 and message.startswith("error:")
     assert "timed out after 120 s" in message
@@ -179,7 +180,7 @@ def test_replay_http_error_is_one_line(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mc.urllib.request, "urlopen", urlopen)
     with pytest.raises(SystemExit) as exc:
-        mc._run_replay(_replay_args(tmp_path))
+        mc.run_replay(_replay_args(tmp_path))
     message = str(exc.value)
     assert message.count("\n") == 0 and message.startswith("error:")
     assert "503" in message and "cannot reach" not in message
@@ -193,6 +194,6 @@ def test_replay_unreachable_is_one_line(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mc.urllib.request, "urlopen", urlopen)
     with pytest.raises(SystemExit) as exc:
-        mc._run_replay(_replay_args(tmp_path))
+        mc.run_replay(_replay_args(tmp_path))
     message = str(exc.value)
     assert message.count("\n") == 0 and "cannot reach" in message

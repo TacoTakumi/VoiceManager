@@ -25,8 +25,11 @@ true) and a WAV of what played. Use headphones: there is no echo cancellation, s
 microphone would hear the assistant. The bearer token comes from the
 ``VOICEMANAGER_TOKEN`` environment variable.
 
-    python scripts/microturn_client.py replay [--script FILE] [--url URL] [--model NAME]
-    python scripts/microturn_client.py live [--vm-host HOST] [--vm-port PORT] [--voice NAME]
+The command line is scripts/voice_agent.py, which runs this module's two modes as
+its ``replay`` and ``microturn`` subcommands beside the classic turn pattern:
+
+    python scripts/voice_agent.py replay [--script FILE] [--url URL] [--model NAME]
+    python scripts/voice_agent.py microturn [--vm-host HOST] [--vm-port PORT] [--voice NAME]
         [--duration SECONDS] [--log FILE] [--wav FILE] [--tts-mode {clause,flush}]
         [--url URL] [--model NAME]
 """
@@ -39,6 +42,7 @@ import os
 import pathlib
 import re
 import statistics
+import sys
 import threading
 import time
 import urllib.error
@@ -380,46 +384,45 @@ def summary(results: list[TickResult]) -> str:
     return f"{len(results)} ticks, median turn {median:.0f} ms, spoke on {spoke}"
 
 
-class WsTTSSink:
-    """TTSSink over a connected ``VoiceManagerClient``.
+class SessionTTSSink:
+    """TTSSink over a ``DuplexSession`` of the VoiceManager client.
 
-    Text and done frames go straight onto the client's socket, because the client's
-    public streaming TTS generator only plays audio between the text chunks it sends.
-    Flush and cancel use the client's own methods; ``cancel_tts`` also marks the id so
-    its late audio is dropped.
+    One ``TTSRequest`` per request id, made on its first text with the voice and the
+    chunking the orchestrator asks for; flush, done and cancel go to that request.
+    ``is_cancelled`` tells the live session which request's late audio to ignore.
     """
 
-    def __init__(self, client, voice: str | None = None):
-        self.client = client
+    def __init__(self, session, voice: str | None = None):
+        self.session = session
         self.voice = voice
-        self._opened: set[str] = set()
+        self._requests: dict = {}
+        self._cancelled: set[str] = set()
+
+    def _request(self, request_id: str, chunking: str | None = None):
+        if request_id not in self._requests:
+            self._requests[request_id] = self.session.tts_request(
+                voice=self.voice, chunking=chunking, request_id=request_id)
+        return self._requests[request_id]
 
     async def send_text(self, request_id: str, text: str, chunking: str | None = None) -> None:
         """Append text to the request; its first frame carries the voice and chunking."""
-        payload = {"type": "tts_stream", "request_id": request_id, "text": text,
-                   "done": False}
-        # The server fixes the voice and the chunking when the request starts, so later
-        # frames leave them out.
-        if request_id not in self._opened:
-            if self.voice is not None:
-                payload["voice"] = self.voice
-            if chunking is not None:
-                payload["chunking"] = chunking
-        self._opened.add(request_id)
-        await self.client._ws.send(json.dumps(payload))
+        await self._request(request_id, chunking).send(text)
 
     async def flush(self, request_id: str) -> None:
         """Synthesize the buffered text now and keep the request open."""
-        await self.client.flush_tts(request_id)
+        await self._request(request_id).flush()
 
     async def done(self, request_id: str) -> None:
         """End the request."""
-        await self.client._ws.send(json.dumps(
-            {"type": "tts_stream", "request_id": request_id, "text": "", "done": True}))
+        await self._request(request_id).done()
 
     async def cancel(self, request_id: str) -> None:
-        """Stop the request; the client drops its audio still in flight."""
-        await self.client.cancel_tts(request_id)
+        """Stop the request; the session drops its audio still in flight."""
+        self._cancelled.add(request_id)
+        await self._request(request_id).cancel()
+
+    def is_cancelled(self, request_id: str) -> bool:
+        return request_id in self._cancelled
 
 
 class AudioPlayer:
@@ -618,7 +621,7 @@ class LiveSession:
                 f"{self.orchestrator.cutins} cut-ins, tts mode {self.orchestrator.mode}")
 
 
-async def _mic_task(client) -> None:
+async def _mic_task(duplex) -> None:
     """Send the microphone to VoiceManager as 16 kHz mono int16 blocks of 100 ms."""
     import sounddevice as sd
 
@@ -632,30 +635,29 @@ async def _mic_task(client) -> None:
     with sd.RawInputStream(samplerate=16000, channels=1, dtype="int16", blocksize=1600,
                            callback=callback):
         while True:
-            await client._ws.send(await blocks.get())
+            await duplex.send_audio(await blocks.get())
 
 
-async def _stt_task(client, session: LiveSession) -> None:
+async def _stt_task(duplex, session: LiveSession) -> None:
     """Feed transcription frames to the session until the connection closes."""
-    while (frame := await client._stt_queue.get()) is not None:
+    async for frame in duplex.transcripts():
         session.on_transcription(frame, session.clock())
     logger.warning("VoiceManager closed the connection")
 
 
-async def _tts_task(client, session: LiveSession, player: AudioPlayer) -> None:
+async def _tts_task(duplex, session: LiveSession, player: AudioPlayer) -> None:
     """Play TTS audio and time its first bytes until the connection closes."""
-    while (item := await client._tts_queue.get()) is not None:
-        if isinstance(item, bytes):
-            if session.on_audio(item, session.clock()):
-                player.enqueue(item)
-        elif item.get("type") == "audio_start":
-            rate = item.get("sample_rate", 22050)
-            session.on_audio_start(item.get("request_id"), rate, session.clock())
+    async for event in duplex.audio():
+        if event[0] == "pcm":
+            if session.on_audio(event[1], session.clock()):
+                player.enqueue(event[1])
+        elif event[0] == "audio_start":
+            frame = event[1]
+            rate = frame.get("sample_rate", 22050)
+            session.on_audio_start(frame.get("request_id"), rate, session.clock())
             player.start(rate)
-        elif item.get("type") == "audio_end":
-            session.on_audio_end(item.get("request_id"))
-            # Exactly one audio_end per request, so its cancel mark is no longer needed.
-            client._cancelled_tts.discard(item.get("request_id"))
+        elif event[0] == "audio_end":
+            session.on_audio_end(event[1].get("request_id"))
 
 
 async def _tick_task(session: LiveSession) -> None:
@@ -709,84 +711,82 @@ async def live(args: argparse.Namespace) -> None:
     print("warning: use headphones; there is no echo cancellation")
     client = VoiceManagerClient(host=args.vm_host, port=args.vm_port, token=token)
     try:
-        await client._connect()
+        await client.__aenter__()
     except (VoiceManagerError, OSError) as exc:
         raise SystemExit(f"error: cannot connect to VoiceManager: {exc}") from exc
+    player = AudioPlayer()
+    engine = LlamaServerEngine(args.url, model=args.model)
+    session = None
     try:
         check_stt_engine(client.stt_engine)
-    except SystemExit:
-        await client._disconnect()
-        raise
-    player = AudioPlayer()
-    sink = WsTTSSink(client, voice=args.voice)
-    orchestrator = TTSOrchestrator(sink, player, mode=args.tts_mode)
-    engine = LlamaServerEngine(args.url, model=args.model)
-    try:
-        with open(log_path, "w") as log:
-            session = LiveSession(engine, TickSlicer(), orchestrator, log,
-                                  cancelled=lambda rid: rid in client._cancelled_tts)
-            # The client's public stream_stt_live / stream_tts_live generators only read
-            # replies between the chunks they send, so they cannot run STT and TTS at the
-            # same time. The tasks use its socket and reader queues directly instead.
-            tasks = [asyncio.create_task(c) for c in (
-                _mic_task(client), _stt_task(client, session),
-                _tts_task(client, session, player), _tick_task(session))]
-            try:
-                await asyncio.wait(tasks, timeout=args.duration,
-                                   return_when=asyncio.FIRST_COMPLETED)
-            except asyncio.CancelledError:
-                pass  # Ctrl-C: asyncio.run cancels this task; stop cleanly below
-            for task in tasks:
-                task.cancel()
-            for task, outcome in zip(tasks, await asyncio.gather(*tasks,
-                                                                 return_exceptions=True)):
-                if isinstance(outcome, Exception):
-                    logger.error("%s stopped: %s", task.get_coro().__name__,
-                                 http_error_message(engine, outcome) or repr(outcome))
-            if orchestrator.open:
+        async with client.duplex() as duplex:
+            sink = SessionTTSSink(duplex, voice=args.voice)
+            orchestrator = TTSOrchestrator(sink, player, mode=args.tts_mode)
+            with open(log_path, "w") as log:
+                session = LiveSession(engine, TickSlicer(), orchestrator, log,
+                                      cancelled=sink.is_cancelled)
+                tasks = [asyncio.create_task(c) for c in (
+                    _mic_task(duplex), _stt_task(duplex, session),
+                    _tts_task(duplex, session, player), _tick_task(session))]
                 try:
-                    await sink.done(orchestrator.request_id)
-                except ConnectionClosed:
-                    pass
+                    await asyncio.wait(tasks, timeout=args.duration,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                except asyncio.CancelledError:
+                    pass  # Ctrl-C: asyncio.run cancels this task; stop cleanly below
+                for task in tasks:
+                    task.cancel()
+                for task, outcome in zip(tasks, await asyncio.gather(
+                        *tasks, return_exceptions=True)):
+                    if isinstance(outcome, Exception):
+                        logger.error("%s stopped: %s", task.get_coro().__name__,
+                                     http_error_message(engine, outcome) or repr(outcome))
+                if orchestrator.open:
+                    try:
+                        await sink.done(orchestrator.request_id)
+                    except (ConnectionClosed, VoiceManagerError):
+                        pass
     finally:
         player.close()
-        await client._disconnect()
+        await client.__aexit__(None, None, None)
     write_wav(wav_path, bytes(player.played), player.sample_rate or client.last_tts_sample_rate)
     print(f"log: {log_path}  wav: {wav_path}")
-    print(session.summary_line())
+    if session is not None:
+        print(session.summary_line())
 
 
-def _parser() -> argparse.ArgumentParser:
-    """The command line: one subcommand per mode, each with the shared server options."""
-    server = argparse.ArgumentParser(add_help=False)
-    server.add_argument("--url", default="http://127.0.0.1:8080",
+def add_server_options(parser: argparse.ArgumentParser) -> None:
+    """The llama-server options the replay and micro-turn modes share."""
+    parser.add_argument("--url", default="http://127.0.0.1:8080",
                         help="llama-server or llama-swap base URL")
-    server.add_argument("--model", default=None,
+    parser.add_argument("--model", default=None,
                         help="model name for llama-swap routing (omit for plain llama-server)")
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    modes = parser.add_subparsers(dest="mode", required=True)
-    rp = modes.add_parser("replay", parents=[server],
-                          help="run a scripted call as text, no audio")
-    rp.add_argument("--script", type=pathlib.Path, default=None,
-                    help="one heard string per line, empty line for silence (default: demo)")
-    lv = modes.add_parser("live", parents=[server],
-                          help="a live call over VoiceManager (headphones required)")
-    lv.add_argument("--vm-host", default="localhost", help="VoiceManager host")
-    lv.add_argument("--vm-port", type=int, default=8255, help="VoiceManager port")
-    lv.add_argument("--voice", default=None, help="TTS voice (default: the token's voice)")
-    lv.add_argument("--duration", type=float, default=None,
-                    help="stop after this many seconds (default: at Ctrl-C)")
-    lv.add_argument("--log", default=None,
-                    help="JSON lines log (default: runs/microturn/microturn-<stamp>.jsonl)")
-    lv.add_argument("--wav", default=None,
-                    help="WAV of the audio played (default: runs/microturn/microturn-<stamp>.wav)")
-    lv.add_argument("--tts-mode", choices=TTS_MODES, default="clause",
-                    help="clause: the server cuts each utterance into small pieces; "
-                         "flush: flush each speaking tick's words (default: clause)")
-    return parser
 
 
-def _run_replay(args: argparse.Namespace) -> None:
+def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
+    """The options of the replay mode: a scripted call as text, no audio."""
+    add_server_options(parser)
+    parser.add_argument("--script", type=pathlib.Path, default=None,
+                        help="one heard string per line, empty line for silence (default: demo)")
+
+
+def add_live_arguments(parser: argparse.ArgumentParser) -> None:
+    """The options of the micro-turn live mode."""
+    add_server_options(parser)
+    parser.add_argument("--vm-host", default="localhost", help="VoiceManager host")
+    parser.add_argument("--vm-port", type=int, default=8255, help="VoiceManager port")
+    parser.add_argument("--voice", default=None, help="TTS voice (default: the token's voice)")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="stop after this many seconds (default: at Ctrl-C)")
+    parser.add_argument("--log", default=None,
+                        help="JSON lines log (default: runs/microturn/microturn-<stamp>.jsonl)")
+    parser.add_argument("--wav", default=None,
+                        help="WAV of the audio played (default: runs/microturn/microturn-<stamp>.wav)")
+    parser.add_argument("--tts-mode", choices=TTS_MODES, default="clause",
+                        help="clause: the server cuts each utterance into small pieces; "
+                             "flush: flush each speaking tick's words (default: clause)")
+
+
+def run_replay(args: argparse.Namespace) -> None:
     """Replay a script through llama-server and print each tick and a summary."""
     engine = LlamaServerEngine(args.url, model=args.model)
     script = read_script(args.script) if args.script else DEMO
@@ -798,14 +798,7 @@ def _run_replay(args: argparse.Namespace) -> None:
     print(summary(results))
 
 
-def main() -> None:
-    """Run the selected mode."""
-    args = _parser().parse_args()
-    if args.mode == "live":
-        asyncio.run(live(args))
-    else:
-        _run_replay(args)
-
-
 if __name__ == "__main__":
-    main()
+    sys.stderr.write("the command line moved: run scripts/voice_agent.py "
+                     "(replay | microturn | classic)\n")
+    sys.exit(2)

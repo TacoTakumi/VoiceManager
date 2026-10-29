@@ -4,6 +4,7 @@ Model-free, server-free and device-free. A fake engine stands in for llama-serve
 fake client for the VoiceManager WebSocket, and the player is driven by ``pull`` alone,
 so no audio stream is ever opened.
 """
+import argparse
 import asyncio
 import importlib.util
 import io
@@ -226,31 +227,81 @@ def test_live_summary_without_audio():
     assert "median first audio n/a" in line
 
 
-class FakeWs:
+class FakeRequest:
+    """A TTSRequest stand-in: records what the sink asks of it, as frames."""
+
+    def __init__(self, session, request_id: str, voice, chunking):
+        self.session = session
+        self.request_id = request_id
+        self.voice = voice
+        self.chunking = chunking
+        self._first = True
+
+    def _frame(self, text: str, done: bool, flush: bool = False) -> dict:
+        frame = {"type": "tts_stream", "request_id": self.request_id, "text": text,
+                 "done": done}
+        if flush:
+            frame["flush"] = True
+        if self._first:
+            if self.voice is not None:
+                frame["voice"] = self.voice
+            if self.chunking is not None:
+                frame["chunking"] = self.chunking
+            self._first = False
+        return frame
+
+    async def send(self, text: str, flush: bool = False) -> None:
+        self.session.sent.append(self._frame(text, False, flush))
+
+    async def flush(self) -> None:
+        self.session.calls.append(("flush", self.request_id))
+
+    async def done(self) -> None:
+        self.session.sent.append(self._frame("", True))
+
+    async def cancel(self) -> None:
+        self.session.calls.append(("cancel", self.request_id))
+
+
+class FakeSession:
+    """A DuplexSession stand-in: sends recorded, replies fed through two queues."""
+
     def __init__(self):
-        self.sent: list[str] = []
-
-    async def send(self, msg: str) -> None:
-        self.sent.append(msg)
-
-
-class FakeClient:
-    """Records raw WebSocket sends and the public flush/cancel calls."""
-
-    def __init__(self):
-        self._ws = FakeWs()
+        self.sent: list[dict] = []
         self.calls: list[tuple] = []
+        self.audio_sent: list[bytes] = []
+        self.requests: dict[str, FakeRequest] = {}
+        self.stt: asyncio.Queue = asyncio.Queue()
+        self.tts: asyncio.Queue = asyncio.Queue()
 
-    async def flush_tts(self, request_id: str) -> None:
-        self.calls.append(("flush", request_id))
+    def tts_request(self, voice=None, chunking=None, request_id=None):
+        req = FakeRequest(self, request_id or f"auto{len(self.requests) + 1}", voice, chunking)
+        self.requests[req.request_id] = req
+        return req
 
-    async def cancel_tts(self, request_id: str) -> None:
-        self.calls.append(("cancel", request_id))
+    async def send_audio(self, pcm: bytes) -> None:
+        self.audio_sent.append(pcm)
+
+    async def transcripts(self):
+        while (frame := await self.stt.get()) is not None:
+            yield frame
+
+    async def audio(self):
+        while (event := await self.tts.get()) is not None:
+            yield event
+
+
+def _live_args(**overrides) -> argparse.Namespace:
+    """The namespace the microturn subcommand of voice_agent.py produces, by default."""
+    values = dict(url="http://127.0.0.1:8080", model=None, vm_host="localhost", vm_port=8255,
+                  voice=None, duration=None, log=None, wav=None, tts_mode="clause")
+    values.update(overrides)
+    return argparse.Namespace(**values)
 
 
 def test_live_sink_frames():
-    client = FakeClient()
-    sink = mc.WsTTSSink(client, voice="alice")
+    session = FakeSession()
+    sink = mc.SessionTTSSink(session, voice="alice")
 
     async def run():
         await sink.send_text("r1", "Do not")
@@ -261,8 +312,7 @@ def test_live_sink_frames():
         await sink.cancel("r2")
 
     asyncio.run(run())
-    frames = [json.loads(m) for m in client._ws.sent]
-    assert frames == [
+    assert session.sent == [
         {"type": "tts_stream", "request_id": "r1", "text": "Do not", "done": False,
          "voice": "alice"},
         {"type": "tts_stream", "request_id": "r1", "text": " mix", "done": False},
@@ -270,23 +320,15 @@ def test_live_sink_frames():
         {"type": "tts_stream", "request_id": "r2", "text": "Stop", "done": False,
          "voice": "alice"},
     ]
-    assert client.calls == [("flush", "r1"), ("cancel", "r2")]
+    assert session.calls == [("flush", "r1"), ("cancel", "r2")]
+    assert sink.is_cancelled("r2") and not sink.is_cancelled("r1")
 
 
 def test_live_sink_without_voice():
-    client = FakeClient()
-    sink = mc.WsTTSSink(client)
+    session = FakeSession()
+    sink = mc.SessionTTSSink(session)
     asyncio.run(sink.send_text("r1", "Hi"))
-    assert "voice" not in json.loads(client._ws.sent[0])
-
-
-def test_live_cli_options():
-    args = mc._parser().parse_args(["live", "--duration", "5", "--voice", "alice"])
-    assert args.mode == "live"
-    assert args.vm_host == "localhost" and args.vm_port == 8255
-    assert args.duration == 5.0 and args.voice == "alice"
-    assert args.log is None and args.wav is None
-    assert args.url == "http://127.0.0.1:8080"
+    assert "voice" not in session.sent[0]
 
 
 def test_live_no_sounddevice_at_import():
@@ -328,7 +370,7 @@ def test_live_engine_check_allows_streaming_engines():
 
 def test_live_default_paths_are_in_run_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    args = mc._parser().parse_args(["live"])
+    args = _live_args()
     log_path, wav_path = mc.live_output_paths(args)
     run_dir = tmp_path / "runs" / "microturn"
     assert run_dir.is_dir()
@@ -339,7 +381,7 @@ def test_live_default_paths_are_in_run_directory(tmp_path, monkeypatch):
 
 def test_live_explicit_paths_override_run_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    args = mc._parser().parse_args(["live", "--log", "a.jsonl", "--wav", "b.wav"])
+    args = _live_args(log="a.jsonl", wav="b.wav")
     assert mc.live_output_paths(args) == ("a.jsonl", "b.wav")
     assert not (tmp_path / "runs").exists()
 
@@ -380,8 +422,8 @@ def test_live_summary_names_tts_mode():
 
 
 def test_live_sink_clause_chunking_on_first_frame():
-    client = FakeClient()
-    sink = mc.WsTTSSink(client, voice="alice")
+    session = FakeSession()
+    sink = mc.SessionTTSSink(session, voice="alice")
 
     async def run():
         await sink.send_text("r1", "Do not", chunking="clause")
@@ -389,34 +431,25 @@ def test_live_sink_clause_chunking_on_first_frame():
         await sink.done("r1")
 
     asyncio.run(run())
-    frames = [json.loads(m) for m in client._ws.sent]
-    assert frames == [
+    assert session.sent == [
         {"type": "tts_stream", "request_id": "r1", "text": "Do not", "done": False,
          "voice": "alice", "chunking": "clause"},
         {"type": "tts_stream", "request_id": "r1", "text": " mix", "done": False},
         {"type": "tts_stream", "request_id": "r1", "text": "", "done": True},
     ]
-    assert client.calls == []
+    assert session.calls == []
 
 
 def test_live_sink_chunking_only_on_first_frame():
-    client = FakeClient()
-    sink = mc.WsTTSSink(client)
+    session = FakeSession()
+    sink = mc.SessionTTSSink(session)
 
     async def run():
         await sink.send_text("r1", "Do not")
         await sink.send_text("r1", " mix", chunking="clause")
 
     asyncio.run(run())
-    assert all("chunking" not in json.loads(m) for m in client._ws.sent)
-
-
-def test_live_cli_tts_mode():
-    assert mc._parser().parse_args(["live"]).tts_mode == "clause"
-    args = mc._parser().parse_args(["live", "--tts-mode", "flush"])
-    assert args.tts_mode == "flush"
-    with pytest.raises(SystemExit):
-        mc._parser().parse_args(["live", "--tts-mode", "word"])
+    assert all("chunking" not in frame for frame in session.sent)
 
 
 def test_live_last_word_time_ignores_recase_and_punctuation():
@@ -497,16 +530,19 @@ class FakeLiveClient:
         self.host, self.port, self.token = host, port, token
         self.stt_engine = "whisper"
         self.last_tts_sample_rate = 22050
-        self._cancelled_tts: set[str] = set()
         self.connected = False
         self.disconnected = False
         FakeLiveClient.instances.append(self)
 
-    async def _connect(self) -> None:
+    async def __aenter__(self):
         self.connected = True
+        return self
 
-    async def _disconnect(self) -> None:
+    async def __aexit__(self, *exc_info) -> None:
         self.disconnected = True
+
+    def duplex(self):
+        raise AssertionError("a duplex session was opened before the engine check")
 
 
 def test_live_checks_stt_engine_before_starting_tasks(tmp_path, monkeypatch):
@@ -539,8 +575,7 @@ def test_live_checks_stt_engine_before_starting_tasks(tmp_path, monkeypatch):
     monkeypatch.setenv("VOICEMANAGER_TOKEN", "vmp_test")
     FakeLiveClient.instances.clear()
     log_path, wav_path = tmp_path / "call.jsonl", tmp_path / "call.wav"
-    args = mc._parser().parse_args(["live", "--duration", "0.1", "--log", str(log_path),
-                                   "--wav", str(wav_path)])
+    args = _live_args(duration=0.1, log=str(log_path), wav=str(wav_path))
 
     with pytest.raises(SystemExit) as exc:
         asyncio.run(mc.live(args))
@@ -551,3 +586,78 @@ def test_live_checks_stt_engine_before_starting_tasks(tmp_path, monkeypatch):
     assert client.connected and client.disconnected
     assert started == []
     assert not log_path.exists() and not wav_path.exists()
+
+
+class RecordingPlayer(TogglePlayer):
+    """TogglePlayer that also records what the tts task enqueues and its start rate."""
+
+    def __init__(self):
+        super().__init__()
+        self.rate = None
+        self.chunks: list[bytes] = []
+
+    def start(self, rate: int) -> None:
+        self.rate = rate
+
+    def enqueue(self, pcm: bytes) -> None:
+        self.chunks.append(pcm)
+        self.playing = True
+
+
+def test_live_tasks_over_a_session_through_a_tick_a_cut_in_and_shutdown():
+    duplex = FakeSession()
+    player = RecordingPlayer()
+    sink = mc.SessionTTSSink(duplex, voice="alice")
+    ids = iter(f"r{i}" for i in range(1, 100))
+    orch = mc.TTSOrchestrator(sink, player, new_id=lambda: next(ids), mode="clause")
+    log = io.StringIO()
+    clock = {"t": 100.0}
+    session = mc.LiveSession(ScriptedEngine(["Do not", LISTEN]), mc.TickSlicer(), orch, log,
+                             clock=lambda: clock["t"], cancelled=sink.is_cancelled)
+
+    async def until(predicate):
+        for _ in range(500):
+            if predicate():
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("condition not reached")
+
+    async def run():
+        stt = asyncio.create_task(mc._stt_task(duplex, session))
+        tts = asyncio.create_task(mc._tts_task(duplex, session, player))
+        # The person speaks; the transcript reaches the session through the task.
+        clock["t"] = 100.2
+        await duplex.stt.put(_frame("bleach and ammonia"))
+        await until(lambda: session.last_word_t is not None)
+        clock["t"] = 100.6
+        await session.run_tick(100.6)  # the model speaks: request r1 opens in clause mode
+        assert duplex.sent[0] == {"type": "tts_stream", "request_id": "r1", "text": "Do not",
+                                  "done": False, "voice": "alice", "chunking": "clause"}
+        # Its audio arrives through the task: first audio is timed and played.
+        clock["t"] = 100.9
+        await duplex.tts.put(("audio_start", {"type": "audio_start", "request_id": "r1",
+                                              "sample_rate": 24000}))
+        await duplex.tts.put(("pcm", b"\x01\x00", "r1"))
+        await until(lambda: player.chunks == [b"\x01\x00"])
+        assert player.rate == 24000
+        # The person talks over it: the next tick hears words while audio plays.
+        clock["t"] = 101.0
+        await duplex.stt.put(_frame("wait", seg=1))
+        await until(lambda: session.last_word_t == 101.0)
+        clock["t"] = 101.2
+        await session.run_tick(101.2)  # LISTEN with words heard and audio playing: cut-in
+        assert ("cancel", "r1") in duplex.calls and orch.cutins == 1
+        # Late audio of the cancelled request is not played.
+        await duplex.tts.put(("pcm", b"\x02\x00", "r1"))
+        await duplex.tts.put(("audio_end", {"type": "audio_end", "request_id": "r1",
+                                            "reason": "cancelled"}))
+        await duplex.tts.put(None)
+        await duplex.stt.put(None)
+        await asyncio.wait_for(asyncio.gather(stt, tts), 2.0)
+        assert player.chunks == [b"\x01\x00"]
+
+    asyncio.run(run())
+    lines = _lines(log)
+    utterances = [line for line in lines if line["type"] == "utterance"]
+    assert [u["cancelled"] for u in utterances] == [False, True]
+    assert utterances[0]["first_audio_ms"] == pytest.approx(700.0)
