@@ -171,7 +171,7 @@ VoXtream (https://github.com/herimor/voxtream) is a streaming TTS model that tak
 
 ```bash
 python3.12 -m venv venv-voxtream
-venv-voxtream/bin/pip install "voxtream>=0.2"
+venv-voxtream/bin/pip install "voxtream>=0.2" fastapi uvicorn   # the sidecar serves with fastapi and uvicorn
 sudo apt install espeak-ng     # the phonemizer runs the espeak-ng program
 ```
 
@@ -183,7 +183,7 @@ Set `VM_TTS_ENGINE=voxtream`. The first start downloads the weights (about 2.5 G
 - `VM_VOXTREAM_READY_TIMEOUT`: seconds to wait for the sidecar to load (default 180).
 - `VM_VOXTREAM_COMPILE`: `torch.compile` the model for a lower first-packet latency at the cost of minutes of startup (default off).
 
-The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM. Voice cloning from an upload (`/voice/upload`) is not offered on this engine; it is English only; and the weights are published under CC BY-NC 4.0, so check the licence before any commercial use.
+The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM. One generation is capped at 60 s of audio by the shipped generator config: a `tts_stream` request whose speech would run past 60 s is cut there with a normal `audio_end` (reason `complete`) and the rest of its text is dropped, so keep one request to one reply. Voice cloning from an upload (`/voice/upload`) is not offered on this engine (the upload answers 400); it is English only; and the weights are published under CC BY-NC 4.0, so check the licence before any commercial use.
 
 ## Configuration
 
