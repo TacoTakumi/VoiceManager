@@ -30,7 +30,7 @@
     "max_prompt_sec": 20,
     "min_prompt_sec": 1,
     "max_phone_tokens": 2000,
-    "cache_prompt": false,
+    "cache_prompt": true,
     "cfg_gamma": 1.5,
     "cfg_ac_gamma": 2.0,
     "text_context": " context",

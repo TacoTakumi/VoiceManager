@@ -183,6 +183,8 @@ Set `VM_TTS_ENGINE=voxtream`. The first start downloads the weights (about 2.5 G
 - `VM_VOXTREAM_READY_TIMEOUT`: seconds to wait for the sidecar to load (default 180).
 - `VM_VOXTREAM_COMPILE`: `torch.compile` the model for a lower first-packet latency at the cost of minutes of startup (default off).
 
+The first request on each preset encodes its reference clip and saves the result beside the WAV as `<name>.prompt.npy` (gitignored); later requests reuse it, which took about 50 ms off the first-word latency on the rig. VoXtream only checks that the file exists, so delete the `.prompt.npy` after replacing a preset WAV.
+
 The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM. One generation is capped at 60 s of audio by the shipped generator config: a `tts_stream` request whose speech would run past 60 s is cut there with a normal `audio_end` (reason `complete`) and the rest of its text is dropped, so keep one request to one reply. Voice cloning from an upload (`/voice/upload`) is not offered on this engine (the upload answers 400); it is English only; and the weights are published under CC BY-NC 4.0, so check the licence before any commercial use.
 
 ## Configuration

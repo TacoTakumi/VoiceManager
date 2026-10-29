@@ -31,6 +31,9 @@ drafts/
 # Voice design candidates from scripts/design_voice.py; --register copies the chosen one to voices/designed/
 voice_design/
 
+# VoXtream's cached encoding of each preset clip (generator.json cache_prompt), written beside the WAV
+voices/**/*.prompt.npy
+
 # Listen-test clips stay on disk, never in git
 tts_evidence/
 

@@ -31,7 +31,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `voxtream (herimor/voxtream2.1)` and `/info` reports `tts_model`
   `herimor/voxtream2.1`. Settings `VM_VOXTREAM_PY`, `VM_VOXTREAM_PORT`,
   `VM_VOXTREAM_VOICES`, `VM_VOXTREAM_VOICE`, `VM_VOXTREAM_READY_TIMEOUT` and
-  `VM_VOXTREAM_COMPILE`. English only; the weights are CC BY-NC 4.0.
+  `VM_VOXTREAM_COMPILE`. The encoded reference clip of each preset is cached
+  beside its WAV (`<name>.prompt.npy`) after the first request. English only;
+  the weights are CC BY-NC 4.0.
 - `tts_stream` has a `chunking` field: `"sentence"` (the default, unchanged) or
   `"clause"`. In clause mode the server holds the streamed text and cuts
   playback-aware pieces at clause marks, word counts or when the unplayed
