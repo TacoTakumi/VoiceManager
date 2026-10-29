@@ -36,3 +36,6 @@ tts_evidence/
 
 # Live-run logs and WAVs from scripts/microturn_client.py
 runs/
+
+# The VoXtream TTS sidecar environment (VM_TTS_ENGINE=voxtream), created by hand.
+venv-voxtream/

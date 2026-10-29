@@ -95,6 +95,9 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     tts_models["tts_executor"].shutdown(wait=True)
+    if tts_models.get("tts_engine_type") == "voxtream":
+        # The sidecar is a child process this server spawned; stop it with the server.
+        tts_models["tts_engine"].dispose()
     if stt_engine_type == "whisper":
         models["executor"].shutdown(wait=True)
     logger.info("VoiceManager shutting down")

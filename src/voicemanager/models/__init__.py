@@ -422,9 +422,11 @@ def load_tts_models(settings) -> dict:
         return _load_vibevoice_tts(settings)
     if engine == "audiocpp":
         return _load_audiocpp_tts(settings)
+    if engine == "voxtream":
+        return _load_voxtream_tts(settings)
     raise ValueError(
         f"unknown VM_TTS_ENGINE {engine!r}: expected 'openvoice', 'vibevoice', "
-        "or 'audiocpp'")
+        "'audiocpp' or 'voxtream'")
 
 
 def _load_openvoice_tts(settings) -> dict:
@@ -544,6 +546,51 @@ def _load_audiocpp_tts(settings) -> dict:
         "tts_engine": engine,
         "tts_executor": tts_executor,
         "tts_engine_type": "audiocpp",
+    }
+
+
+def _load_voxtream_tts(settings) -> dict:
+    """Spawn the VoXtream sidecar and build the engine that talks to it.
+
+    VoXtream runs in its own virtual environment (it pins an older torch), so the
+    model never loads in this process: the sidecar is started from VM_VOXTREAM_PY on
+    the GPU that VM_DEVICE resolves to, and startup waits until it reports ready or
+    fails with an error naming the setting at fault. The voice presets are validated
+    first, so a bad presets file refuses to start before any process is spawned.
+
+    Args:
+        settings: voicemanager.config.Settings instance
+
+    Returns:
+        dict with keys: tts_engine, tts_executor, tts_engine_type
+    """
+    from voicemanager.pipeline.voxtream_tts import VoxtreamSidecar, VoxtreamTTSEngine
+
+    resolved_device = _resolve_device(settings.device)
+    logger.info(
+        "Loading voxtream TTS engine (python=%s, port=%d, device=%s, voices=%s, voice=%s)",
+        settings.voxtream_py, settings.voxtream_port, resolved_device,
+        settings.voxtream_voices, settings.voxtream_voice,
+    )
+    sidecar = VoxtreamSidecar(
+        python=settings.voxtream_py,
+        port=settings.voxtream_port,
+        device=VoxtreamSidecar.device_argument(resolved_device),
+        ready_timeout_s=settings.voxtream_ready_timeout,
+        compile_model=settings.voxtream_compile,
+    )
+    engine = VoxtreamTTSEngine(sidecar, default_voice=settings.voxtream_voice)
+    engine.load(voices_path=settings.voxtream_voices)  # presets first, then the spawn
+    logger.info("voxtream TTS engine loaded (sample_rate=%d, sidecar=%s)",
+                engine.sample_rate, sidecar.url)
+
+    tts_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    logger.info("TTS ThreadPoolExecutor created (max_workers=1, separate from STT)")
+
+    return {
+        "tts_engine": engine,
+        "tts_executor": tts_executor,
+        "tts_engine_type": "voxtream",
     }
 
 

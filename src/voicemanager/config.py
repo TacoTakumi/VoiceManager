@@ -286,6 +286,21 @@ class Settings(BaseSettings):
     # dry between them; later frames run ahead of playback. 0 sends on arrival.
     audiocpp_tts_start_buffer_ms: int = Field(default=250, ge=0)  # VM_AUDIOCPP_TTS_START_BUFFER_MS
 
+    # VoXtream TTS sidecar (only used when VM_TTS_ENGINE=voxtream). VoXtream reads
+    # streamed text at the speaking rate, so one generation speaks a whole tts_stream
+    # request with no seams. It pins its own torch, so it runs as one separate process
+    # from its own virtual environment: VM_VOXTREAM_PY is that environment's python.
+    # VoiceManager spawns the sidecar at startup, waits for it to be ready, and stops
+    # it at shutdown. The GPU is the one VM_DEVICE resolves to.
+    voxtream_py: str = Field(default="venv-voxtream/bin/python")  # VM_VOXTREAM_PY
+    voxtream_port: int = Field(default=8256, gt=0)             # VM_VOXTREAM_PORT (loopback)
+    voxtream_voices: str = Field(default="voices/designed/refs.json")  # VM_VOXTREAM_VOICES
+    voxtream_voice: str = Field(default="designed_female_s101")  # VM_VOXTREAM_VOICE (default preset)
+    # Seconds to wait for the sidecar's /health to answer 200 after the spawn. The
+    # model load takes a few seconds; the first run also downloads the weights.
+    voxtream_ready_timeout: float = Field(default=180.0, gt=0)  # VM_VOXTREAM_READY_TIMEOUT
+    voxtream_compile: bool = Field(default=False)              # VM_VOXTREAM_COMPILE (torch.compile)
+
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
     # when the piece up to it holds at least mark_min_words words. The first piece
@@ -310,6 +325,8 @@ class Settings(BaseSettings):
         "audiocpp_tts_model",
         "audiocpp_tts_voices",
         "vibevoice_voices_dir",
+        "voxtream_py",
+        "voxtream_voices",
     )
 
     def __init__(self, **values) -> None:
