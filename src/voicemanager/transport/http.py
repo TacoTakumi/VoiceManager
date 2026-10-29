@@ -163,6 +163,14 @@ async def upload_voice(
                    "select a voice from voices/designed/refs.json via the request's "
                    "voice field). Use VM_TTS_ENGINE=openvoice for upload cloning.",
         )
+    # The voxtream engine likewise speaks named presets only.
+    if tts_engine_type == "voxtream":
+        raise HTTPException(
+            status_code=400,
+            detail="Voice upload not supported with the voxtream engine (presets only: "
+                   "select a voice from the VM_VOXTREAM_VOICES presets via the request's "
+                   "voice field). Use VM_TTS_ENGINE=openvoice for upload cloning.",
+        )
 
     # Route voice upload to specific session via registry
     registry = getattr(request.app.state, "session_registry", None)

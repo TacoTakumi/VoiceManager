@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-import authkit  # noqa: F401  test auth env; must be imported before voicemanager
+import authkit  # test auth env; must be imported before voicemanager
 from fastapi.testclient import TestClient
 
 import voicemanager.app as app_module
@@ -220,3 +220,24 @@ def test_resolve_voice_default_other_and_unknown(fake_sidecar):
         assert "designed_female_s101" in str(exc.value)
     finally:
         engine.dispose()
+
+
+# --- /voice/upload: presets only -----------------------------------------------------
+
+def test_upload_under_voxtream_returns_400_naming_the_limitation():
+    from voicemanager.session import SessionRegistry
+
+    app = app_module.create_app()
+    app.state.tts_engine_type = "voxtream"
+    app.state.session_registry = SessionRegistry()
+    client = TestClient(app)
+    response = client.post(
+        "/voice/upload",
+        params={**authkit.auth_params(), "session_id": "s1"},
+        headers=authkit.auth_headers(),
+        files={"file": ("v.wav", b"RIFF" + b"\x00" * 40, "audio/wav")},
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "voxtream" in detail
+    assert "preset" in detail.lower()
