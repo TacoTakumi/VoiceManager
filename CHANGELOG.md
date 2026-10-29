@@ -71,6 +71,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a real call over VoiceManager (headphones required) and logs the turn time
   and the delay to the first audio.
 
+- README: a "Conversation with a text LLM" section on the two ways to build
+  an agent on VoiceManager, the classic turn pattern with any LLM and the
+  experimental micro-turn pattern with the published LoRA, its links, its state
+  and where it is going.
+
 ### Fixed
 
 - The `tts_stream` idle flush (`VM_TTS_STREAM_FLUSH_TIMEOUT`) now counts from
