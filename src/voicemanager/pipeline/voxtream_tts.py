@@ -248,8 +248,8 @@ class VoxtreamTTSEngine(TTSEngine):
         feeds the same kind of generation as the chunks arrive.
         """
         generation = self.open_generation(kwargs.get("voice"))
-        await generation.start()
         try:
+            await generation.start()  # inside the try: an init error must not leak the socket
             await generation.push(text)
             await generation.end()
             async for frame in generation.frames():

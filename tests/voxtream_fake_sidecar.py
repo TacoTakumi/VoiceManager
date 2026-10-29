@@ -92,10 +92,13 @@ FRAME_SAMPLES = 1920  # 80 ms at 24 kHz
 
 class FakeVoxtreamSidecar:
     def __init__(self, frames_per_chunk: int = 1, hold_eos: bool = False,
-                 keep_emitting_after_eot: bool = False):
+                 keep_emitting_after_eot: bool = False, init_error: str | None = None):
         self.frames_per_chunk = frames_per_chunk
         self.hold_eos = hold_eos
         self.keep_emitting_after_eot = keep_emitting_after_eot
+        # Answer every init with this error message instead of config, then keep the
+        # connection open until the client closes it (so a leaked client socket shows).
+        self.init_error = init_error
         self.inits: list[dict] = []
         self.chunks: list[list[str]] = []  # per connection, in order
         self.eots: list[int] = []  # connection indexes that sent eot
@@ -165,6 +168,10 @@ class FakeVoxtreamSidecar:
             init = json.loads(await ws.recv())
             with self._lock:
                 self.inits.append(init)
+            if self.init_error is not None:
+                await ws.send(json.dumps({"type": "error", "message": self.init_error}))
+                while True:
+                    await ws.recv()  # ends with ConnectionClosed when the client closes
             await ws.send(json.dumps({"type": "config", "sample_rate": 24000,
                                       "dtype": "float32", "channels": 1}))
             if init.get("text"):

@@ -21,10 +21,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from voicemanager.app import create_app
-from voicemanager.pipeline.audiocpp_tts import UnknownVoiceError
 from voicemanager.pipeline.tts import TTSPipeline, float32_to_pcm16
 from voicemanager.pipeline.voxtream_tts import (
-    VoxtreamSidecar, VoxtreamTTSEngine, VoxtreamTTSStreamPipeline)
+    VoxtreamGenerationError, VoxtreamSidecar, VoxtreamTTSEngine, VoxtreamTTSStreamPipeline)
 from voicemanager.transport import websocket as ws_module
 from voxtream_fake_sidecar import FRAME_SAMPLES, FakeVoxtreamSidecar
 
@@ -316,3 +315,29 @@ def test_tts_stream_over_the_websocket_endpoint_uses_the_pass_through(fake, monk
     assert fake.connections == 1
     assert fake.chunks[0] == CHUNKS
     assert pcm == [_fake_frame(n) for n in range(1, len(CHUNKS) + 1)]
+
+
+# --- init error ----------------------------------------------------------------------
+
+def test_init_error_raises_and_closes_the_client_connection():
+    fake = FakeVoxtreamSidecar(init_error="model is still loading").start()
+    try:
+        ws = _WS()
+
+        async def run():
+            engine = _engine(fake)
+            with pytest.raises(VoxtreamGenerationError) as exc:
+                async for _ in engine.stream_synthesize("hello"):
+                    pass
+            assert "still loading" in str(exc.value)
+            # The fake keeps the connection open, so only a client close ends it.
+            await _until(lambda: len(fake.closes) == 1, timeout=0.5)
+            pipeline = TTSPipeline(engine=engine, executor=None)
+            with pytest.raises(VoxtreamGenerationError):
+                await pipeline.synthesize_and_stream(ws, "hello again", "one")
+            await _until(lambda: len(fake.closes) == 2, timeout=0.5)
+        asyncio.run(run())
+        assert ws.kinds() == ["audio_start", "audio_end"]
+        assert ws.texts("audio_end")[0]["reason"] == "error"
+    finally:
+        fake.stop()
