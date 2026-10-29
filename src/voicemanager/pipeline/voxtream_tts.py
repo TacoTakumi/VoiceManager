@@ -394,6 +394,10 @@ class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
         generation: VoxtreamGeneration | None = None
         pump: asyncio.Task | None = None
         frames = 0
+        # Only a generation the sidecar ended itself (eos) is a complete reply; an
+        # unknown voice, an unreachable sidecar, an error frame or a dropped
+        # connection ends the request with reason "error", as the one-shot path does.
+        reached_eos = False
 
         async def pump_text() -> None:
             while True:
@@ -422,6 +426,7 @@ class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
                 await websocket.send_bytes(float32_to_pcm16(frame))
                 frames += 1
                 self._report_audio(request_id, len(frame), generation.sample_rate)
+            reached_eos = True
             if pump is not None and not pump.done():
                 # eos before the text ended: the sidecar stopped on its own
                 pump.cancel()
@@ -441,7 +446,9 @@ class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
                 except Exception:
                     pass
             try:
-                await websocket.send_text(AudioEndMessage(request_id=request_id).model_dump_json())
+                await websocket.send_text(AudioEndMessage(
+                    request_id=request_id,
+                    reason="complete" if reached_eos else "error").model_dump_json())
             except Exception:
                 logger.debug("Could not send audio_end for request_id=%s", request_id)
             logger.debug("VoXtream generation complete: request_id=%s frames=%d",

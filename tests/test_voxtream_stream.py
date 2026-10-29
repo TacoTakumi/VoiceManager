@@ -6,7 +6,9 @@ request's chunks pass straight through in order, flush sends nothing, done sends
 the client gets one audio_start (24000, mono, 16 bit), the frames as int16 PCM and one
 audio_end; text fed after audio has started is still spoken in the same generation;
 the one-shot tts request is one generation with the whole text; voice selection reaches
-the init frame and an unknown voice fails before any connection; and the pipeline is
+the init frame and an unknown voice fails before any connection; a generation that
+fails before eos (init error, dropped connection, no sidecar, unknown voice) ends
+with audio_end reason "error" while a sidecar eos stays "complete"; and the pipeline is
 wired per connection for the voxtream engine type.
 """
 import asyncio
@@ -228,6 +230,7 @@ def test_unknown_voice_ends_the_request_with_an_error_frame_and_no_connection(fa
     assert len(errors) == 1
     assert "nope" in errors[0]["message"] and "designed_female_s101" in errors[0]["message"]
     assert ws.kinds() == ["error", "audio_start", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
     assert fake.connections == 0
 
 
@@ -244,6 +247,7 @@ def test_unknown_voice_over_the_endpoint_keeps_the_connection_open(fake, monkeyp
             assert [f["type"] for f in frames] == ["error", "audio_start", "audio_end"]
             assert "designed_female_s101" in frames[0]["message"]
             assert frames[2]["request_id"] == "bad"
+            assert frames[2]["reason"] == "error"
             # The connection is still open: a valid request plays normally.
             ws.send_json({"type": "tts_stream", "text": "still here", "done": True,
                           "request_id": "good"})
@@ -315,6 +319,59 @@ def test_tts_stream_over_the_websocket_endpoint_uses_the_pass_through(fake, monk
     assert fake.connections == 1
     assert fake.chunks[0] == CHUNKS
     assert pcm == [_fake_frame(n) for n in range(1, len(CHUNKS) + 1)]
+
+
+# --- failed generations end with reason error ----------------------------------------
+
+def _run_stream(engine, chunks: list[str], ws: _WS) -> None:
+    async def run():
+        pipe = _pipe(engine)
+        for i, chunk in enumerate(chunks):
+            await pipe.feed_text(chunk, i == len(chunks) - 1, ws, "r1")
+        await asyncio.wait_for(pipe.synthesis_task, 3.0)
+    asyncio.run(run())
+
+
+def test_init_error_on_the_stream_path_ends_with_reason_error():
+    fake = FakeVoxtreamSidecar(init_error="model is still loading").start()
+    try:
+        ws = _WS()
+        _run_stream(_engine(fake), CHUNKS, ws)
+    finally:
+        fake.stop()
+    assert ws.kinds() == ["audio_start", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
+
+
+def test_sidecar_dropping_the_connection_mid_generation_ends_with_reason_error():
+    fake = FakeVoxtreamSidecar(close_after_frames=2).start()
+    try:
+        ws = _WS()
+        _run_stream(_engine(fake), CHUNKS, ws)
+    finally:
+        fake.stop()
+    assert ws.kinds() == ["audio_start", "bytes", "bytes", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
+
+
+def test_no_sidecar_on_the_port_ends_with_reason_error():
+    fake = FakeVoxtreamSidecar().start()
+    fake.stop()  # the port is now closed; the engine still points at it
+    ws = _WS()
+    _run_stream(_engine(fake), CHUNKS, ws)
+    assert ws.kinds() == ["audio_start", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
+
+
+def test_eos_from_the_sidecar_with_text_still_queued_ends_with_reason_complete():
+    fake = FakeVoxtreamSidecar(eos_after_frames=2).start()
+    try:
+        ws = _WS()
+        _run_stream(_engine(fake), CHUNKS, ws)
+    finally:
+        fake.stop()
+    assert ws.kinds() == ["audio_start", "bytes", "bytes", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "complete"
 
 
 # --- init error ----------------------------------------------------------------------

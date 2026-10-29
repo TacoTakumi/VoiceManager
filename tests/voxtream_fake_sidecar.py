@@ -92,13 +92,21 @@ FRAME_SAMPLES = 1920  # 80 ms at 24 kHz
 
 class FakeVoxtreamSidecar:
     def __init__(self, frames_per_chunk: int = 1, hold_eos: bool = False,
-                 keep_emitting_after_eot: bool = False, init_error: str | None = None):
+                 keep_emitting_after_eot: bool = False, init_error: str | None = None,
+                 close_after_frames: int | None = None,
+                 eos_after_frames: int | None = None):
         self.frames_per_chunk = frames_per_chunk
         self.hold_eos = hold_eos
         self.keep_emitting_after_eot = keep_emitting_after_eot
         # Answer every init with this error message instead of config, then keep the
         # connection open until the client closes it (so a leaked client socket shows).
         self.init_error = init_error
+        # Drop the connection after this many frames, with no eos: a sidecar that died
+        # mid-generation.
+        self.close_after_frames = close_after_frames
+        # Send eos after this many frames while text may still be arriving: the
+        # sidecar's own stop (the maximum audio length).
+        self.eos_after_frames = eos_after_frames
         self.inits: list[dict] = []
         self.chunks: list[list[str]] = []  # per connection, in order
         self.eots: list[int] = []  # connection indexes that sent eot
@@ -187,6 +195,15 @@ class FakeVoxtreamSidecar:
                         await ws.send(np.full(FRAME_SAMPLES, frame_no / 100.0,
                                               dtype=np.float32).tobytes())
                         self.frames_sent[index] = frame_no
+                        if self.close_after_frames is not None \
+                                and frame_no >= self.close_after_frames:
+                            await ws.close(code=1011, reason="fake sidecar fault")
+                            return
+                        if self.eos_after_frames is not None \
+                                and frame_no >= self.eos_after_frames:
+                            await ws.send(json.dumps({"type": "eos"}))
+                            await ws.close()
+                            return
                 elif payload.get("event") == "eot":
                     eot = True
             with self._lock:
