@@ -168,7 +168,8 @@ class ClassicSession:
     ones ends the reply: an endpointed one dispatches the revision at once (the
     endpoint hold revised what was heard), another one is the person talking over the
     reply, and the turn dispatches again at its next endpoint. A reply that ends on
-    its own opens the next turn.
+    its own opens the next turn; if its last audio is still playing when the next
+    turn's first words arrive, the speaker is cleared.
     """
 
     def __init__(self, duplex, chat_factory: Callable[[list[dict]], ChatStream], player,
@@ -221,6 +222,11 @@ class ClassicSession:
             return
         if not heard_before:
             self.say(f"... {text}")  # the first words of this turn: the microphone works
+            if (self.reply is None or self.reply.ended) and self.player.is_playing():
+                # The last reply's audio_end has passed but its tail is still playing:
+                # the person talking over it stops the speaker, as a barge-in would.
+                self.player.clear()
+                self.say("  (playback stopped)")
         if self.reply is not None and not self.reply.ended:
             if words == self.dispatched_words:
                 return  # a confirmation (or a re-casing) of what was dispatched

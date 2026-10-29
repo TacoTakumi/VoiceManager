@@ -461,3 +461,25 @@ def test_warm_up_reports_ready_or_the_failure(sse_server):
     said.clear()
     assert asyncio.run(va.warm_up_chat(sse_server, None, say=said.append)) is False
     assert said[-1].startswith("error:") and "HTTP 503" in said[-1]
+
+
+def test_words_after_audio_end_while_the_tail_still_plays_clear_the_speaker():
+    factory = ChatFactory(FakeChat(["A", " long", " fact."]), FakeChat(["Sure."]))
+    session, duplex, player, log, clock = _session(factory)
+    said: list[str] = []
+    session.say = said.append
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("tell me a fact", endpoint=True), 100.9)
+        await _settle()
+        # The server has sent every byte (audio_end), but the player still holds audio.
+        await _finish_reply(session, duplex, duplex.requests[0], clock)
+        assert duplex.turns == 2 and player.is_playing()
+        await session.on_transcript(_frame("that is", turn_id=2), 103.0)
+        assert player.cleared == 1
+        await session.on_transcript(_frame("that is enough", turn_id=2, endpoint=True), 103.6)
+        await _settle()
+    asyncio.run(run())
+    assert "  (playback stopped)" in said
+    assert len(duplex.requests) == 2 and not duplex.requests[0].cancelled
