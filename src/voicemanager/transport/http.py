@@ -20,19 +20,41 @@ def _audiocpp_stt_model_name(config: dict) -> str | None:
     return os.path.basename(config.get("model", "")) or config.get("model_task")
 
 
-def _tts_model_name(request: Request) -> str:
-    """Return human-readable TTS model name based on active engine type."""
+def _tts_model_id(request: Request) -> str:
+    """The bare model id of the active TTS engine, as /info reports it.
+
+    The vibevoice model id, the audiocpp GGUF basename (the filesystem layout
+    stays server-side; falls back to the model_task id when no path is
+    configured), the VoXtream model repository, else the OpenVoice checkpoint.
+    """
     tts_engine_type = getattr(request.app.state, "tts_engine_type", "openvoice")
     if tts_engine_type == "vibevoice":
-        settings = get_settings()
-        return f"vibevoice-realtime ({settings.vibevoice_model})"
+        return get_settings().vibevoice_model
     if tts_engine_type == "audiocpp":
         settings = get_settings()
-        # Basename, not the full path (the /info convention for the STT sidecar):
-        # falls back to the model_task id when no GGUF path is configured.
-        name = os.path.basename(settings.audiocpp_tts_model) or settings.audiocpp_tts_model_task
-        return f"audiocpp ({name})"
+        return os.path.basename(settings.audiocpp_tts_model) or settings.audiocpp_tts_model_task
+    if tts_engine_type == "voxtream":
+        return _voxtream_model_repo()
     return "openvoice-v2"
+
+
+def _tts_model_name(request: Request) -> str:
+    """Human-readable TTS model label for /health: the engine and its model id."""
+    tts_engine_type = getattr(request.app.state, "tts_engine_type", "openvoice")
+    model = _tts_model_id(request)
+    if tts_engine_type == "vibevoice":
+        return f"vibevoice-realtime ({model})"
+    if tts_engine_type in ("audiocpp", "voxtream"):
+        return f"{tts_engine_type} ({model})"
+    return model
+
+
+@functools.cache
+def _voxtream_model_repo() -> str:
+    """The Hugging Face repository the shipped VoXtream generator config loads."""
+    import json
+    from voicemanager.pipeline.voxtream_server import CONFIG_DIR
+    return json.loads((CONFIG_DIR / "generator.json").read_text())["model_repo"]
 
 
 @http_router.get("/health")
@@ -116,12 +138,7 @@ async def info(request: Request, token: Token = Depends(require_token)):
             if stt_engine_type == "audiocpp" and audiocpp is not None
             else None
         ),
-        "tts_model": (
-            settings.vibevoice_model if tts_engine_type == "vibevoice"
-            else (os.path.basename(settings.audiocpp_tts_model)
-                  or settings.audiocpp_tts_model_task) if tts_engine_type == "audiocpp"
-            else "openvoice-v2"
-        ),
+        "tts_model": _tts_model_id(request),
         "tts_sample_rate": tts_engine.sample_rate if tts_engine is not None else None,
         "available_voices": (
             tts_engine.available_voices
