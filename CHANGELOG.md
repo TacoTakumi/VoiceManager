@@ -16,11 +16,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sidecar process from its own virtual environment (`venv-voxtream`, three
   commands in the README), spawned at startup on the `VM_DEVICE` GPU and
   stopped at shutdown; startup refuses with the setting named when the
-  interpreter is missing or the sidecar is not ready in time. The voice is a
-  preset from the designed presets file (the reference WAV only). Settings
-  `VM_VOXTREAM_PY`, `VM_VOXTREAM_PORT`, `VM_VOXTREAM_VOICES`,
-  `VM_VOXTREAM_VOICE`, `VM_VOXTREAM_READY_TIMEOUT` and `VM_VOXTREAM_COMPILE`.
-  English only; the weights are CC BY-NC 4.0.
+  interpreter is missing, the sidecar is not ready in time, or
+  `VM_VOXTREAM_PORT` is already in use (an orphaned sidecar is never adopted).
+  The voice is a preset from the designed presets file (the reference WAV
+  only); an unknown `voice` on `tts_stream` ends that request with an `error`
+  frame of `error_type` `unknown_voice` naming the presets, then `audio_start`
+  and `audio_end` with reason `error`, and the connection stays open. A
+  generation that fails before the engine finishes (sidecar unreachable, an
+  error frame, a dropped connection) ends with `audio_end` reason `error`, as
+  the one-shot `tts` path already did. One generation is capped at 60 s of
+  audio by the shipped generator config; a longer request is cut there with a
+  normal `audio_end` and the rest of its text is dropped. `/voice/upload`
+  answers 400 under this engine (no cloning). `/health` names the engine as
+  `voxtream (herimor/voxtream2.1)` and `/info` reports `tts_model`
+  `herimor/voxtream2.1`. Settings `VM_VOXTREAM_PY`, `VM_VOXTREAM_PORT`,
+  `VM_VOXTREAM_VOICES`, `VM_VOXTREAM_VOICE`, `VM_VOXTREAM_READY_TIMEOUT` and
+  `VM_VOXTREAM_COMPILE`. English only; the weights are CC BY-NC 4.0.
 - `tts_stream` has a `chunking` field: `"sentence"` (the default, unchanged) or
   `"clause"`. In clause mode the server holds the streamed text and cuts
   playback-aware pieces at clause marks, word counts or when the unplayed
