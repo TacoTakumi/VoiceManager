@@ -73,6 +73,148 @@ class TTSError(VoiceManagerError):
 # VoiceManagerClient
 # ---------------------------------------------------------------------------
 
+class TTSRequest:
+    """One streaming TTS reply on a DuplexSession.
+
+    Made by ``DuplexSession.tts_request``. ``send`` appends text to the request (the
+    first frame carries the voice and the chunking the request was made with),
+    ``flush`` speaks the held text now, ``done`` ends the text and ``cancel`` stops
+    the reply. The audio comes back on ``DuplexSession.audio`` under this
+    ``request_id``.
+    """
+
+    def __init__(self, client: "VoiceManagerClient", request_id: str,
+                 voice: str | None, chunking: str | None) -> None:
+        self._client = client
+        self.request_id = request_id
+        self._voice = voice
+        self._chunking = chunking
+        self._first = True
+        self.done_sent = False
+        self.cancelled = False
+
+    async def send(self, text: str, flush: bool = False) -> None:
+        """Append ``text`` to the request; with ``flush`` the server speaks it now."""
+        if self.done_sent:
+            raise VoiceManagerError(
+                f"TTS request {self.request_id} is closed: done() was already sent")
+        payload = {"type": "tts_stream", "request_id": self.request_id,
+                   "text": text, "done": False}
+        if flush:
+            payload["flush"] = True
+        if self._first:
+            if self._voice is not None:
+                payload["voice"] = self._voice
+            if self._chunking is not None:
+                payload["chunking"] = self._chunking
+            self._first = False
+        await self._client._send_or_raise(json.dumps(payload), TTSError)
+
+    async def flush(self) -> None:
+        """Speak the text the server holds for this request now; keep it open."""
+        await self.send("", flush=True)
+
+    async def done(self) -> None:
+        """End the request's text; the server answers with one audio_end."""
+        if self.done_sent:
+            return
+        self.done_sent = True
+        payload = {"type": "tts_stream", "request_id": self.request_id, "text": "",
+                   "done": True}
+        if self._first:  # a reply with no text at all still names its voice
+            if self._voice is not None:
+                payload["voice"] = self._voice
+            if self._chunking is not None:
+                payload["chunking"] = self._chunking
+            self._first = False
+        await self._client._send_or_raise(json.dumps(payload), TTSError)
+
+    async def cancel(self) -> None:
+        """Stop the reply: the server answers with one audio_end, reason cancelled."""
+        self.cancelled = True
+        self.done_sent = True
+        await self._client.cancel_tts(self.request_id)
+
+
+class DuplexSession:
+    """STT and TTS at the same time on one connection.
+
+    Made by ``VoiceManagerClient.duplex()``. The send methods and the two read
+    iterators are independent, so one task can stream the microphone with
+    ``send_audio`` while another reads ``transcripts()``, a third feeds a
+    ``TTSRequest`` and a fourth plays what ``audio()`` yields. While a session is
+    open the client's one-sided methods (``stream_stt_live``, ``stream_tts_live``
+    and the batch ones) refuse, since they read the same reply queues.
+
+    ``audio()`` yields ``("audio_start", frame)``, ``("pcm", bytes, request_id)`` and
+    ``("audio_end", frame)`` in arrival order. The pcm of a cancelled request is
+    dropped until its audio_end, which is still yielded. Each iterator ends when
+    the connection closes.
+    """
+
+    def __init__(self, client: "VoiceManagerClient") -> None:
+        self._client = client
+        self.closed = False
+
+    async def __aenter__(self) -> "DuplexSession":
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """End the session; the client's one-sided methods work again."""
+        self.closed = True
+        if self._client._duplex is self:
+            self._client._duplex = None
+
+    async def send_audio(self, pcm: bytes) -> None:
+        """Send one binary frame of 16 kHz mono 16-bit PCM to STT."""
+        await self._client._send_or_raise(pcm, STTError)
+
+    async def turn_start(self, timeout: float = 5.0) -> int:
+        """Open a conversation turn and return the server's turn_id."""
+        return await self._client.turn_start(timeout=timeout)
+
+    def tts_request(self, voice: str | None = None, chunking: str | None = None,
+                    request_id: str | None = None) -> TTSRequest:
+        """Make a streaming TTS request; nothing is sent until its first ``send``."""
+        _check_chunking(chunking)
+        request_id = request_id or str(uuid.uuid4())
+        self._client.last_tts_request_id = request_id
+        return TTSRequest(self._client, request_id, voice, chunking)
+
+    async def transcripts(self) -> AsyncIterator[dict]:
+        """Yield every transcription dict as it arrives, turn_id stamped."""
+        while (frame := await self._client._stt_queue.get()) is not None:
+            yield self._client._stamp_turn_id(frame)
+
+    async def audio(self) -> AsyncIterator[tuple]:
+        """Yield audio_start, pcm and audio_end events in arrival order."""
+        client = self._client
+        current: str | None = None
+        while (item := await client._tts_queue.get()) is not None:
+            if isinstance(item, bytes):
+                if current is not None and current not in client._cancelled_tts:
+                    yield ("pcm", item, current)
+                continue
+            kind, rid = item.get("type"), item.get("request_id")
+            if kind == "audio_start":
+                current = rid
+                client.last_tts_sample_rate = item.get("sample_rate", client.last_tts_sample_rate)
+                yield ("audio_start", item)
+            elif kind == "audio_end":
+                client._cancelled_tts.discard(rid)
+                if rid == current:
+                    current = None
+                yield ("audio_end", item)
+
+    async def errors(self) -> AsyncIterator[dict]:
+        """Yield the server's error frames (timeout warnings, invalid requests)."""
+        while (frame := await self._client._error_queue.get()) is not None:
+            yield frame
+
+
 class VoiceManagerClient:
     """Async client for the VoiceManager STT/TTS server.
 
@@ -131,6 +273,8 @@ class VoiceManagerClient:
         # and returns immediately without awaiting audio_end; the live-yield path
         # discards binary frames for a cancelled request until its audio_end lands.
         self._cancelled_tts: set[str] = set()
+        # The open DuplexSession, if any; the one-sided methods refuse while it is set.
+        self._duplex: DuplexSession | None = None
 
         self._logger = logger
 
@@ -303,6 +447,37 @@ class VoiceManagerClient:
             await self._stt_queue.put(None)
             await self._tts_queue.put(None)
             await self._turn_queue.put(None)
+            await self._error_queue.put(None)
+
+    # ------------------------------------------------------------------
+    # Full duplex
+    # ------------------------------------------------------------------
+
+    def duplex(self) -> DuplexSession:
+        """Open a DuplexSession: STT and TTS at the same time on this connection.
+
+        Use it as ``async with client.duplex() as session:`` or call ``close()``
+        when done. Only one session is open at a time, and while it is open the
+        one-sided methods (``stream_stt_live``, ``stream_tts_live``, ``stream_stt``,
+        ``stream_tts``, ``synthesize_tts``) raise VoiceManagerError.
+        """
+        if self._duplex is not None and not self._duplex.closed:
+            raise VoiceManagerError("a duplex session is already open on this client")
+        self._duplex = DuplexSession(self)
+        return self._duplex
+
+    def _require_no_duplex(self, method: str) -> None:
+        if self._duplex is not None and not self._duplex.closed:
+            raise VoiceManagerError(
+                f"{method} cannot run while a duplex session is open; use the session")
+
+    async def _send_or_raise(self, data, error: type) -> None:
+        """Send one frame; a closed connection reconnects and raises ``error``."""
+        try:
+            await self._ws.send(data)
+        except websockets.exceptions.ConnectionClosed:
+            await self._reconnect()
+            raise error("Connection lost during duplex session")
 
     # ------------------------------------------------------------------
     # STT methods
@@ -341,6 +516,7 @@ class VoiceManagerClient:
         Raises:
             STTError: If the connection is lost during streaming.
         """
+        self._require_no_duplex("stream_stt")
         results: list[dict] = []
         try:
             async for chunk in audio_chunks:
@@ -399,6 +575,7 @@ class VoiceManagerClient:
         Raises:
             STTError: If the connection is lost during streaming.
         """
+        self._require_no_duplex("stream_stt_live")
         send_done = False
         try:
             send_iter = audio_chunks.__aiter__()
@@ -497,6 +674,7 @@ class VoiceManagerClient:
         Raises:
             TTSError: If the connection is lost or times out.
         """
+        self._require_no_duplex("synthesize_tts")
         request_id = str(uuid.uuid4())
         self.last_tts_request_id = request_id  # reachable so a caller can cancel_tts()
         payload = {"type": "tts", "text": text, "request_id": request_id}
@@ -568,6 +746,7 @@ class VoiceManagerClient:
             TTSError: If the connection is lost or times out.
             ValueError: If chunking is not None, "sentence" or "clause".
         """
+        self._require_no_duplex("stream_tts")
         _check_chunking(chunking)
         request_id = str(uuid.uuid4())
         self.last_tts_request_id = request_id  # reachable so a caller can cancel_tts()
@@ -686,6 +865,7 @@ class VoiceManagerClient:
             TTSError: If the connection is lost or times out.
             ValueError: If chunking is not None, "sentence" or "clause".
         """
+        self._require_no_duplex("stream_tts_live")
         _check_chunking(chunking)
         if request_id is None:
             request_id = str(uuid.uuid4())
