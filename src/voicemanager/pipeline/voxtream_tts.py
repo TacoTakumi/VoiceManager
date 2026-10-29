@@ -15,6 +15,7 @@ transcript is unused). Cloning from an uploaded WAV is not offered on this engin
 import asyncio
 import json
 import logging
+import socket
 import subprocess
 import time
 import urllib.error
@@ -37,6 +38,7 @@ SERVER_SCRIPT = Path(voxtream_server.__file__)
 # Settings named in startup errors, so the operator knows which line of .env to fix.
 PY_SETTING = "VM_VOXTREAM_PY"
 READY_TIMEOUT_SETTING = "VM_VOXTREAM_READY_TIMEOUT"
+PORT_SETTING = "VM_VOXTREAM_PORT"
 VOICE_SETTING = "VM_VOXTREAM_VOICE"
 _STOP_GRACE_S = 5.0
 _HEALTH_POLL_S = 0.1
@@ -108,6 +110,13 @@ class VoxtreamSidecar:
                 "voxtream engine)")
         if self.process is not None and self.process.poll() is None:
             return
+        if self._port_in_use():
+            # A stranger on the port (an orphaned sidecar from a killed server, another
+            # service) would answer /health and be taken for the child we never
+            # managed to start. Refuse instead.
+            raise VoxtreamStartupError(
+                f"{PORT_SETTING}={self.port} is already in use on {self.host}; stop the "
+                "process that holds it (an orphaned sidecar?) or pick another port")
         cmd = self.command()
         logger.info("Starting VoXtream sidecar: %s", " ".join(cmd))
         try:
@@ -133,6 +142,13 @@ class VoxtreamSidecar:
                     f"{READY_TIMEOUT_SETTING}={self.ready_timeout_s:g} s; the first run "
                     "downloads the weights, so raise the timeout or check its log")
             time.sleep(_HEALTH_POLL_S)
+
+    def _port_in_use(self) -> bool:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=0.5):
+                return True
+        except OSError:
+            return False
 
     def is_ready(self) -> bool:
         try:

@@ -241,3 +241,20 @@ def test_upload_under_voxtream_returns_400_naming_the_limitation():
     detail = response.json()["detail"]
     assert "voxtream" in detail
     assert "preset" in detail.lower()
+
+
+# --- port already in use -------------------------------------------------------------
+
+def test_a_port_already_in_use_refuses_startup_naming_the_port_setting(fake_sidecar, tmp_path):
+    args_file = tmp_path / "args.json"
+    fake_sidecar("ready", VOXTREAM_FAKE_ARGS_FILE=args_file)
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        sidecar = VoxtreamSidecar(sys.executable, port, ready_timeout_s=5.0)
+        with pytest.raises(VoxtreamStartupError) as exc:
+            sidecar.start()
+    assert "VM_VOXTREAM_PORT" in str(exc.value)
+    assert sidecar.process is None
+    assert not args_file.exists()  # nothing was spawned
