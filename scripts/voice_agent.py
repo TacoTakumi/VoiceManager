@@ -174,8 +174,10 @@ class ClassicSession:
     def __init__(self, duplex, chat_factory: Callable[[list[dict]], ChatStream], player,
                  log, clock: Callable[[], float] = time.monotonic, voice: str | None = None,
                  chunking: str = "clause", system_prompt: str = SYSTEM_PROMPT,
-                 on_error: Callable[[str], None] = print):
+                 on_error: Callable[[str], None] = print,
+                 say: Callable[[str], None] = lambda line: None):
         self.duplex = duplex
+        self.say = say  # one terminal line per utterance heard and per reply
         self.chat_factory = chat_factory
         self.player = player
         self.log = log
@@ -210,12 +212,15 @@ class ClassicSession:
         """Feed one transcription frame: upsert its segment, dispatch or supersede."""
         if self.turn_id is not None and frame.get("turn_id", 0) != self.turn_id:
             return
+        heard_before = bool(_heard_words(self.turn_text()))
         self.segments[frame.get("segment_index", 0)] = frame.get("text", "")
         text = self.turn_text()
         words = _heard_words(text)
         endpointed = bool(frame.get("endpoint") or frame.get("is_final"))
         if not words:
             return
+        if not heard_before:
+            self.say(f"... {text}")  # the first words of this turn: the microphone works
         if self.reply is not None and not self.reply.ended:
             if words == self.dispatched_words:
                 return  # a confirmation (or a re-casing) of what was dispatched
@@ -238,6 +243,7 @@ class ClassicSession:
         reply = Reply(request, chat, self.turn_id or 0, text, now)
         self.reply = reply
         self.replies.append(reply)
+        self.say(f"> {text}")
         reply.task = asyncio.create_task(self._run_reply(reply))
 
     async def _run_reply(self, reply: Reply) -> None:
@@ -324,6 +330,9 @@ class ClassicSession:
     # --- the record -----------------------------------------------------------------
 
     def _write_utterance(self, reply: Reply) -> None:
+        delay = "-" if reply.first_audio_ms is None else f"{reply.first_audio_ms:.0f} ms"
+        state = f"cancelled, {reply.reason}" if reply.cancelled else f"first audio {delay}"
+        self.say(f"< {reply.chat.text or '(no reply)'}  [{state}]")
         self.log.write(json.dumps({
             "type": "utterance", "turn_id": reply.turn_id, "text": reply.text,
             "t": round(reply.dispatched_at - self._t0, 3),
@@ -347,6 +356,23 @@ class ClassicSession:
                 f"endpoint, {cancelled} cancelled, tts chunking {self.chunking}")
 
 
+async def warm_up_chat(base_url: str, model: str | None, say: Callable[[str], None] = print,
+                       timeout: float = 300.0) -> bool:
+    """Send one short chat request so llama-swap loads the model before the first turn."""
+    say(f"loading the chat model{' ' + model if model else ''} at {base_url} ...")
+    chat = ChatStream(base_url, model, [{"role": "user", "content": "Say ready."}],
+                      timeout=timeout)
+    try:
+        chat.start(asyncio.get_running_loop())
+        async for _ in chat.deltas():
+            pass
+    except Exception as exc:
+        say(chat_error_message(base_url, timeout, exc) or f"error: chat request failed: {exc!r}")
+        return False
+    say("chat model ready")
+    return True
+
+
 def classic_output_paths(args: argparse.Namespace) -> tuple[str, str]:
     """The log and WAV paths of a classic run; defaults go in ``runs/classic/``."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -364,7 +390,9 @@ async def classic(args: argparse.Namespace) -> None:
     from voicemanager.client import VoiceManagerClient, VoiceManagerError
 
     log_path, wav_path = classic_output_paths(args)
-    print("warning: use headphones; there is no echo cancellation")
+    print("warning: use headphones; there is no echo cancellation", flush=True)
+    if not await warm_up_chat(args.url, args.model):
+        raise SystemExit(2)
     client = VoiceManagerClient(host=args.vm_host, port=args.vm_port, token=token)
     try:
         await client.__aenter__()
@@ -372,13 +400,19 @@ async def classic(args: argparse.Namespace) -> None:
         raise SystemExit(f"error: cannot connect to VoiceManager: {exc}") from exc
     player = AudioPlayer()
     session = None
+
+    def say(line: str) -> None:
+        print(line, flush=True)
+
     try:
         async with client.duplex() as duplex:
             with open(log_path, "w") as log:
                 session = ClassicSession(
                     duplex, lambda messages: ChatStream(args.url, args.model, messages),
-                    player, log, voice=args.voice, chunking=args.tts_mode)
+                    player, log, voice=args.voice, chunking=args.tts_mode, say=say)
                 await session.open_turn()
+                say(f"listening (stt {client.stt_engine}, tts {client.tts_engine}); "
+                    "speak, pause, and the reply follows; Ctrl-C to stop")
 
                 async def transcripts() -> None:
                     async for frame in duplex.transcripts():

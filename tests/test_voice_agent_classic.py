@@ -433,3 +433,31 @@ def test_default_run_paths_are_under_runs_classic(tmp_path, monkeypatch):
     assert (tmp_path / "runs" / "classic").is_dir()
     assert va.classic_output_paths(argparse.Namespace(log="a.jsonl", wav="b.wav")) == (
         "a.jsonl", "b.wav")
+
+
+def test_terminal_lines_per_utterance_and_reply():
+    factory = ChatFactory(FakeChat(["Hi", " there."]))
+    duplex, player, log = FakeDuplex(), FakePlayer(), io.StringIO()
+    said: list[str] = []
+    clock = {"t": 100.0}
+    session = va.ClassicSession(duplex, factory, player, log, clock=lambda: clock["t"],
+                                say=said.append)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("hello", endpoint=True), 100.5)
+        await _settle()
+        clock["t"] = 100.8
+        await _finish_reply(session, duplex, duplex.requests[0], clock)
+    asyncio.run(run())
+    assert said == ["... hello", "> hello", "< Hi there.  [first audio 300 ms]"]
+
+
+def test_warm_up_reports_ready_or_the_failure(sse_server):
+    said: list[str] = []
+    assert asyncio.run(va.warm_up_chat(sse_server, "m1", say=said.append)) is True
+    assert said[-1] == "chat model ready" and _SSEHandler.bodies[0]["model"] == "m1"
+    _SSEHandler.status = 503
+    said.clear()
+    assert asyncio.run(va.warm_up_chat(sse_server, None, say=said.append)) is False
+    assert said[-1].startswith("error:") and "HTTP 503" in said[-1]
