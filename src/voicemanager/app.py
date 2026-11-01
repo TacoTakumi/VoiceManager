@@ -98,6 +98,7 @@ async def lifespan(app: FastAPI):
         # The sidecar is one shared child process: watch it and start it again when
         # it dies, so TTS comes back without a restart of the server.
         sidecar_watcher = asyncio.create_task(tts_models["tts_engine"].watch())
+    app.state.sidecar_watcher = sidecar_watcher
     yield
     # Shutdown
     if sidecar_watcher is not None:

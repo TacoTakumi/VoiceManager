@@ -156,7 +156,17 @@ def test_shutdown_stops_the_watcher_first_and_interrupts_a_restart_in_flight(
     caplog.set_level("INFO", logger="voicemanager.pipeline.voxtream_tts")
     with TestClient(app_module.create_app()) as client:
         engine = client.app.state.tts_engine
+        watcher = client.app.state.sidecar_watcher
         first = engine.sidecar.process
+        # The order is the point: the watcher must already be done when the
+        # lifespan stops the sidecar, or it could see that stop as a death.
+        at_dispose = {}
+        real_dispose = engine.dispose
+
+        def dispose_recording():
+            at_dispose["watcher_done"] = watcher.done()
+            real_dispose()
+        monkeypatch.setattr(engine, "dispose", dispose_recording)
         # The respawn will take 5 s to answer /health: the start waits inside it.
         fake_sidecar("slow", VOXTREAM_FAKE_DELAY_S=5)
         _kill(first)
@@ -169,10 +179,13 @@ def test_shutdown_stops_the_watcher_first_and_interrupts_a_restart_in_flight(
     _wait(lambda: second.poll() is not None, timeout=5)
     assert first.poll() is not None
     assert engine.sidecar.process is None and not engine.ready
-    starts_after = [r for r in caplog.records
-                    if "Starting VoXtream sidecar" in r.getMessage()
-                    and r.created > shutdown_began]
-    assert starts_after == []
+    # The watcher was cancelled before the sidecar was stopped: it is done, and it
+    # never saw the closed sidecar as a death to log or retry.
+    assert at_dispose["watcher_done"] is True
+    assert watcher.cancelled()
+    after = [r for r in caplog.records if r.created > shutdown_began]
+    assert [r for r in after if "Starting VoXtream sidecar" in r.getMessage()] == []
+    assert [r for r in after if "restart failed" in r.getMessage()] == []
     time.sleep(0.3)  # a watcher still alive would have started one by now
     assert engine.sidecar.process is None
 
