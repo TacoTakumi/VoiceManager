@@ -17,6 +17,7 @@ import json
 import logging
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -72,6 +73,11 @@ class VoxtreamSidecar:
         # Set once the spawned process answered /health; cleared on every spawn and
         # stop, so ``ready`` is false while a start is still waiting.
         self._answered_health = False
+        # Set by close(): a start still waiting ends and no start begins, so a server
+        # shutting down never leaves a sidecar behind. stop() alone keeps the sidecar
+        # startable (the ready-timeout path stops and the watcher tries again).
+        self._closing = False
+        self._lock = threading.Lock()
 
     @staticmethod
     def device_argument(resolved_device: str, visible: str | None = None) -> str | None:
@@ -126,6 +132,8 @@ class VoxtreamSidecar:
                 "voxtream engine)")
         if self.alive:
             return
+        if self._closing:
+            raise VoxtreamStartupError("the VoXtream sidecar is closing; no start begins")
         self._answered_health = False
         if self._port_in_use():
             # A stranger on the port (an orphaned sidecar from a killed server, another
@@ -137,13 +145,21 @@ class VoxtreamSidecar:
         cmd = self.command()
         logger.info("Starting VoXtream sidecar: %s", " ".join(cmd))
         try:
-            self.process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         except OSError as exc:
             raise VoxtreamStartupError(
                 f"{PY_SETTING}={self.python} could not be started: {exc}") from exc
+        self.process = proc
         deadline = time.monotonic() + self.ready_timeout_s
         while True:
-            code = self.process.poll()
+            if self._closing:
+                # close() ran while this start waited: its stop() may already have
+                # taken the process; stop again so both paths leave nothing running.
+                self.stop()
+                raise VoxtreamStartupError(
+                    "the VoXtream sidecar was stopped during startup: the server is "
+                    "shutting down")
+            code = proc.poll()
             if code is not None:
                 self.process = None
                 raise VoxtreamStartupError(
@@ -175,13 +191,18 @@ class VoxtreamSidecar:
         except (urllib.error.URLError, OSError, ValueError):
             return False
 
+    def close(self) -> None:
+        """Stop the process for good: a start still waiting ends and no start begins."""
+        self._closing = True
+        self.stop()
+
     def stop(self) -> None:
         """Terminate the process, then kill it if it ignores the request."""
-        proc = self.process
-        self._answered_health = False
+        with self._lock:
+            proc, self.process = self.process, None
+            self._answered_health = False
         if proc is None:
             return
-        self.process = None
         if proc.poll() is not None:
             return
         proc.terminate()
@@ -243,8 +264,8 @@ class VoxtreamTTSEngine(TTSEngine):
         """False while the sidecar is dead or a start is still waiting for it."""
         return self._sidecar.ready
 
-    async def watch(self, poll_interval: float = _WATCH_POLL_S,
-                    retry_delay: float = _WATCH_RETRY_S) -> None:
+    async def watch(self, poll_interval: float | None = None,
+                    retry_delay: float | None = None) -> None:
         """Start the sidecar again whenever it dies; runs until cancelled.
 
         The sidecar is one shared child process, so without this a crash leaves
@@ -252,8 +273,13 @@ class VoxtreamTTSEngine(TTSEngine):
         sidecar is started through the same path as at startup (the ready wait and
         the port-in-use refusal apply), in a worker thread so the event loop keeps
         serving. A start that fails is logged and tried again after ``retry_delay``;
-        nothing raises out of here.
+        nothing raises out of here. The intervals default to the module constants,
+        read at call time.
         """
+        if poll_interval is None:
+            poll_interval = _WATCH_POLL_S
+        if retry_delay is None:
+            retry_delay = _WATCH_RETRY_S
         while True:
             if self._sidecar.alive:
                 await asyncio.sleep(poll_interval)
@@ -333,7 +359,8 @@ class VoxtreamTTSEngine(TTSEngine):
             await generation.close()
 
     def dispose(self) -> None:
-        self._sidecar.stop()
+        """Stop the sidecar for good; a restart still waiting ends and none begins."""
+        self._sidecar.close()
 
 
 class VoxtreamGenerationError(RuntimeError):

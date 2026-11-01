@@ -1,4 +1,5 @@
 """FastAPI application factory."""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -92,8 +93,17 @@ async def lifespan(app: FastAPI):
         "TTS models loaded (engine=%s), session registry initialized",
         tts_models.get("tts_engine_type", "openvoice"),
     )
+    sidecar_watcher = None
+    if tts_models.get("tts_engine_type") == "voxtream":
+        # The sidecar is one shared child process: watch it and start it again when
+        # it dies, so TTS comes back without a restart of the server.
+        sidecar_watcher = asyncio.create_task(tts_models["tts_engine"].watch())
     yield
     # Shutdown
+    if sidecar_watcher is not None:
+        # Before the sidecar is stopped, so the shutdown never starts a new one.
+        sidecar_watcher.cancel()
+        await asyncio.gather(sidecar_watcher, return_exceptions=True)
     tts_models["tts_executor"].shutdown(wait=True)
     if tts_models.get("tts_engine_type") == "voxtream":
         # The sidecar is a child process this server spawned; stop it with the server.
