@@ -199,6 +199,8 @@ Set `VM_TTS_ENGINE=voxtream`. The first start downloads the weights (about 2.5 G
 
 The first request on each preset encodes its reference clip and saves the result beside the WAV as `<name>.prompt.npy` (gitignored); later requests reuse it, which took about 50 ms off the first-word latency on the rig. VoXtream only checks that the file exists, so delete the `.prompt.npy` after replacing a preset WAV.
 
+The server watches the sidecar and starts it again when it dies (a crash, an OOM kill). While the sidecar is gone or loading again, `GET /health` answers 503 with `status: "degraded"` and `tts: null`, and a TTS request ends at once with `audio_end` reason `error`; it is 200 `ok` again once the sidecar is ready. A restart that fails is logged and tried again every few seconds. STT is not affected.
+
 The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM. One generation is capped at 60 s of audio by the shipped generator config: a `tts_stream` request whose speech would run past 60 s is cut there with a normal `audio_end` (reason `complete`) and the rest of its text is dropped, so keep one request to one reply. Voice cloning from an upload (`/voice/upload`) is not offered on this engine (the upload answers 400); it is English only; and the weights are published under CC BY-NC 4.0, so check the licence before any commercial use.
 
 ## Configuration

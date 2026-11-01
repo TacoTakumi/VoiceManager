@@ -1319,7 +1319,23 @@ The `stt` value reflects the active engine: `"faster-whisper"`, `"qwen3-asr"`,
 `"nemotron-streaming"`, or - under the audiocpp engine - the active model_task id
 (e.g. `"voxtral-mini-4b-realtime-asr-streaming"`), which names the model family
 the sidecar is serving. `tts` is `"openvoice-v2"`, `"vibevoice-realtime (...)"`,
-or - under the audiocpp engine - `"audiocpp (...)"` naming the loaded GGUF.
+or - under the audiocpp engine - `"audiocpp (...)"` naming the loaded GGUF,
+or - under the voxtream engine - `"voxtream (...)"` naming the model repository.
+
+Under the voxtream engine the TTS model runs in a sidecar process that the
+server watches and starts again when it dies. While that sidecar is gone or
+loading again, `/health` answers `503` with `status: "degraded"` and the `tts`
+slot `null`; the body keeps its shape and the other slots their values:
+
+```json
+{ "status": "degraded", "models": { "stt": "faster-whisper", "vad": "silero-vad", "tts": null } }
+```
+
+A TTS request sent meanwhile ends at once with `audio_end` reason `error`
+(see [Gotchas](#gotchas)); STT keeps working. The answer is `200`
+with `status: "ok"` again once the sidecar is ready, usually within the
+sidecar's load time. A monitor can read the status code alone; a client that
+needs TTS should wait for `200` before sending a `tts` or `tts_stream` request.
 
 ### `GET /info`
 

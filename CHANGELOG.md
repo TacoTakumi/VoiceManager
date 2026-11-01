@@ -4,9 +4,23 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.1]
+## [0.4.0]
+
+### Added
+
+- The VoXtream sidecar is watched after startup. When the sidecar process dies
+  the server starts it again through the same path as at startup, and a start
+  that fails is logged and tried again every few seconds. Before, a dead
+  sidecar left every TTS request failing until a person restarted the server.
+  At shutdown the watcher stops before the sidecar, and a restart still waiting
+  for the sidecar is interrupted, so no sidecar outlives the server.
 
 ### Changed
+
+- `GET /health` answers 503 with `status: "degraded"` and `tts: null` while the
+  VoXtream sidecar is dead or loading again, and 200 `ok` once it is ready. The
+  body keeps its shape; the STT and VAD slots are unchanged. This is why the
+  version is a minor bump: a documented REST endpoint has a new answer.
 
 - The micro-turn reference client (`scripts/microturn_client.py`) sends the
   model its transcript fragments in the form the adapter was trained on. A
