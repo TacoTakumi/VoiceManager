@@ -20,6 +20,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   38 to 18 of 38. The server, the protocol and the classic voice agent are
   unchanged.
 
+### Fixed
+
+- The micro-turn client's late end mark is judged on the words the model
+  received, not on the final's text: a final that revises the last sent word
+  ("honey" to "money?") sends no words but still ends the model's history with
+  a mark, the final's own when it has one. After a shrink, regrowth along the
+  words the model received counts no second revision, however many ticks it
+  takes or where its frames cut a word, so the tick log's `revised` and
+  `revisions` fields no longer overcount a mid-word shrink.
+
 ## [0.3.0]
 
 ### Added

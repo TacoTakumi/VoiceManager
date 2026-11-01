@@ -93,7 +93,9 @@ class TickSlicer:
 
     Sent words are never taken back, because the model's history only grows. When the
     STT revises words already sent (or shrinks the text), the tick counts one revision
-    for that segment and sends only the words past the already-sent count.
+    for that segment and sends only the words past the already-sent count. After a
+    shrink, regrowth along the words the model received is the same change, not a
+    second revision, however many ticks it takes and wherever its frames cut a word.
 
     One kind of change is not a revision: the last word sent grows into a longer word
     that starts with it ("ra" to "random", or "honey" to "honey?"). The STT cut the
@@ -103,8 +105,9 @@ class TickSlicer:
 
     The streaming STT puts no end mark on a finished utterance, and nearly every
     answer in the training data follows a fragment that ends in "?" or ".". So when a
-    segment's final arrives and its text does not end in a mark, the tick sends one:
-    "?" when the segment opens with a question word, otherwise ".". It goes on the
+    segment's final arrives and the words the model received for it do not end in a
+    mark, the tick sends one: the mark the final ends in, else "?" when the segment
+    opens with a question word, otherwise ".". It goes on the
     last word sent for that segment in the tick, or alone when there is none, and a
     segment gets it once. The mark of a finished segment comes before the words of a
     later segment in the same tick.
@@ -147,7 +150,7 @@ class TickSlicer:
             if self._completes_last_shown(shown, sent, words):
                 emitted.append(words[n - 1][len(shown[-1]):])
                 shown[-1] = words[n - 1]
-            elif len(words) < len(sent) or words[:len(sent)] != sent:
+            elif not self._unchanged(sent, shown, words):
                 self.revisions += 1
                 self.last_revised = True
                 logger.debug("segment %d revised: sent=%r now=%r", seg, sent, words)
@@ -156,7 +159,7 @@ class TickSlicer:
                 self._shown[seg] = shown + words[n:]
                 self._count[seg] = len(words)
             self._sent[seg] = words[:self._count.get(seg, 0)]
-            mark = self._end_mark(seg, words)
+            mark = self._end_mark(seg, words, self._shown.get(seg, []))
             if mark:
                 if len(emitted) > start:
                     emitted[-1] += mark
@@ -166,16 +169,42 @@ class TickSlicer:
         self._final.clear()
         return " ".join(emitted) if emitted else NOVOICE
 
-    def _end_mark(self, seg: int, words: list[str]) -> str:
-        """The late end mark for a segment whose final just arrived, or an empty string."""
-        if not self._final.get(seg) or seg in self._marked or not words:
+    def _end_mark(self, seg: int, words: list[str], shown: list[str]) -> str:
+        """The late end mark for a segment whose final just arrived, or an empty string.
+
+        Judged on the words the model received: a final that revises the last sent
+        word ("honey" to "money?") sends no words, so its mark must still go out.
+        """
+        if not self._final.get(seg) or seg in self._marked or not words or not shown:
             return ""
         self._marked.add(seg)
-        if words[-1][-1] in END_MARKS:
+        if shown[-1][-1] in END_MARKS:
             return ""
+        if words[-1][-1] in END_MARKS:
+            return words[-1][-1]
         # The word before any apostrophe, so "what's" and "who's" count as questions.
         first = re.split(r"['\u2019]", re.sub(r"[^\w'\u2019]", "", words[0]).lower())[0]
         return "?" if first in QUESTION_WORDS else "."
+
+    @staticmethod
+    def _unchanged(sent: list[str], shown: list[str], words: list[str]) -> bool:
+        """True when the new words count no revision against what was sent.
+
+        They repeat or extend the latest version of the sent words, or, once that
+        version has departed from what the model received, they follow the model's
+        words again: whole words equal, the last one possibly cut short. The first
+        departure (the shrink or the changed word itself) is the revision.
+        """
+        if words[:len(sent)] == sent:
+            return True
+        if sent == shown:
+            return False
+        k = min(len(words), len(shown))
+        if k == 0 or words[:k - 1] != shown[:k - 1]:
+            return False
+        if len(words) >= len(shown):
+            return words[k - 1] == shown[k - 1]
+        return shown[k - 1].startswith(words[k - 1])
 
     @staticmethod
     def _completes_last_shown(shown: list[str], sent: list[str], words: list[str]) -> bool:

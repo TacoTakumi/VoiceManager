@@ -315,3 +315,59 @@ def test_slicer_completes_after_a_shrink_to_nothing():
     assert s.tick() == NOVOICE
     s.feed(frame("random"))
     assert s.tick() == "ndom"
+
+
+def test_slicer_final_that_revises_the_last_sent_word_still_gets_its_mark():
+    s = mc.TickSlicer()
+    s.feed(frame("tell me a fact about honey"))
+    assert s.tick() == "tell me a fact about honey"
+    # The final changes the word the model received, so no words go out, but
+    # the model's history must still end in a mark: the final's own.
+    s.feed(frame("tell me a fact about money?", final=True))
+    assert s.tick() == "?"
+    assert s.revisions == 1
+    s.feed(frame("tell me a fact about money?", final=True))
+    assert s.tick() == NOVOICE
+
+
+def test_slicer_final_that_revises_the_last_sent_word_without_a_mark_gets_one():
+    s = mc.TickSlicer()
+    s.feed(frame("tell me a fact about honey"))
+    assert s.tick() == "tell me a fact about honey"
+    s.feed(frame("tell me a fact about money", final=True))
+    assert s.tick() == "."
+    assert s.revisions == 1
+
+
+def test_slicer_mid_word_shrink_then_regrowth_counts_one_revision():
+    s = mc.TickSlicer()
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == "hey I am cleaning the"
+    s.feed(frame("hey I a"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 1
+    # Regrowth along the words the model received is the same change, however
+    # many ticks it takes and wherever its frames cut a word.
+    s.feed(frame("hey I am clea"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 1
+    assert s.last_revised is False
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 1
+    s.feed(frame("hey I am cleaning the bathroom"))
+    assert s.tick() == "bathroom"
+    assert s.revisions == 1
+    assert s.last_revised is False
+
+
+def test_slicer_regrowth_to_different_words_is_a_second_revision():
+    s = mc.TickSlicer()
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == "hey I am cleaning the"
+    s.feed(frame("hey I a"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 1
+    s.feed(frame("hey I am clearing the"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 2
