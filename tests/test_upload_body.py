@@ -255,3 +255,34 @@ def test_chunked_body_under_the_cap_is_accepted(small_cap, fake_extractor):
     assert resp.status_code == 200
     assert len(fake_extractor) == 1
     assert entry.tts_pipeline.target_se is EXTRACTED
+
+
+# --- a refused upload leaves nothing behind -------------------------------------------
+
+import gc
+import os
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_refused_chunked_upload_frees_its_spooled_file_without_the_gc(monkeypatch, fake_extractor):
+    # Above 1 MiB the multipart parser spools the file part to disk; the 413 raised
+    # mid-parse must not leave that file open until the cyclic GC runs.
+    cap = 2 * 1024 * 1024
+    monkeypatch.setattr(config.get_settings(), "upload_max_bytes", cap)
+    app, counter, client = _app()
+    _live_session(app)
+    chunks = list(_multipart_chunks([b"\x00" * (256 * 1024)] * 12))  # 3 MiB of file content
+    gc.disable()
+    try:
+        gc.collect()
+        before = _open_fds()
+        for _ in range(5):
+            resp = asyncio.run(_post_chunked(counter, chunks))
+            assert resp.status_code == 413
+        assert _open_fds() == before
+    finally:
+        gc.enable()
+    assert fake_extractor == []

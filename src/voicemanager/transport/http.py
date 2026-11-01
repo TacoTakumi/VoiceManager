@@ -175,6 +175,19 @@ def _capped_receive(receive, limit: int):
     return receive_capped
 
 
+def _too_large(limit: int) -> HTTPException:
+    """The 413 for an upload over the cap.
+
+    Built at each raise site, never ahead of time: an exception held in the
+    handler's locals is kept alive by its own traceback, and with it the parser
+    frames and the spooled file of the refused upload, until the cyclic GC runs.
+    """
+    return HTTPException(
+        status_code=413,
+        detail=f"Upload larger than the {limit} byte limit (VM_UPLOAD_MAX_BYTES)",
+    )
+
+
 @http_router.post("/voice/upload")
 async def upload_voice(
     request: Request,
@@ -234,13 +247,9 @@ async def upload_voice(
         raise HTTPException(status_code=503, detail="TTS engine not loaded")
 
     limit = get_settings().upload_max_bytes
-    too_large = HTTPException(
-        status_code=413,
-        detail=f"Upload larger than the {limit} byte limit (VM_UPLOAD_MAX_BYTES)",
-    )
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > limit:
-        raise too_large
+        raise _too_large(limit)
     capped = Request(request.scope, _capped_receive(request.receive, limit))
     try:
         async with capped.form() as form:
@@ -250,7 +259,7 @@ async def upload_voice(
             content = await upload.read()
             filename = upload.filename
     except _BodyTooLarge:
-        raise too_large
+        raise _too_large(limit)
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
