@@ -150,6 +150,31 @@ async def info(request: Request, token: Token = Depends(require_token)):
     }
 
 
+class _BodyTooLarge(Exception):
+    """Raised from the capped receive channel once the body passes the limit."""
+
+
+def _capped_receive(receive, limit: int):
+    """Wrap an ASGI receive so the body bytes it hands out stop at ``limit``.
+
+    The multipart parser pulls the body through this channel, so an upload sent
+    without a Content-Length (chunked) is cut off within one chunk of the cap
+    instead of spooling to disk until the client stops.
+    """
+    total = 0
+
+    async def receive_capped():
+        nonlocal total
+        message = await receive()
+        if message["type"] == "http.request":
+            total += len(message.get("body", b""))
+            if total > limit:
+                raise _BodyTooLarge()
+        return message
+
+    return receive_capped
+
+
 @http_router.post("/voice/upload")
 async def upload_voice(
     request: Request,
@@ -166,7 +191,9 @@ async def upload_voice(
 
     The multipart body is not a parameter: FastAPI reads a declared file before
     it runs any dependency, so the whole upload would be spooled to disk before
-    the 401, 400 or 404. The handler reads the form itself, after every check.
+    the 401, 400 or 404. The handler reads the form itself, after every check,
+    and refuses a body over VM_UPLOAD_MAX_BYTES with 413: on the Content-Length
+    before any read, or at the cap while a chunked body streams in.
     """
     # Voice cloning not supported with VibeVoice engine
     tts_engine_type = getattr(request.app.state, "tts_engine_type", "openvoice")
@@ -206,12 +233,24 @@ async def upload_voice(
     if tts_engine is None:
         raise HTTPException(status_code=503, detail="TTS engine not loaded")
 
-    async with request.form() as form:
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile):
-            raise HTTPException(status_code=400, detail="Missing file field")
-        content = await upload.read()
-        filename = upload.filename
+    limit = get_settings().upload_max_bytes
+    too_large = HTTPException(
+        status_code=413,
+        detail=f"Upload larger than the {limit} byte limit (VM_UPLOAD_MAX_BYTES)",
+    )
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise too_large
+    capped = Request(request.scope, _capped_receive(request.receive, limit))
+    try:
+        async with capped.form() as form:
+            upload = form.get("file")
+            if not isinstance(upload, UploadFile):
+                raise HTTPException(status_code=400, detail="Missing file field")
+            content = await upload.read()
+            filename = upload.filename
+    except _BodyTooLarge:
+        raise too_large
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 

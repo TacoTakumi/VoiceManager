@@ -183,3 +183,75 @@ def test_valid_upload_reaches_the_extractor_and_sets_the_profile(fake_extractor)
     assert entry.tts_pipeline.target_se is EXTRACTED
     assert entry.has_voice_profile is True
     assert counter.bytes_read > 0
+
+
+# --- the body size cap ------------------------------------------------------------------
+
+import httpx
+
+from voicemanager import config
+
+CAP = 1024
+BOUNDARY = b"cap-test-boundary"
+
+
+@pytest.fixture
+def small_cap(monkeypatch):
+    monkeypatch.setattr(config.get_settings(), "upload_max_bytes", CAP)
+
+
+def _multipart_chunks(content_chunks):
+    """A multipart body with one file field, yielded piece by piece."""
+    yield (b"--" + BOUNDARY + b"\r\n"
+           b'Content-Disposition: form-data; name="file"; filename="test.wav"\r\n'
+           b"Content-Type: audio/wav\r\n\r\n")
+    yield from content_chunks
+    yield b"\r\n--" + BOUNDARY + b"--\r\n"
+
+
+async def _post_chunked(counter, chunks):
+    """POST the chunks as a chunked body (no Content-Length) straight into the ASGI app."""
+    async def body():
+        for chunk in chunks:
+            yield chunk
+
+    transport = httpx.ASGITransport(app=counter)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        return await http.post(
+            "/voice/upload", params={"session_id": "live-session"},
+            headers={**authkit.auth_headers(),
+                     "Content-Type": f"multipart/form-data; boundary={BOUNDARY.decode()}"},
+            content=body(),
+        )
+
+
+def test_content_length_over_the_cap_is_413_before_any_read(small_cap, fake_extractor):
+    app, counter, client = _app()
+    _live_session(app)
+    resp = _post(client, headers=authkit.auth_headers(),
+                 files={"file": ("test.wav", b"\x00" * (CAP * 2), "audio/wav")})
+    assert resp.status_code == 413
+    assert str(CAP) in resp.json()["detail"]
+    assert counter.bytes_read == 0
+    assert fake_extractor == []
+
+
+def test_chunked_body_past_the_cap_is_413_and_reading_stops(small_cap, fake_extractor):
+    app, counter, client = _app()
+    _live_session(app)
+    chunk = 256
+    chunks = list(_multipart_chunks([b"\x00" * chunk] * 16))  # 4 KiB of file content
+    resp = asyncio.run(_post_chunked(counter, chunks))
+    assert resp.status_code == 413
+    assert CAP < counter.bytes_read <= CAP + chunk
+    assert fake_extractor == []
+
+
+def test_chunked_body_under_the_cap_is_accepted(small_cap, fake_extractor):
+    app, counter, client = _app()
+    entry = _live_session(app)
+    chunks = list(_multipart_chunks([WAV[:50], WAV[50:]]))
+    resp = asyncio.run(_post_chunked(counter, chunks))
+    assert resp.status_code == 200
+    assert len(fake_extractor) == 1
+    assert entry.tts_pipeline.target_se is EXTRACTED
