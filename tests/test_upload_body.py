@@ -286,3 +286,44 @@ def test_refused_chunked_upload_frees_its_spooled_file_without_the_gc(monkeypatc
     finally:
         gc.enable()
     assert fake_extractor == []
+
+
+# --- a client that leaves mid-upload --------------------------------------------------
+
+async def _post_then_disconnect(counter):
+    """Drive the ASGI app directly: one body chunk, then the client goes away."""
+    preamble = next(_multipart_chunks([]))
+    messages = iter([
+        {"type": "http.request", "body": preamble, "more_body": True},
+        {"type": "http.disconnect"},
+    ])
+    sent = []
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    headers = [(k.lower().encode(), v.encode()) for k, v in authkit.auth_headers().items()]
+    headers.append((b"content-type", b"multipart/form-data; boundary=" + BOUNDARY))
+    headers.append((b"host", b"test"))
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+        "scheme": "http", "path": "/voice/upload", "raw_path": b"/voice/upload",
+        "query_string": b"session_id=live-session", "root_path": "", "headers": headers,
+        "client": ("127.0.0.1", 1234), "server": ("test", 80),
+    }
+    await counter(scope, receive, send)
+    return sent
+
+
+def test_client_disconnect_mid_upload_ends_quietly(fake_extractor):
+    app, counter, client = _app()
+    _live_session(app)
+    # Before the fix ClientDisconnect escapes the handler: the server-error middleware
+    # sends a 500 and re-raises it, which uvicorn logs as a traceback per aborted upload.
+    sent = asyncio.run(_post_then_disconnect(counter))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 400
+    assert fake_extractor == []

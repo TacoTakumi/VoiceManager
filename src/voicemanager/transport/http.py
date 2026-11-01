@@ -5,6 +5,7 @@ import os
 import tempfile
 from fastapi import APIRouter, Depends, Request, HTTPException, Query
 from starlette.datastructures import UploadFile
+from starlette.requests import ClientDisconnect
 from voicemanager.auth.deps import require_token
 from voicemanager.auth.store import Token
 from voicemanager.config import get_settings
@@ -260,6 +261,10 @@ async def upload_voice(
             filename = upload.filename
     except _BodyTooLarge:
         raise _too_large(limit)
+    except ClientDisconnect:
+        # The client left mid-upload. Nobody reads this answer; it only keeps the
+        # abort out of the server log, where an unhandled exception is a traceback.
+        raise HTTPException(status_code=400, detail="Client disconnected during upload")
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
