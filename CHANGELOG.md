@@ -26,6 +26,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the server stops the sidecar itself. Before, the stop signal reached the
   sidecar first and the watcher could start a new one that the shutdown then
   killed. An installed unit needs the new line and a `daemon-reload`.
+- A terminal hangup (a dropped SSH session, a closed terminal pane) now runs
+  the server's orderly shutdown, which stops the sidecar. Before, the hangup
+  ended the server without its lifespan; with the sidecar in its own session
+  that would have left it running on its port. A hangup that is already
+  ignored (`nohup`) stays ignored.
 
 - The micro-turn reference client (`scripts/microturn_client.py`) sends the
   model its transcript fragments in the form the adapter was trained on. A

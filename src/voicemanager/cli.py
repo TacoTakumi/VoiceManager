@@ -40,6 +40,30 @@ def configure_logging() -> None:
     )
 
 
+def hangup_means_shutdown(shutdown=None) -> bool:
+    """Make a terminal hangup run the orderly shutdown; True when a handler went in.
+
+    uvicorn stops cleanly on SIGINT and SIGTERM but not on SIGHUP: a dropped SSH
+    session or a closed terminal pane would end the server without its lifespan.
+    The lifespan is what stops the VoXtream sidecar, which runs in a session of
+    its own so that a stop reaches the server first, and so the hangup never
+    reaches the sidecar: it would live on holding its port and the GPU. The
+    handler sends SIGTERM to this process, which uvicorn turns into the orderly
+    shutdown. A hangup that is already ignored (nohup) stays ignored.
+    """
+    import os
+    import signal
+
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_DFL:
+        return False
+    if shutdown is None:
+        def shutdown() -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGHUP, lambda signum, frame: shutdown())
+    return True
+
+
 def run_server() -> None:
     """Start the VoiceManager server with uvicorn.
 
@@ -51,6 +75,7 @@ def run_server() -> None:
     import uvicorn
 
     settings = get_settings()  # Fails fast with a clear error on bad config
+    hangup_means_shutdown()
     uvicorn.run(
         "voicemanager.app:create_app",
         host=settings.host,
