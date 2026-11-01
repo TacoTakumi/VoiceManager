@@ -21,6 +21,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   VoXtream sidecar is dead or loading again, and 200 `ok` once it is ready. The
   body keeps its shape; the STT and VAD slots are unchanged. This is why the
   version is a minor bump: a documented REST endpoint has a new answer.
+- The VoXtream sidecar runs in its own session, and the contrib systemd units
+  set `KillMode=mixed`, so a service stop or a Ctrl-C signals the server only
+  and the server stops the sidecar itself. Before, the stop signal reached the
+  sidecar first and the watcher could start a new one that the shutdown then
+  killed. An installed unit needs the new line and a `daemon-reload`.
 
 - The micro-turn reference client (`scripts/microturn_client.py`) sends the
   model its transcript fragments in the form the adapter was trained on. A

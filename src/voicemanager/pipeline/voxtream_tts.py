@@ -145,7 +145,10 @@ class VoxtreamSidecar:
         cmd = self.command()
         logger.info("Starting VoXtream sidecar: %s", " ".join(cmd))
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+            # Its own session: a service stop or a Ctrl-C signals the server's process
+            # group, and the sidecar must not die ahead of the lifespan, which stops
+            # it itself (otherwise the watcher starts one the shutdown then kills).
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True)
         except OSError as exc:
             raise VoxtreamStartupError(
                 f"{PY_SETTING}={self.python} could not be started: {exc}") from exc

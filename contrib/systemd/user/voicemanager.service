@@ -30,6 +30,9 @@ ExecStart=%h/VoiceManager/venv/bin/voicemanager serve
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
+# Stop signals the server only: it stops its own child processes (the VoXtream
+# sidecar) during shutdown. Anything still left at TimeoutStopSec is killed.
+KillMode=mixed
 
 [Install]
 WantedBy=default.target

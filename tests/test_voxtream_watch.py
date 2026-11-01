@@ -8,8 +8,10 @@ process from tests/voxtream_fake_sidecar.py, started with the test interpreter.
 """
 import asyncio
 import inspect
+import os
 import socket
 import time
+from pathlib import Path
 
 import pytest
 
@@ -181,3 +183,25 @@ def test_disposed_engine_refuses_to_start_again(fake_sidecar):
     with pytest.raises(voxtream_tts.VoxtreamStartupError, match="closing"):
         engine.sidecar.start()
     assert not engine.ready
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_the_sidecar_runs_in_its_own_session(fake_sidecar):
+    # A service stop or a Ctrl-C signals the server's process group; the sidecar
+    # must not be in it, or it dies ahead of the lifespan and the watcher starts a
+    # new one that the shutdown then has to kill.
+    result, engine = _load()
+    try:
+        pid = engine.sidecar.process.pid
+        assert os.getsid(pid) == pid
+        assert os.getsid(pid) != os.getsid(os.getpid())
+    finally:
+        _release(result, engine)
+
+
+def test_the_systemd_units_use_killmode_mixed_so_the_server_stops_the_sidecar():
+    for unit in ("system", "user"):
+        text = (REPO_ROOT / "contrib" / "systemd" / unit / "voicemanager.service").read_text()
+        assert "KillMode=mixed" in text, unit
