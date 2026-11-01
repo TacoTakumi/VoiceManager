@@ -173,7 +173,8 @@ class TickSlicer:
         self._marked.add(seg)
         if words[-1][-1] in END_MARKS:
             return ""
-        first = re.sub(r"\W", "", words[0]).lower()
+        # The word before any apostrophe, so "what's" and "who's" count as questions.
+        first = re.split(r"['\u2019]", re.sub(r"[^\w'\u2019]", "", words[0]).lower())[0]
         return "?" if first in QUESTION_WORDS else "."
 
     @staticmethod

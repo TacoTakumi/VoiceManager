@@ -278,3 +278,18 @@ def test_slicer_completes_after_a_revision_of_earlier_words():
     s.feed(frame("hey I am cleaning the random"))
     assert s.tick() == "ndom"
     assert s.revisions == 1
+
+
+def test_slicer_contracted_question_word_gets_a_question_mark():
+    for text in ("what's the time", "who's there", "how's it going",
+                 "what’s the time"):
+        s = mc.TickSlicer()
+        s.feed(frame(text))
+        assert s.tick() == text
+        s.feed(frame(text, final=True))
+        assert s.tick() == "?", text
+    s = mc.TickSlicer()
+    s.feed(frame("i'm cleaning the bathroom"))
+    assert s.tick() == "i'm cleaning the bathroom"
+    s.feed(frame("i'm cleaning the bathroom", final=True))
+    assert s.tick() == "."
