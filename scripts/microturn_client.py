@@ -86,6 +86,12 @@ class TickSlicer:
     Sent words are never taken back, because the model's history only grows. When the
     STT revises words already sent (or shrinks the text), the tick counts one revision
     for that segment and sends only the words past the already-sent count.
+
+    One kind of change is not a revision: the last word sent grows into a longer word
+    that starts with it ("ra" to "random", or "honey" to "honey?"). The STT cut the
+    word at the tick boundary, or added a mark late. The adapter was trained on
+    fragments where the next fragment starts with the missing letters, so the tick
+    sends the extra characters first, then any new words.
     """
 
     def __init__(self) -> None:
@@ -110,7 +116,9 @@ class TickSlicer:
             words = self._latest[seg].split()
             sent = self._sent.get(seg, [])
             n = self._count.get(seg, 0)
-            if len(words) < len(sent) or words[:len(sent)] != sent:
+            if self._completes_last_sent(sent, words):
+                emitted.append(words[len(sent) - 1][len(sent[-1]):])
+            elif len(words) < len(sent) or words[:len(sent)] != sent:
                 self.revisions += 1
                 self.last_revised = True
                 logger.debug("segment %d revised: sent=%r now=%r", seg, sent, words)
@@ -120,6 +128,16 @@ class TickSlicer:
             self._sent[seg] = words[:self._count.get(seg, 0)]
         self._latest.clear()
         return " ".join(emitted) if emitted else NOVOICE
+
+    @staticmethod
+    def _completes_last_sent(sent: list[str], words: list[str]) -> bool:
+        """True when the only change to the sent words is that the last one grew."""
+        if not sent or len(words) < len(sent):
+            return False
+        if words[:len(sent) - 1] != sent[:-1]:
+            return False
+        now = words[len(sent) - 1]
+        return len(now) > len(sent[-1]) and now.startswith(sent[-1])
 
 
 def build_prompt(history: list[tuple[str, str]], heard: str) -> str:

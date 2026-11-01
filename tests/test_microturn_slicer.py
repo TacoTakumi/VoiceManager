@@ -142,3 +142,39 @@ def test_slicer_changed_shrink_then_growth_counts_one_revision():
     s.feed(frame("hey I am cleaning the bathroom"))
     assert s.tick() == "the bathroom"
     assert s.revisions == 1
+
+
+def test_slicer_completes_a_cut_word_before_new_words():
+    s = mc.TickSlicer()
+    s.feed(frame("tell me a ra"))
+    assert s.tick() == "tell me a ra"
+    # The STT finishes the word it cut at the tick boundary: the missing letters
+    # lead the next fragment, as in the training data, and nothing is re-sent.
+    s.feed(frame("tell me a random fact"))
+    assert s.tick() == "ndom fact"
+    assert s.revisions == 0
+    assert s.last_revised is False
+    s.feed(frame("tell me a random fact"))
+    assert s.tick() == NOVOICE
+
+
+def test_slicer_completes_a_cut_word_alone():
+    s = mc.TickSlicer()
+    s.feed(frame("tell me a ra"))
+    assert s.tick() == "tell me a ra"
+    s.feed(frame("tell me a random"))
+    assert s.tick() == "ndom"
+    assert s.revisions == 0
+    assert s.last_revised is False
+    s.feed(frame("tell me a random fact"))
+    assert s.tick() == "fact"
+
+
+def test_slicer_sends_a_late_mark_as_a_completion():
+    s = mc.TickSlicer()
+    s.feed(frame("a fact about honey"))
+    assert s.tick() == "a fact about honey"
+    s.feed(frame("a fact about honey?"))
+    assert s.tick() == "?"
+    assert s.revisions == 0
+    assert s.last_revised is False
