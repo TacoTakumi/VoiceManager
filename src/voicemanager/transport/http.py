@@ -4,6 +4,7 @@ import functools
 import os
 import tempfile
 from fastapi import APIRouter, Depends, Request, HTTPException, Query
+from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 from starlette.requests import ClientDisconnect
 from voicemanager.auth.deps import require_token
@@ -65,6 +66,12 @@ async def health(request: Request):
 
     Reports actual model load state from app.state.
     Reflects active STT engine (whisper or qwen).
+
+    An engine with a ``ready`` flag (voxtream: its sidecar process) is reported
+    as loaded only while the flag is true. While it is false the answer is 503
+    with status "degraded" and that slot null, so a monitor that reads the
+    status code and a reader of the body both see TTS is out, and the body
+    keeps its shape.
     """
     settings = get_settings()
     stt_engine_type = getattr(request.app.state, "stt_engine_type", settings.stt_engine)
@@ -74,8 +81,10 @@ async def health(request: Request):
     audiocpp = getattr(request.app.state, "audiocpp_config", None)
     vad = getattr(request.app.state, "vad_model", None)
     tts_engine = getattr(request.app.state, "tts_engine", None)
-    return {
-        "status": "ok",
+    tts_ready = tts_engine is not None and bool(getattr(tts_engine, "ready", True))
+    degraded = tts_engine is not None and not tts_ready
+    body = {
+        "status": "degraded" if degraded else "ok",
         "models": {
             # audiocpp reports the model_task: the family label analog of
             # "nemotron-streaming"/"qwen3-asr" — which family is serving depends on
@@ -86,9 +95,12 @@ async def health(request: Request):
                    else "faster-whisper" if whisper is not None
                    else None,
             "vad": "silero-vad" if vad is not None else None,
-            "tts": _tts_model_name(request) if tts_engine is not None else None,
+            "tts": _tts_model_name(request) if tts_ready else None,
         },
     }
+    if degraded:
+        return JSONResponse(body, status_code=503)
+    return body
 
 
 @http_router.get("/info")
