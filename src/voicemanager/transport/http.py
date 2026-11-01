@@ -3,7 +3,8 @@ import asyncio
 import functools
 import os
 import tempfile
-from fastapi import APIRouter, Depends, Request, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, Depends, Request, HTTPException, Query
+from starlette.datastructures import UploadFile
 from voicemanager.auth.deps import require_token
 from voicemanager.auth.store import Token
 from voicemanager.config import get_settings
@@ -152,7 +153,6 @@ async def info(request: Request, token: Token = Depends(require_token)):
 @http_router.post("/voice/upload")
 async def upload_voice(
     request: Request,
-    file: UploadFile = File(...),
     session_id: str = Query(default=""),
     token: Token = Depends(require_token),
 ):
@@ -163,6 +163,10 @@ async def upload_voice(
     Returns 404 if session_id is not found in the registry, or belongs to
     another user: that answer is the same as for an unknown id, so it does not
     reveal that the session exists.
+
+    The multipart body is not a parameter: FastAPI reads a declared file before
+    it runs any dependency, so the whole upload would be spooled to disk before
+    the 401, 400 or 404. The handler reads the form itself, after every check.
     """
     # Voice cloning not supported with VibeVoice engine
     tts_engine_type = getattr(request.app.state, "tts_engine_type", "openvoice")
@@ -202,11 +206,16 @@ async def upload_voice(
     if tts_engine is None:
         raise HTTPException(status_code=503, detail="TTS engine not loaded")
 
-    content = await file.read()
+    async with request.form() as form:
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            raise HTTPException(status_code=400, detail="Missing file field")
+        content = await upload.read()
+        filename = upload.filename
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    suffix = os.path.splitext(filename or "audio.wav")[1] or ".wav"
 
     # se_extractor.get_se() requires a file path (pydub needs disk access for VAD splitting)
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
