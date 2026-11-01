@@ -179,16 +179,19 @@ class TickSlicer:
 
     @staticmethod
     def _completes_last_shown(shown: list[str], sent: list[str], words: list[str]) -> bool:
-        """True when the only change to the sent words is that the last one the model
-        received grew. The words before it are compared with their latest version, so
-        an earlier revision does not block a completion; a shrink that is still
-        outstanding (fewer latest words than sent) does.
+        """True when the last word the model received grew and the words before it
+        are unchanged. Unchanged means equal to what the model received, or to their
+        latest version: a shrink that dropped words, or an earlier revision, does not
+        block a completion. A change to the last word that is not an extension of
+        what the model received is a revision, never a completion.
         """
-        if not shown or len(sent) != len(shown) or len(words) < len(shown):
+        k = len(shown)
+        if not shown or len(words) < k:
             return False
-        if words[:len(shown) - 1] != sent[:-1]:
+        before = words[:k - 1]
+        if before != shown[:-1] and before != sent[:k - 1]:
             return False
-        now = words[len(shown) - 1]
+        now = words[k - 1]
         return len(now) > len(shown[-1]) and now.startswith(shown[-1])
 
 

@@ -293,3 +293,25 @@ def test_slicer_contracted_question_word_gets_a_question_mark():
     assert s.tick() == "i'm cleaning the bathroom"
     s.feed(frame("i'm cleaning the bathroom", final=True))
     assert s.tick() == "."
+
+
+def test_slicer_completes_after_a_shrink_that_dropped_whole_words():
+    s = mc.TickSlicer()
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == "hey I am cleaning the"
+    s.feed(frame("hey I a"))
+    assert s.tick() == NOVOICE
+    # The regrowth extends the last word the model received: the extra letter
+    # is a completion, then the new word follows.
+    s.feed(frame("hey I am cleaning then bathroom"))
+    assert s.tick() == "n bathroom"
+
+
+def test_slicer_completes_after_a_shrink_to_nothing():
+    s = mc.TickSlicer()
+    s.feed(frame("ra"))
+    assert s.tick() == "ra"
+    s.feed(frame(""))
+    assert s.tick() == NOVOICE
+    s.feed(frame("random"))
+    assert s.tick() == "ndom"
