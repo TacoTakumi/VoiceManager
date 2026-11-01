@@ -1371,12 +1371,19 @@ Header: `Authorization: Bearer <token>`. Query parameter: `session_id` (the
 session to bind the clone to; it must belong to the token's user). Body:
 multipart form with a `file` field containing the WAV sample.
 
+The server checks the token, the engine and the session before it reads the
+body, so a `401`, the engine `400` or a `404` costs it nothing and arrives
+before the upload is sent (a client that sends `Expect: 100-continue`, as curl
+does for a large file, never sends the body at all). The body is capped by the
+server's `VM_UPLOAD_MAX_BYTES` setting (default 20 MiB, 20971520 bytes).
+
 | Status | When |
 |---|---|
 | `200` | Success - body `{"status": "voice profile updated"}`. |
-| `400` | The server runs VibeVoice, audiocpp or voxtream (cloning unsupported - presets only), or the sample is empty or too short. |
-| `401` | No `Authorization: Bearer` header, or the token is unknown or revoked. |
-| `404` | `session_id` is not a live session of the token's user (an unknown id and another user's session answer the same). |
+| `400` | The server runs VibeVoice, audiocpp or voxtream (cloning unsupported - presets only), the form has no `file` field, or the sample is empty or too short. |
+| `401` | No `Authorization: Bearer` header, or the token is unknown or revoked. Sent before the body is read. |
+| `404` | `session_id` is not a live session of the token's user (an unknown id and another user's session answer the same). Sent before the body is read. |
+| `413` | The body is larger than `VM_UPLOAD_MAX_BYTES`: on the `Content-Length` before any of it is read, or at the cap while a chunked body streams in. The detail names the limit. The client reads the `413` normally; the connection is not reset. |
 | `503` | The session registry or TTS engine is unavailable. |
 
 ## Gotchas

@@ -29,6 +29,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   words the model received counts no second revision, however many ticks it
   takes or where its frames cut a word, so the tick log's `revised` and
   `revisions` fields no longer overcount a mid-word shrink.
+- `POST /voice/upload` checks the bearer token, the engine and the session
+  before it reads the multipart body. FastAPI read the declared file parameter
+  before any dependency ran, so an unauthenticated client could push an
+  arbitrarily large upload that was spooled to disk before the 401. The body is
+  now capped by a new `VM_UPLOAD_MAX_BYTES` setting (default 20 MiB): a
+  `Content-Length` above it answers 413 before any read, and a chunked body is
+  cut off at the cap with 413. A form without a `file` field answers 400
+  instead of 422. The accepted path is unchanged.
 
 ## [0.3.0]
 
