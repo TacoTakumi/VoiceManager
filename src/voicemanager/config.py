@@ -137,6 +137,8 @@ class Settings(BaseSettings):
     tts_speed: float = Field(default=1.0)        # VM_TTS_SPEED
     session_timeout: int = Field(default=300)    # VM_SESSION_TIMEOUT (seconds)
     tts_stream_flush_timeout: int = Field(default=10)  # VM_TTS_STREAM_FLUSH_TIMEOUT (seconds)
+    # Largest request body POST /voice/upload accepts; 413 above it, before the body is read.
+    upload_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)  # VM_UPLOAD_MAX_BYTES
     stt_engine: str = Field(default="audiocpp")             # VM_STT_ENGINE: whisper|qwen|nemotron|audiocpp
     qwen_model: str = Field(default="Qwen/Qwen3-ASR-0.6B") # VM_QWEN_MODEL
     qwen_gpu_memory_utilization: float = Field(default=0.5) # VM_QWEN_GPU_MEMORY_UTILIZATION
