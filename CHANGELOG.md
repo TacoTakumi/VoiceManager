@@ -4,6 +4,22 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1]
+
+### Changed
+
+- The micro-turn reference client (`scripts/microturn_client.py`) sends the
+  model its transcript fragments in the form the adapter was trained on. A
+  word the STT cut at a tick boundary is completed by the next fragment, which
+  starts with the missing letters ("tell me a ra", then "ndom fact"), and a
+  mark the STT adds late to a sent word is sent the same way. When a
+  segment's final arrives without an end mark, the client sends one: "?" for a
+  segment that opens with a question word, otherwise ".", on the last word
+  sent for that segment in the tick or alone, once per segment. In a text
+  replay of seven live runs this form raised the answered requests from 6 of
+  38 to 18 of 38. The server, the protocol and the classic voice agent are
+  unchanged.
+
 ## [0.3.0]
 
 ### Added
