@@ -53,9 +53,10 @@ def test_slicer_revision_does_not_resend():
     assert s.tick() == "the bathroom"
     assert s.revisions == 1
     assert s.last_revised is True
-    # The same text again is neither new words nor a second revision.
+    # The same text again is neither new words nor a second revision; the final
+    # ends the utterance, so the tick sends the late end mark alone.
     s.feed(frame("hey I am cleaning the bathroom", final=True))
-    assert s.tick() == NOVOICE
+    assert s.tick() == "."
     assert s.revisions == 1
     assert s.last_revised is False
 
@@ -66,9 +67,10 @@ def test_slicer_new_segment_starts_from_zero():
     assert s.tick() == "hey i'm cleaning"
     s.feed(frame("hey i'm cleaning the bathroom", final=True))
     s.feed(frame("right now", segment=1))
-    assert s.tick() == "the bathroom right now"
+    # The end mark of the finished segment comes before the words of the next one.
+    assert s.tick() == "the bathroom. right now"
     s.feed(frame("right now with bleach", segment=1, final=True))
-    assert s.tick() == "with bleach"
+    assert s.tick() == "with bleach."
     # A segment that is new in the tick is emitted whole, even if it repeats words.
     s.feed(frame("right", segment=2))
     assert s.tick() == "right"
@@ -113,10 +115,10 @@ def test_slicer_scripted_call_sequence():
         NOVOICE,
         "the",
         "bathroom",
-        "right",
+        ". right",
         "now",
         NOVOICE,
-        NOVOICE,
+        ".",
     ]
     assert s.revisions == 1
 
@@ -178,3 +180,52 @@ def test_slicer_sends_a_late_mark_as_a_completion():
     assert s.tick() == "?"
     assert s.revisions == 0
     assert s.last_revised is False
+
+
+def test_slicer_final_without_mark_sends_a_full_stop_alone():
+    s = mc.TickSlicer()
+    s.feed(frame("tell me a fact about honey"))
+    assert s.tick() == "tell me a fact about honey"
+    s.feed(frame("tell me a fact about honey", final=True))
+    assert s.tick() == "."
+    assert s.revisions == 0
+    assert s.last_revised is False
+
+
+def test_slicer_final_of_a_question_sends_a_question_mark():
+    s = mc.TickSlicer()
+    s.feed(frame("could you tell me a fact"))
+    assert s.tick() == "could you tell me a fact"
+    s.feed(frame("could you tell me a fact", final=True))
+    assert s.tick() == "?"
+
+
+def test_slicer_final_with_new_words_marks_the_last_word():
+    s = mc.TickSlicer()
+    s.feed(frame("tell me a fact about"))
+    assert s.tick() == "tell me a fact about"
+    s.feed(frame("tell me a fact about honey", final=True))
+    assert s.tick() == "honey."
+    # A segment gets one mark: the same final again sends nothing.
+    s.feed(frame("tell me a fact about honey", final=True))
+    assert s.tick() == NOVOICE
+
+
+def test_slicer_final_that_ends_in_a_mark_gets_no_second_mark():
+    s = mc.TickSlicer()
+    s.feed(frame("a fact about honey"))
+    assert s.tick() == "a fact about honey"
+    s.feed(frame("a fact about honey?", final=True))
+    assert s.tick() == "?"
+    s.feed(frame("a fact about honey?", final=True))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 0
+
+
+def test_slicer_empty_final_sends_nothing():
+    s = mc.TickSlicer()
+    s.feed(frame("", final=True))
+    assert s.tick() == NOVOICE
+    s.feed(frame("", segment=1, final=True))
+    s.feed(frame("hey", segment=2))
+    assert s.tick() == "hey"

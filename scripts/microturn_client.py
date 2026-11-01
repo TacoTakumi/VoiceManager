@@ -74,6 +74,14 @@ DEMO = [
 ]
 
 
+END_MARKS = ".?!"
+# Opening words of the training user turns that end in "?" rather than ".".
+QUESTION_WORDS = frozenset({
+    "could", "can", "do", "does", "what", "how", "which", "are", "is", "would",
+    "will", "why", "where", "who", "when",
+})
+
+
 class TickSlicer:
     """Turns VoiceManager's streaming transcription frames into one string per tick.
 
@@ -92,6 +100,14 @@ class TickSlicer:
     word at the tick boundary, or added a mark late. The adapter was trained on
     fragments where the next fragment starts with the missing letters, so the tick
     sends the extra characters first, then any new words.
+
+    The streaming STT puts no end mark on a finished utterance, and nearly every
+    answer in the training data follows a fragment that ends in "?" or ".". So when a
+    segment's final arrives and its text does not end in a mark, the tick sends one:
+    "?" when the segment opens with a question word, otherwise ".". It goes on the
+    last word sent for that segment in the tick, or alone when there is none, and a
+    segment gets it once. The mark of a finished segment comes before the words of a
+    later segment in the same tick.
     """
 
     def __init__(self) -> None:
@@ -103,16 +119,23 @@ class TickSlicer:
         # change is not counted again on later frames that repeat or extend it.
         self._count: dict[int, int] = {}
         self._sent: dict[int, list[str]] = {}
+        # Per segment: whether its latest frame is a final, and which segments
+        # already got their end mark.
+        self._final: dict[int, bool] = {}
+        self._marked: set[int] = set()
 
     def feed(self, frame: dict) -> None:
         """Store one transcription frame; only the latest per segment counts per tick."""
-        self._latest[frame.get("segment_index", 0)] = frame.get("text", "")
+        seg = frame.get("segment_index", 0)
+        self._latest[seg] = frame.get("text", "")
+        self._final[seg] = bool(frame.get("is_final", False))
 
     def tick(self) -> str:
         """Return the new words heard since the last tick, or ``NOVOICE``, and reset."""
         emitted: list[str] = []
         self.last_revised = False
         for seg in sorted(self._latest):
+            start = len(emitted)
             words = self._latest[seg].split()
             sent = self._sent.get(seg, [])
             n = self._count.get(seg, 0)
@@ -126,8 +149,25 @@ class TickSlicer:
                 emitted.extend(words[n:])
                 self._count[seg] = len(words)
             self._sent[seg] = words[:self._count.get(seg, 0)]
+            mark = self._end_mark(seg, words)
+            if mark:
+                if len(emitted) > start:
+                    emitted[-1] += mark
+                else:
+                    emitted.append(mark)
         self._latest.clear()
+        self._final.clear()
         return " ".join(emitted) if emitted else NOVOICE
+
+    def _end_mark(self, seg: int, words: list[str]) -> str:
+        """The late end mark for a segment whose final just arrived, or an empty string."""
+        if not self._final.get(seg) or seg in self._marked or not words:
+            return ""
+        self._marked.add(seg)
+        if words[-1][-1] in END_MARKS:
+            return ""
+        first = re.sub(r"\W", "", words[0]).lower()
+        return "?" if first in QUESTION_WORDS else "."
 
     @staticmethod
     def _completes_last_sent(sent: list[str], words: list[str]) -> bool:
