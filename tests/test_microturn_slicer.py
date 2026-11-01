@@ -229,3 +229,52 @@ def test_slicer_empty_final_sends_nothing():
     s.feed(frame("", segment=1, final=True))
     s.feed(frame("hey", segment=2))
     assert s.tick() == "hey"
+
+
+def test_slicer_shrink_inside_a_sent_word_then_regrowth_resends_nothing():
+    s = mc.TickSlicer()
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == "hey I am cleaning the"
+    # The shrink ends inside a word the model received whole; regrowth to the
+    # same words must not send the rest of that word again.
+    s.feed(frame("hey I am cle"))
+    assert s.tick() == NOVOICE
+    s.feed(frame("hey I am cleaning the bathroom"))
+    assert s.tick() == "bathroom"
+
+
+def test_slicer_shrink_to_a_shorter_prefix_then_regrowth_resends_nothing():
+    s = mc.TickSlicer()
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == "hey I am cleaning the"
+    s.feed(frame("hey I a"))
+    assert s.tick() == NOVOICE
+    s.feed(frame("hey I am cleaning the bathroom"))
+    assert s.tick() == "bathroom"
+
+
+def test_slicer_revised_last_word_is_not_completed():
+    s = mc.TickSlicer()
+    s.feed(frame("hey I am cleaning the"))
+    assert s.tick() == "hey I am cleaning the"
+    s.feed(frame("hey I am cleaning tha"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 1
+    # "that" extends the revised word, not the word the model received: it is
+    # another revision of a sent word, and nothing is sent.
+    s.feed(frame("hey I am cleaning that"))
+    assert s.tick() == NOVOICE
+    assert s.revisions == 2
+
+
+def test_slicer_completes_after_a_revision_of_earlier_words():
+    s = mc.TickSlicer()
+    s.feed(frame("hey i'm cleaning the"))
+    assert s.tick() == "hey i'm cleaning the"
+    # Six words against four sent: a revision of the sent ones, two new words.
+    s.feed(frame("hey I am cleaning the ra"))
+    assert s.tick() == "the ra"
+    assert s.revisions == 1
+    s.feed(frame("hey I am cleaning the random"))
+    assert s.tick() == "ndom"
+    assert s.revisions == 1

@@ -119,6 +119,10 @@ class TickSlicer:
         # change is not counted again on later frames that repeat or extend it.
         self._count: dict[int, int] = {}
         self._sent: dict[int, list[str]] = {}
+        # Per segment: the words as the model received them, completions included.
+        # A completion extends the last of these, never the latest version, so a
+        # shrink into a sent word followed by regrowth sends nothing twice.
+        self._shown: dict[int, list[str]] = {}
         # Per segment: whether its latest frame is a final, and which segments
         # already got their end mark.
         self._final: dict[int, bool] = {}
@@ -139,14 +143,17 @@ class TickSlicer:
             words = self._latest[seg].split()
             sent = self._sent.get(seg, [])
             n = self._count.get(seg, 0)
-            if self._completes_last_sent(sent, words):
-                emitted.append(words[len(sent) - 1][len(sent[-1]):])
+            shown = self._shown.get(seg, [])
+            if self._completes_last_shown(shown, sent, words):
+                emitted.append(words[n - 1][len(shown[-1]):])
+                shown[-1] = words[n - 1]
             elif len(words) < len(sent) or words[:len(sent)] != sent:
                 self.revisions += 1
                 self.last_revised = True
                 logger.debug("segment %d revised: sent=%r now=%r", seg, sent, words)
             if len(words) > n:
                 emitted.extend(words[n:])
+                self._shown[seg] = shown + words[n:]
                 self._count[seg] = len(words)
             self._sent[seg] = words[:self._count.get(seg, 0)]
             mark = self._end_mark(seg, words)
@@ -170,14 +177,18 @@ class TickSlicer:
         return "?" if first in QUESTION_WORDS else "."
 
     @staticmethod
-    def _completes_last_sent(sent: list[str], words: list[str]) -> bool:
-        """True when the only change to the sent words is that the last one grew."""
-        if not sent or len(words) < len(sent):
+    def _completes_last_shown(shown: list[str], sent: list[str], words: list[str]) -> bool:
+        """True when the only change to the sent words is that the last one the model
+        received grew. The words before it are compared with their latest version, so
+        an earlier revision does not block a completion; a shrink that is still
+        outstanding (fewer latest words than sent) does.
+        """
+        if not shown or len(sent) != len(shown) or len(words) < len(shown):
             return False
-        if words[:len(sent) - 1] != sent[:-1]:
+        if words[:len(shown) - 1] != sent[:-1]:
             return False
-        now = words[len(sent) - 1]
-        return len(now) > len(sent[-1]) and now.startswith(sent[-1])
+        now = words[len(shown) - 1]
+        return len(now) > len(shown[-1]) and now.startswith(shown[-1])
 
 
 def build_prompt(history: list[tuple[str, str]], heard: str) -> str:
