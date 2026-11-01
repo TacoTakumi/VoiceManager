@@ -42,6 +42,10 @@ PORT_SETTING = "VM_VOXTREAM_PORT"
 VOICE_SETTING = "VM_VOXTREAM_VOICE"
 _STOP_GRACE_S = 5.0
 _HEALTH_POLL_S = 0.1
+# The watcher: how often it reads the sidecar's exit status, and how long it waits
+# after a failed start before trying again.
+_WATCH_POLL_S = 2.0
+_WATCH_RETRY_S = 5.0
 
 
 class VoxtreamStartupError(RuntimeError):
@@ -65,6 +69,9 @@ class VoxtreamSidecar:
         self.server_script = Path(server_script) if server_script else Path(SERVER_SCRIPT)
         self.extra_args = list(extra_args or [])
         self.process: subprocess.Popen | None = None
+        # Set once the spawned process answered /health; cleared on every spawn and
+        # stop, so ``ready`` is false while a start is still waiting.
+        self._answered_health = False
 
     @staticmethod
     def device_argument(resolved_device: str, visible: str | None = None) -> str | None:
@@ -117,8 +124,9 @@ class VoxtreamSidecar:
                 f"{PY_SETTING}={self.python} is not a file; it must be the python of "
                 "the VoXtream virtual environment (see the README section on the "
                 "voxtream engine)")
-        if self.process is not None and self.process.poll() is None:
+        if self.alive:
             return
+        self._answered_health = False
         if self._port_in_use():
             # A stranger on the port (an orphaned sidecar from a killed server, another
             # service) would answer /health and be taken for the child we never
@@ -142,6 +150,7 @@ class VoxtreamSidecar:
                     f"the VoXtream sidecar exited with code {code} during startup "
                     f"({PY_SETTING}={self.python}); its log says why")
             if self.is_ready():
+                self._answered_health = True
                 logger.info("VoXtream sidecar ready at %s", self.url)
                 return
             if time.monotonic() >= deadline:
@@ -169,6 +178,7 @@ class VoxtreamSidecar:
     def stop(self) -> None:
         """Terminate the process, then kill it if it ignores the request."""
         proc = self.process
+        self._answered_health = False
         if proc is None:
             return
         self.process = None
@@ -184,7 +194,13 @@ class VoxtreamSidecar:
 
     @property
     def alive(self) -> bool:
+        """The process runs (its exit status is not set); no request is made."""
         return self.process is not None and self.process.poll() is None
+
+    @property
+    def ready(self) -> bool:
+        """The process runs and has answered /health since it was spawned."""
+        return self._answered_health and self.alive
 
 
 class VoxtreamTTSEngine(TTSEngine):
@@ -221,6 +237,40 @@ class VoxtreamTTSEngine(TTSEngine):
                 f"{voices_path}; valid presets: {', '.join(sorted(self._presets))}")
         if start_sidecar:
             self._sidecar.start()
+
+    @property
+    def ready(self) -> bool:
+        """False while the sidecar is dead or a start is still waiting for it."""
+        return self._sidecar.ready
+
+    async def watch(self, poll_interval: float = _WATCH_POLL_S,
+                    retry_delay: float = _WATCH_RETRY_S) -> None:
+        """Start the sidecar again whenever it dies; runs until cancelled.
+
+        The sidecar is one shared child process, so without this a crash leaves
+        every TTS request failing until a person restarts the server. A dead
+        sidecar is started through the same path as at startup (the ready wait and
+        the port-in-use refusal apply), in a worker thread so the event loop keeps
+        serving. A start that fails is logged and tried again after ``retry_delay``;
+        nothing raises out of here.
+        """
+        while True:
+            if self._sidecar.alive:
+                await asyncio.sleep(poll_interval)
+                continue
+            proc = self._sidecar.process
+            code = proc.poll() if proc is not None else None
+            logger.warning("VoXtream sidecar is gone (exit code %s); starting it again", code)
+            try:
+                await asyncio.to_thread(self._sidecar.start)
+            except VoxtreamStartupError as exc:
+                logger.error("VoXtream sidecar restart failed: %s; next try in %g s",
+                             exc, retry_delay)
+                await asyncio.sleep(retry_delay)
+            except Exception:
+                logger.exception("VoXtream sidecar restart failed; next try in %g s",
+                                 retry_delay)
+                await asyncio.sleep(retry_delay)
 
     @property
     def sample_rate(self) -> int:
