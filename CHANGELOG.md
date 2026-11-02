@@ -4,6 +4,48 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+A sweep of the small corrections that earlier review rounds left open.
+
+### Fixed
+
+- `cancel_tts` and `flush_tts` on the Python client raise `TTSError` and
+  reconnect on a lost connection, as `send` and `done` already did; before,
+  the websockets `ConnectionClosed` leaked out to the caller.
+- A VoXtream generation reports `audio_end` reason `complete` only when the
+  sidecar sent its `eos` frame; a connection the sidecar closed cleanly without
+  one is reason `error`.
+- The `tts_stream` idle flush is re-armed only by a frame of the open request;
+  a late frame for a cancelled or superseded request no longer moves it.
+- The VoXtream watcher logs the "sidecar is gone" line once per death; a
+  retry after a failed restart logs the restart error alone.
+- `POST /voice/upload` accepts only plain ASCII digits in `Content-Length`, and
+  its OpenAPI entry carries the multipart request body again (it was lost when
+  the handler started reading the body itself).
+- The `Authorization` scheme is matched case-insensitively (`bearer` works, as
+  RFC 7235 requires); the secret keeps its case. A new auth store file is
+  created 0600 in a 0700 directory. Token names are stored stripped whether
+  they come from the CLI or the web form.
+- The reference voice agent records an `audio_end` with reason `error` as an
+  error, and the micro-turn client's TTS sink forgets a request at its
+  `audio_end` instead of keeping an entry for the life of the call.
+- The audiocpp TTS evidence script takes the sample rate from `audio_start`,
+  so a 24 kHz engine's long-form WAV, duration and RTF are labelled right.
+
+### Changed
+
+- Every Python file in the package is ASCII: em dashes became ` - `, and the
+  sentence splitter writes its CJK and quote characters as escapes. A test
+  keeps non-ASCII bytes out of the package. The voice upload "too short"
+  message lost its em dash too.
+- The client guide's clause-mode debug pointer quotes the current log line and
+  the first-audio line that follows it, and the classic outline says where it
+  differs from the full script (one dispatch per turn, a new turn per reply).
+- Stale comments corrected: the sidecar registry says six entries ship, a drive
+  test states its claim instead of pointing at a review round, and the Python
+  tests lose a bare marker, a narrated task list and lowercase sentence starts.
+
 ## [0.4.0]
 
 ### Added
