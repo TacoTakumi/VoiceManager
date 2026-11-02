@@ -288,8 +288,11 @@ class VoxtreamTTSEngine(TTSEngine):
                 await asyncio.sleep(poll_interval)
                 continue
             proc = self._sidecar.process
-            code = proc.poll() if proc is not None else None
-            logger.warning("VoXtream sidecar is gone (exit code %s); starting it again", code)
+            if proc is not None:
+                # A process was seen and has exited. After a failed restart there is
+                # no process; the restart error below is the whole story then.
+                logger.warning("VoXtream sidecar is gone (exit code %s); starting it again",
+                               proc.poll())
             try:
                 await asyncio.to_thread(self._sidecar.start)
             except VoxtreamStartupError as exc:
@@ -383,6 +386,9 @@ class VoxtreamGeneration:
         self.preset = preset
         self.sample_rate = SAMPLE_RATE
         self._ws = None
+        # Set on the sidecar's eos frame only. frames() also returns on a clean
+        # close without eos, and that is not a complete generation.
+        self.eos_received = False
 
     async def start(self) -> None:
         self._ws = await websockets.asyncio.client.connect(self.url, max_size=None)
@@ -417,6 +423,7 @@ class VoxtreamGeneration:
                 payload = json.loads(message)
                 kind = payload.get("type")
                 if kind == "eos":
+                    self.eos_received = True
                     return
                 if kind == "error":
                     raise VoxtreamGenerationError(payload.get("message", "generation failed"))
@@ -515,7 +522,7 @@ class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
                 await websocket.send_bytes(float32_to_pcm16(frame))
                 frames += 1
                 self._report_audio(request_id, len(frame), generation.sample_rate)
-            reached_eos = True
+            reached_eos = generation.eos_received
             if pump is not None and not pump.done():
                 # eos before the text ended: the sidecar stopped on its own
                 pump.cancel()

@@ -94,7 +94,8 @@ class FakeVoxtreamSidecar:
     def __init__(self, frames_per_chunk: int = 1, hold_eos: bool = False,
                  keep_emitting_after_eot: bool = False, init_error: str | None = None,
                  close_after_frames: int | None = None,
-                 eos_after_frames: int | None = None):
+                 eos_after_frames: int | None = None,
+                 clean_close_after_frames: int | None = None):
         self.frames_per_chunk = frames_per_chunk
         self.hold_eos = hold_eos
         self.keep_emitting_after_eot = keep_emitting_after_eot
@@ -107,6 +108,9 @@ class FakeVoxtreamSidecar:
         # Send eos after this many frames while text may still be arriving: the
         # sidecar's own stop (the maximum audio length).
         self.eos_after_frames = eos_after_frames
+        # Close the connection cleanly (code 1000) after this many frames with no
+        # eos: a sidecar that went away politely without finishing the reply.
+        self.clean_close_after_frames = clean_close_after_frames
         self.inits: list[dict] = []
         self.chunks: list[list[str]] = []  # per connection, in order
         self.eots: list[int] = []  # connection indexes that sent eot
@@ -203,6 +207,10 @@ class FakeVoxtreamSidecar:
                                 and frame_no >= self.eos_after_frames:
                             await ws.send(json.dumps({"type": "eos"}))
                             await ws.close()
+                            return
+                        if self.clean_close_after_frames is not None \
+                                and frame_no >= self.clean_close_after_frames:
+                            await ws.close()  # code 1000, no eos
                             return
                 elif payload.get("event") == "eot":
                     eot = True

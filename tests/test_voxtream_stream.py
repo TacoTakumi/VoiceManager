@@ -410,15 +410,42 @@ def test_no_sidecar_on_the_port_ends_with_reason_error():
     assert ws.texts("audio_end")[0]["reason"] == "error"
 
 
-def test_eos_from_the_sidecar_with_text_still_queued_ends_with_reason_complete():
-    fake = FakeVoxtreamSidecar(eos_after_frames=2).start()
+def test_sidecar_closing_cleanly_without_eos_ends_with_reason_error():
+    # A close with code 1000 and no eos frame is not a finished reply: only the
+    # sidecar's eos means complete.
+    fake = FakeVoxtreamSidecar(clean_close_after_frames=2).start()
     try:
         ws = _WS()
         _run_stream(_engine(fake), CHUNKS, ws)
     finally:
         fake.stop()
     assert ws.kinds() == ["audio_start", "bytes", "bytes", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
+
+
+def _run_stream_left_open(engine, chunks: list[str], ws: _WS) -> None:
+    """Feed every chunk without done, so text is still queued when the sidecar ends."""
+    async def run():
+        pipe = _pipe(engine)
+        for chunk in chunks:
+            await pipe.feed_text(chunk, False, ws, "r1")
+        await asyncio.wait_for(pipe.synthesis_task, 3.0)
+    asyncio.run(run())
+
+
+def test_eos_from_the_sidecar_with_text_still_queued_ends_with_reason_complete():
+    # No done is ever sent, so the text pump is still waiting when eos arrives: the
+    # pipeline must cancel it (the fake never sees eot) and still report complete.
+    fake = FakeVoxtreamSidecar(eos_after_frames=2).start()
+    try:
+        ws = _WS()
+        _run_stream_left_open(_engine(fake), CHUNKS, ws)
+        assert fake.wait_for(lambda: len(fake.closes) == 1)
+    finally:
+        fake.stop()
+    assert ws.kinds() == ["audio_start", "bytes", "bytes", "audio_end"]
     assert ws.texts("audio_end")[0]["reason"] == "complete"
+    assert fake.eots == [], "the pump sent eot, so it was not cancelled at eos"
 
 
 # --- init error ----------------------------------------------------------------------

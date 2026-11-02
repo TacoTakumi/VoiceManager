@@ -42,14 +42,15 @@ EXPECTED_CALL = (
 )
 
 
-def test_serve_command_runs_uvicorn_with_the_app_factory(settings_env, run_calls):
+def test_serve_command_runs_uvicorn_with_the_app_factory(settings_env, run_calls,
+                                                        restore_sighup):
     result = CliRunner().invoke(main, ["serve"])
 
     assert result.exit_code == 0, result.output
     assert run_calls == [EXPECTED_CALL]
 
 
-def test_module_entry_point_runs_the_same_serve_path(settings_env, run_calls):
+def test_module_entry_point_runs_the_same_serve_path(settings_env, run_calls, restore_sighup):
     runpy.run_module("voicemanager", run_name="__main__")
 
     assert run_calls == [EXPECTED_CALL]
@@ -145,6 +146,14 @@ def _alive(pid: int) -> bool:
 
 
 _reaped_pids: set[int] = set()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_reaped_pids():
+    """A pid the kernel reuses across tests must not read as already reaped."""
+    _reaped_pids.clear()
+    yield
+    _reaped_pids.clear()
 
 
 def _reaped(pid: int) -> bool:

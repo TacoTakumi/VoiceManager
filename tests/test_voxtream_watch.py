@@ -89,10 +89,15 @@ async def test_a_failed_restart_is_logged_and_the_retry_runs_until_it_works(fake
         def failures():
             return [r for r in caplog.records if "restart failed" in r.getMessage()]
 
-        with caplog.at_level("ERROR", logger="voicemanager.pipeline.voxtream_tts"):
+        def gone():
+            return [r for r in caplog.records if "is gone" in r.getMessage()]
+
+        with caplog.at_level("WARNING", logger="voicemanager.pipeline.voxtream_tts"):
             await _until(lambda: len(failures()) >= 2, timeout=10)  # a second try happened
-        failures = failures()
-        assert "VM_VOXTREAM_PY" in failures[0].getMessage()
+        failed = failures()
+        assert "VM_VOXTREAM_PY" in failed[0].getMessage()
+        # One death was seen; a retry after a failed start has no process to report.
+        assert len(gone()) == 1, [r.getMessage() for r in gone()]
         assert not watcher.done()
         assert not engine.ready
         fake_sidecar("ready")

@@ -203,6 +203,36 @@ def test_tts_stream_frames_keep_the_request_open(fast_flush):
             assert _audio_ends(seen, "r1")[0]["reason"] == "complete"
 
 
+def test_late_frames_for_a_cancelled_request_do_not_re_arm_the_open_one(fast_flush):
+    # r1 is opened and cancelled, r2 is opened, then tts_stream frames for r1 keep
+    # arriving every tenth of the timeout. feed_stream ignores them (r1 is
+    # cancelled), so they must not move r2's idle clock: r2 ends about one
+    # timeout after its own last frame, the open, not later.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        client = TestClient(_app(executor))
+        with authkit.ws_connect(client, "/ws/stream") as ws:
+            assert ws.receive_json()["type"] == "ready"
+            seen: list = []
+            _open_request(ws, "r1")
+            ws.send_json({"type": "tts_cancel", "request_id": "r1"})
+            _wait_for_audio_end(ws, seen, "r1", timeout=2.0)
+            opened = _open_request(ws, "r2")
+            deadline = opened + 3 * FLUSH_TIMEOUT
+            while time.monotonic() < deadline:
+                ws.send_json({"type": "tts_stream", "request_id": "r1", "text": " late"})
+                ws.send_bytes(_PCM)
+                time.sleep(FRAME_INTERVAL)
+                _drain(ws, seen)
+                if _audio_ends(seen, "r2"):
+                    break
+            ended = time.monotonic()
+            assert len(_audio_ends(seen, "r2")) == 1, f"saw {seen}"
+            elapsed = ended - opened
+            assert elapsed >= FLUSH_TIMEOUT - FRAME_INTERVAL, elapsed
+            assert elapsed <= FLUSH_TIMEOUT + FRAME_INTERVAL + SLACK, elapsed
+            assert not _closed(seen)
+
+
 def test_idle_flush_fires_after_about_one_timeout(fast_flush):
     # Only audio after the open: audio_end comes no earlier than the timeout
     # (within tolerance) and no later than the timeout plus one frame interval.

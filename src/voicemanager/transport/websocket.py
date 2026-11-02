@@ -963,12 +963,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         flush=tts_stream_msg.flush,  # speak the buffer now
                         chunking=tts_stream_msg.chunking,  # fixed at request start
                     )
-                    # Re-arm the idle flush from THIS frame (a new request starts its
-                    # own window). done=true closes the request, so nothing is armed.
-                    if tts_session.active_stream_request_id is not None:
-                        tts_stream_last_frame = time.monotonic()
-                    else:
+                    # Re-arm the idle flush from THIS frame when it belongs to the open
+                    # request (a new request starts its own window). A late frame for
+                    # a cancelled or superseded request_id is ignored by feed_stream
+                    # and must not move the clock. done=true closes the request, so
+                    # nothing is armed.
+                    if tts_session.active_stream_request_id is None:
                         tts_stream_last_frame = None
+                    elif tts_session.active_stream_request_id == tts_stream_msg.request_id:
+                        tts_stream_last_frame = time.monotonic()
 
                 elif msg_type == "tts_cancel" and tts_session is not None:
                     cancel_req = TTSCancelMessage.model_validate(parsed)
