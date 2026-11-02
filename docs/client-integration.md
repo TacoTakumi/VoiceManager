@@ -1148,6 +1148,14 @@ async with VoiceManagerClient(token=token) as client:
         await asyncio.gather(microphone_to(session.send_audio), listen(), play())
 ```
 
+The outline dispatches on every endpointed frame of the turn, so on an engine that
+sends an endpoint frame and then a confirmed final (nemotron with the endpoint
+hold) the final would dispatch a second reply for the same words, and because
+the outline never opens another turn, the `turn_id` filter drops nothing after
+the first one. The full script keeps a dispatched flag per turn and calls
+`turn_start()` again once the reply has ended; copy that, not the outline, into
+a real client.
+
 ### Voice cloning and REST
 
 | Method | Signature | Returns | Purpose |

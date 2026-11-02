@@ -863,6 +863,23 @@ class TestCancelTTS:
         # discarded, and audio_end ended the iteration.
         assert yielded == [b"\x11\x22"]
 
+    async def test_cancel_tts_raises_tts_error_on_connection_lost(self, client):
+        """A lost connection is a TTSError and a reconnect, as for send and done."""
+        import websockets.exceptions
+
+        client._ws = AsyncMock()
+        client._ws.send = AsyncMock(
+            side_effect=websockets.exceptions.ConnectionClosed(None, None))
+        reconnects = []
+
+        async def _reconnect():
+            reconnects.append(True)
+        client._reconnect = _reconnect
+
+        with pytest.raises(TTSError, match="Connection lost"):
+            await client.cancel_tts("CANCEL-RID")
+        assert reconnects == [True]
+
     def test_cancel_tts_docstring_has_no_false_synthesize_claim(self):
         """Structural: the docstring no longer claims request_id is
         'returned by synthesize_tts()' — synthesize_tts() returns (bytes, rate)."""
@@ -905,6 +922,22 @@ class TestFlushTTS:
         # No audio_start/audio_end is ever queued — if flush_tts waited on one,
         # this would time out. 50 ms is generous for a single send.
         await asyncio.wait_for(client.flush_tts(rid), timeout=0.05)
+
+    async def test_flush_tts_raises_tts_error_on_connection_lost(self, client):
+        import websockets.exceptions
+
+        client._ws = AsyncMock()
+        client._ws.send = AsyncMock(
+            side_effect=websockets.exceptions.ConnectionClosed(None, None))
+        reconnects = []
+
+        async def _reconnect():
+            reconnects.append(True)
+        client._reconnect = _reconnect
+
+        with pytest.raises(TTSError, match="Connection lost"):
+            await client.flush_tts("FLUSH-RID")
+        assert reconnects == [True]
 
     def test_flush_tts_docstring_warns_mid_sentence(self):
         """Structural: the docstring warns that flushing MID-sentence

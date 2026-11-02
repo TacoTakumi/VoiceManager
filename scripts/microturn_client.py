@@ -526,6 +526,11 @@ class SessionTTSSink:
     def is_cancelled(self, request_id: str) -> bool:
         return request_id in self._cancelled
 
+    def on_audio_end(self, request_id: str) -> None:
+        """Forget the request: its audio_end is the last frame it will ever get."""
+        self._requests.pop(request_id, None)
+        self._cancelled.discard(request_id)
+
 
 class AudioPlayer:
     """Player that plays mono int16 PCM on the default output device.
@@ -747,7 +752,8 @@ async def _stt_task(duplex, session: LiveSession) -> None:
     logger.warning("VoiceManager closed the connection")
 
 
-async def _tts_task(duplex, session: LiveSession, player: AudioPlayer) -> None:
+async def _tts_task(duplex, session: LiveSession, player: AudioPlayer,
+                    sink: SessionTTSSink | None = None) -> None:
     """Play TTS audio and time its first bytes until the connection closes."""
     async for event in duplex.audio():
         if event[0] == "pcm":
@@ -760,6 +766,8 @@ async def _tts_task(duplex, session: LiveSession, player: AudioPlayer) -> None:
             player.start(rate)
         elif event[0] == "audio_end":
             session.on_audio_end(event[1].get("request_id"))
+            if sink is not None:
+                sink.on_audio_end(event[1].get("request_id"))
 
 
 async def _errors_task(duplex) -> None:
@@ -836,7 +844,7 @@ async def live(args: argparse.Namespace) -> None:
                                       cancelled=sink.is_cancelled)
                 tasks = [asyncio.create_task(c) for c in (
                     _mic_task(duplex), _stt_task(duplex, session),
-                    _tts_task(duplex, session, player), _tick_task(session),
+                    _tts_task(duplex, session, player, sink), _tick_task(session),
                     _errors_task(duplex))]
                 try:
                     await asyncio.wait(tasks, timeout=args.duration,

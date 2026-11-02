@@ -373,6 +373,10 @@ class ClassicSession:
         if reply.ended:
             return  # a cancelled reply's ack: the turn goes on listening
         reply.ended = True
+        # The server's verdict on a reply it ended itself: complete, or error (a
+        # generation failure, an unknown voice). A cancelled reply keeps its own reason.
+        if not reply.cancelled:
+            reply.reason = frame.get("reason", "complete")
         if reply.task is not None:
             try:
                 await reply.task
@@ -395,7 +399,12 @@ class ClassicSession:
 
     def _write_utterance(self, reply: Reply) -> None:
         delay = "-" if reply.first_audio_ms is None else f"{reply.first_audio_ms:.0f} ms"
-        state = f"cancelled, {reply.reason}" if reply.cancelled else f"first audio {delay}"
+        if reply.cancelled:
+            state = f"cancelled, {reply.reason}"
+        elif reply.reason != "complete":
+            state = f"{reply.reason}, first audio {delay}"
+        else:
+            state = f"first audio {delay}"
         self.say(f"< {reply.chat.text or '(no reply)'}  [{state}]")
         self.log.write(json.dumps({
             "type": "utterance", "turn_id": reply.turn_id, "text": reply.text,

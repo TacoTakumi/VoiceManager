@@ -88,11 +88,16 @@ async def recv(ws, timeout=180.0):
 
 
 async def run_request(ws, request_id, text):
-    """Send one tts request; return (first_audio_s, total_s, pcm_bytes)."""
+    """Send one tts request; return (first_audio_s, total_s, pcm_bytes, sample_rate).
+
+    The rate is the one the request's audio_start frame declares (24 kHz for
+    breeze and qwen3, 48 kHz for dots), or None when no audio_start arrived.
+    """
     t0 = time.monotonic()
     await ws.send(json.dumps({"type": "tts", "text": text, "request_id": request_id}))
     first = None
     pcm = b""
+    rate = None
     while True:
         frame = await recv(ws)
         if isinstance(frame, bytes):
@@ -101,10 +106,26 @@ async def run_request(ws, request_id, text):
             pcm += frame
             continue
         msg = json.loads(frame)
+        if msg.get("type") == "audio_start" and msg.get("request_id") == request_id:
+            rate = int(msg["sample_rate"])
         if msg.get("type") == "audio_end" and msg.get("request_id") == request_id:
-            return first, time.monotonic() - t0, pcm
+            return first, time.monotonic() - t0, pcm, rate
         if msg.get("type") == "error":
             raise AssertionError(f"error during {request_id}: {msg}")
+
+
+def pcm_duration_s(pcm: bytes, rate: int) -> float:
+    """Seconds of 16-bit mono PCM at ``rate``."""
+    return len(pcm) / 2 / rate
+
+
+def write_wav(path: str, pcm: bytes, rate: int) -> None:
+    """Write 16-bit mono PCM as a WAV at ``rate``."""
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(pcm)
 
 
 async def main() -> int:
@@ -115,8 +136,8 @@ async def main() -> int:
     # Give the per-session sidecars a moment to spawn, then a first request
     # (its latency includes any residual warm-up wait).
     await asyncio.sleep(2.0)
-    first_lat, _, _ = await run_request(ws, "m1", TYPICAL)
-    warm_lat, _, _ = await run_request(ws, "m2", TYPICAL)
+    first_lat, _, _, _ = await run_request(ws, "m1", TYPICAL)
+    warm_lat, _, _, _ = await run_request(ws, "m2", TYPICAL)
     print(f"MEASURE tts_first_audio_first_request_ms={first_lat*1000:.0f}")
     print(f"MEASURE tts_first_audio_warm_ms={warm_lat*1000:.0f}")
 
@@ -161,23 +182,20 @@ async def main() -> int:
             assert msg.get("reason") == "cancelled", msg
             break
     cancel_ack = time.monotonic() - t_cancel
-    next_first, _, _ = await run_request(ws, "cx2", TYPICAL)
+    next_first, _, _, _ = await run_request(ws, "cx2", TYPICAL)
     print(f"MEASURE cancel_to_silence_ms={cancel_ack*1000:.0f}")
     print(f"MEASURE cancel_to_next_request_audio_ms={next_first*1000:.0f}")
 
     # Long-form multi-chunk synthesis for the seam ear test.
-    lf_first, lf_total, pcm = await run_request(ws, "lf1", LONGFORM)
-    duration = len(pcm) / 2 / 48000.0
+    lf_first, lf_total, pcm, rate = await run_request(ws, "lf1", LONGFORM)
+    assert rate, "no audio_start for the long-form request"
+    duration = pcm_duration_s(pcm, rate)
     os.makedirs(os.path.dirname(OUT_WAV), exist_ok=True)
-    with wave.open(OUT_WAV, "wb") as f:
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(48000)
-        f.writeframes(pcm)
+    write_wav(OUT_WAV, pcm, rate)
     print(f"MEASURE longform_first_audio_ms={lf_first*1000:.0f}")
     print(f"MEASURE longform_audio_s={duration:.2f} wall_s={lf_total:.2f} "
           f"rtf={lf_total/duration:.2f}")
-    print(f"WROTE {OUT_WAV} ({len(pcm)} bytes, {duration:.1f} s at 48 kHz) - "
+    print(f"WROTE {OUT_WAV} ({len(pcm)} bytes, {duration:.1f} s at {rate} Hz) - "
           "play this for the seam verdict")
 
     await ws.close()

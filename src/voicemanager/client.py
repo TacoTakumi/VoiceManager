@@ -973,7 +973,7 @@ class VoiceManagerClient:
         # frames for this id even if the cancel frame and the next PCM chunk race.
         self._cancelled_tts.add(request_id)
         msg = json.dumps({"type": "tts_cancel", "request_id": request_id})
-        await self._ws.send(msg)
+        await self._send_or_raise(msg, TTSError)
 
     async def flush_tts(self, request_id: str) -> None:
         """Flush the server's buffered text for an in-flight streaming request.
@@ -1004,7 +1004,7 @@ class VoiceManagerClient:
             "flush": True,
             "done": False,
         })
-        await self._ws.send(msg)
+        await self._send_or_raise(msg, TTSError)
 
     # ------------------------------------------------------------------
     # Voice upload (REST)

@@ -193,6 +193,29 @@ def test_interim_endpoint_and_final_with_the_same_text_dispatch_once():
                                {"role": "assistant", "content": "Paris."}]
 
 
+def test_an_audio_end_with_reason_error_is_recorded_as_an_error():
+    # The server ends a reply it could not synthesize (an unknown voice, a sidecar
+    # failure) with audio_end reason error and no audio: the record says so.
+    factory = ChatFactory(FakeChat(["Paris", "."]))
+    session, duplex, player, log, clock = _session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("what is the capital of France", endpoint=True), 100.9)
+        await _settle()
+        clock["t"] = 101.5
+        req = duplex.requests[0]
+        await session.on_event(("audio_end", {"type": "audio_end", "request_id": req.request_id,
+                                              "reason": "error"}), clock["t"])
+    asyncio.run(run())
+    lines = _lines(log)
+    assert len(lines) == 1
+    assert lines[0]["reason"] == "error"
+    assert lines[0]["cancelled"] is False
+    assert lines[0]["first_audio_ms"] is None
+    assert duplex.turns == 2  # the next turn still opens
+
+
 def test_a_final_that_revises_the_dispatched_text_supersedes_the_reply():
     factory = ChatFactory(FakeChat(["Where", " to?"], hold=True), FakeChat(["Booking", " Boston."]))
     session, duplex, player, log, clock = _session(factory)

@@ -329,6 +329,26 @@ def test_live_sink_frames():
     assert sink.is_cancelled("r2") and not sink.is_cancelled("r1")
 
 
+def test_live_sink_forgets_a_request_at_its_audio_end():
+    # One entry per request id would otherwise live for the whole call.
+    session = FakeSession()
+    sink = mc.SessionTTSSink(session)
+
+    async def run():
+        await sink.send_text("r1", "Hi")
+        await sink.done("r1")
+        await sink.send_text("r2", "Stop")
+        await sink.cancel("r2")
+
+    asyncio.run(run())
+    assert set(sink._requests) == {"r1", "r2"} and sink.is_cancelled("r2")
+    sink.on_audio_end("r1")
+    sink.on_audio_end("r2")
+    sink.on_audio_end("never-seen")  # harmless
+    assert sink._requests == {}
+    assert not sink.is_cancelled("r2")
+
+
 def test_live_sink_without_voice():
     session = FakeSession()
     sink = mc.SessionTTSSink(session)
