@@ -1,7 +1,7 @@
 // audio.cpp streaming sidecar - process boundary for the Nemotron-3.5 STT engine.
 //
 // The sidecar binds an AF_UNIX socket, accepts a connection, reads a HELLO carrying the
-// wire model/task id, validates it against the one-entry task registry, and -
+// wire model/task id, validates it against the task registry, and -
 // on a valid HELLO - loads the selected model and creates its streaming session before
 // replying READY (so READY means the session is warm). It then runs the generic drive
 // loop over IStreamingVoiceTaskSession: AUDIO chunks in, interim EVENT deltas and

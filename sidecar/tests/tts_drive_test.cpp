@@ -762,8 +762,8 @@ void test_tts_cancel_stops_generation_and_session_survives() {
     CHECK(conn.session.drip_pushed.load() < conn.session.drip_chunks,
           "the sink-throw must stop generation early, not run the full script");
 
-    // Session reuse (the sink-throw probe verdict): the SAME warm session serves the next
-    // request completely and byte-exactly - the probe's round-2 claim, model-free.
+    // Session reuse: a sink throw does not poison the warm session. The SAME session
+    // serves the next request completely and byte-exactly, model-free.
     conn.session.drip_chunks = 0;
     conn.send_text("follow-up request", "/voices/ref.wav", "ref");
     std::string audio;

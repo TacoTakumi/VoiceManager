@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
         raise
     app.state.tts_engine = tts_models["tts_engine"]
     app.state.tts_executor = tts_models["tts_executor"]
-    app.state.tts_engine_type = tts_models.get("tts_engine_type", "openvoice")  # NEW
+    app.state.tts_engine_type = tts_models.get("tts_engine_type", "openvoice")
     app.state.session_registry = SessionRegistry()
     logger.info(
         "TTS models loaded (engine=%s), session registry initialized",

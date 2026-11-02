@@ -510,7 +510,7 @@ void test_merge_options() {
     CHECK(sidecar::merge_options({}, {}).empty(), "empty maps merge to empty");
 }
 
-// The default registry serves all four shipped model_tasks. The nemotron entry stays
+// The default registry serves all six shipped model_tasks. The nemotron entry stays
 // byte-for-byte what it was (no options - shipped behavior is exactly the engine
 // defaults), the voxtral entry pins the measured arena/context recipe in its session-option
 // defaults, the dots entry pins the upstream long-form guards (text_chunk_size=200,

@@ -103,14 +103,14 @@ def test_eou_emits_provisional_endpoint_then_confirmed_final():
     assert endpoints[0].text == "this facility" and endpoints[0].segment_index == 0
     assert len(finals) == 1
     assert finals[0].is_final is True and finals[0].endpoint is False
-    # confirmed final matches the provisional text and segment_index.
+    # Confirmed final matches the provisional text and segment_index.
     assert finals[0].text == "this facility" and finals[0].segment_index == 0
-    # provisional endpoint frame precedes the immutable confirmed final.
+    # Provisional endpoint frame precedes the immutable confirmed final.
     assert sent.index(endpoints[0]) < sent.index(finals[0])
 
 
 def test_confirm_runs_on_the_audio_clock_not_wallclock():
-    # expiry is driven by fed-audio duration, so a faster-than-realtime
+    # Expiry is driven by fed-audio duration, so a faster-than-realtime
     # silence feed confirms in far less wall-clock time than hold_ms.
     p = _ScriptedNemotron(
         [("hello", "hello")],
@@ -269,7 +269,7 @@ def test_reopen_stitches_held_text_under_original_segment_index():
 
 
 def test_commit_boundary_starts_new_turn_at_next_segment():
-    # an out-of-window silence commits A (immutable final seg 0); speech that
+    # An out-of-window silence commits A (immutable final seg 0); speech that
     # resumes AFTER that confirmed final is a new turn under seg 1, never merged into A.
     p = _ScriptedNemotron(
         [("apple", "apple")],  # A: single-chunk EoU
@@ -301,7 +301,7 @@ def test_commit_boundary_starts_new_turn_at_next_segment():
 
 
 def test_repeated_eou_reemits_endpoint_for_growing_stitched_turn():
-    # each time the reopened speech itself hits EoU, a FRESH endpoint=true frame
+    # Each time the reopened speech itself hits EoU, a FRESH endpoint=true frame
     # carries the full stitched turn so far under the original segment_index, and the hold
     # restarts — so a further resumption stitches again. A, reopen->B(EoU), reopen->C(EoU),
     # then long silence confirms the whole turn.
@@ -406,14 +406,14 @@ def test_wallclock_fallback_confirms_held_final_before_session_close(monkeypatch
             assert prov2["type"] == "transcription"
             assert prov2["endpoint"] is True and prov2["text"] == "again"
             assert prov2["segment_index"] == 1
-            # the full WS frame stream (JSON dicts) keeps finals immutable across both turns.
+            # The full WS frame stream (JSON dicts) keeps finals immutable across both turns.
             assert_immutable_finals([prov, final, prov2])
     finally:
         cfg._settings = None
 
 
 def test_midstitch_final_flushed_before_session_close(monkeypatch):
-    # the mid-stitch state (reopened, is_holding=False, stitch prefix
+    # The mid-stitch state (reopened, is_holding=False, stitch prefix
     # set, no resumed EoU yet) has NO wall-clock fallback — the receive-timeout cap
     # gates on is_holding. So a client that reopens then goes fully silent rides the
     # session-inactivity timeout to close. The held stitched turn must still be flushed
@@ -467,7 +467,7 @@ def test_midstitch_final_flushed_before_session_close(monkeypatch):
                 pass
 
             assert final is not None, f"stitched final dropped on session-timeout close; got {frames}"
-            # one confirmed final carrying the full stitched turn under
+            # One confirmed final carrying the full stitched turn under
             # the original segment_index, delivered before close.
             assert final["is_final"] is True and final["endpoint"] is False
             assert final["text"] == "a b" and final["segment_index"] == 0
@@ -495,7 +495,7 @@ async def _teardown(pipeline, machine):
 
 
 def test_teardown_flushes_held_final():
-    # a hold pending at teardown is emitted as an is_final=true frame (not dropped).
+    # A hold pending at teardown is emitted as an is_final=true frame (not dropped).
     p = _ScriptedNemotron(
         [("hi", "hi")], shared_pipeline=_FakeShared(), stream_id=30, att_context_size=[70, 13],
     )
@@ -511,7 +511,7 @@ def test_teardown_flushes_held_final():
 
 
 def test_teardown_flushes_stitched_held_final():
-    # the same holds when the hold began inside a stitched turn — the held text is
+    # The same holds when the hold began inside a stitched turn — the held text is
     # the full space-joined turn under the original segment_index.
     p = _ScriptedNemotron(
         [("a", None), ("a", "a"),          # A: interim, EoU (seg 0) -> hold
@@ -543,7 +543,7 @@ def test_teardown_merges_finalize_tail_into_held_final():
 
 
 def test_teardown_midstitch_prefix_not_dropped():
-    # held text is never dropped where a send is possible — if the stream ends after
+    # Held text is never dropped where a send is possible — if the stream ends after
     # a reopen but before the resumed EoU, the stitch prefix + trailing partial still flush
     # as a final under the original segment_index.
     p = _ScriptedNemotron(
@@ -561,7 +561,7 @@ def test_teardown_midstitch_prefix_not_dropped():
 
 
 def test_teardown_idempotent_no_double_final():
-    # at most one is_final per segment_index — a second teardown emits nothing.
+    # At most one is_final per segment_index — a second teardown emits nothing.
     p = _ScriptedNemotron(
         [("hi", "hi")], shared_pipeline=_FakeShared(), stream_id=34, att_context_size=[70, 13],
     )
@@ -574,7 +574,7 @@ def test_teardown_idempotent_no_double_final():
 
 
 def test_teardown_midstitch_idempotent_no_double_final():
-    # a second teardown in the MID-STITCH state must also emit nothing.
+    # A second teardown in the MID-STITCH state must also emit nothing.
     # The flush clears the stitch prefix and the pipeline partial, so it is inert by
     # state — not merely because the socket closed first (the WS timeout path flushes
     # pre-close, then the finally-block calls teardown again).
@@ -594,7 +594,7 @@ def test_teardown_midstitch_idempotent_no_double_final():
 
 
 def test_teardown_disabled_path_emits_tail_only():
-    # with the hold disabled (hold_machine None) teardown is the legacy finalize —
+    # With the hold disabled (hold_machine None) teardown is the legacy finalize —
     # the finalize tail under the pipeline's segment_index, no held/stitch machinery.
     p = _ScriptedNemotron(
         [("go", "go")], final_tail="tail",

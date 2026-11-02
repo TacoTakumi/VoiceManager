@@ -23,7 +23,7 @@ session lock, main.cpp ran handle_connection() INLINE and a second client simply
 listen backlog until the first disconnected (`accept_mode="serial"`, kept for reference). What
 this fake must never do is out-capability the runtime it stands in for: it used to
 spawn a thread per connection, and that is how a "concurrent sessions unaffected"
- assertion passed model-free against a runtime that was single-client. It was the
+assertion passed model-free against a runtime that was single-client. It was the
 second such trap -- a live run found it emitted
 mid-stream deltas the real Nemotron-3.5 model never produces. Multi-session concurrency
 remains a LIVE claim (scripts/audiocpp_two_session_repro.py), never a fake-sidecar one.

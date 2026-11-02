@@ -4,10 +4,10 @@ The first tests cover the additive `turn_id` field on TranscriptionMessage and t
 server-owned TurnTracker whose advance() method opens a turn -- bumping the counter
 AND clearing the STT live partial -- so every transcription frame carries the turn
 that was open when ITS AUDIO WAS RECEIVED, not the turn current at send time.
-No receive loop, no turn_start frame: the turn-advance
-method is exercised directly. Later tasks add the turn_start control frame,
-the through-the-loop partial clearing, the crossing-final tagging and
-the every-engine coverage to this same module.
+No receive loop, no turn_start frame: the turn-advance method is exercised
+directly. The later sections of this module cover the turn_start control frame,
+the through-the-loop partial clearing, the crossing-final tagging and the
+every-engine coverage.
 """
 import asyncio
 import json
@@ -191,19 +191,19 @@ def _connected_ws(client):
 
 
 def test_turn_start_and_turn_started_are_known_message_types():
-    # both the request and its ack are first-class protocol message types.
+    # Both the request and its ack are first-class protocol message types.
     assert MessageType.turn_start.value == "turn_start"
     assert MessageType.turn_started.value == "turn_started"
 
 
 def test_turn_started_ack_message_serializes_type_and_turn_id():
-    # the ack is a dedicated {"type":"turn_started","turn_id":N} frame.
+    # The ack is a dedicated {"type":"turn_started","turn_id":N} frame.
     payload = json.loads(TurnStartedMessage(turn_id=7).model_dump_json())
     assert payload == {"type": "turn_started", "turn_id": 7}
 
 
 def test_turn_start_frame_acks_with_turn_started_id_one_within_budget():
-    # client sends {"type":"turn_start"} and gets {"type":"turn_started",
+    # Client sends {"type":"turn_start"} and gets {"type":"turn_started",
     # "turn_id":1} promptly.
     client = TestClient(create_app())
     with _connected_ws(client) as ws:
@@ -219,7 +219,7 @@ def test_turn_start_frame_acks_with_turn_started_id_one_within_budget():
 
 
 def test_second_turn_start_yields_turn_id_two_monotonic():
-    # the server owns the counter; a second turn_start advances it to 2.
+    # The server owns the counter; a second turn_start advances it to 2.
     client = TestClient(create_app())
     with _connected_ws(client) as ws:
         assert ws.receive_json()["type"] == "ready"
@@ -231,7 +231,7 @@ def test_second_turn_start_yields_turn_id_two_monotonic():
 
 
 def test_turn_start_counter_is_monotonic_and_never_rewinds():
-    # across many turn_start calls the ids are strictly increasing 1..N and
+    # Across many turn_start calls the ids are strictly increasing 1..N and
     # never repeat or rewind.
     client = TestClient(create_app())
     with _connected_ws(client) as ws:
@@ -586,7 +586,7 @@ def _install_engine(monkeypatch, engine: str):
 
 @pytest.mark.parametrize("engine", ["whisper", "qwen", "nemotron"])
 def test_turn_start_stamps_turn_id_on_every_stt_engine(engine, monkeypatch):
-    # with any VM_STT_ENGINE, turn_start returns turn_started(turn_id=1) and the
+    # With any VM_STT_ENGINE, turn_start returns turn_started(turn_id=1) and the
     # first transcription frame for post-turn_start audio carries turn_id=1 -- no engine
     # raises, and none emits a turn_id that lags the acked value.
     import voicemanager.config as cfg
@@ -609,7 +609,7 @@ def test_turn_start_stamps_turn_id_on_every_stt_engine(engine, monkeypatch):
 
 
 def test_turn_start_clears_qwen_engine_live_partial_no_stale_stitch(monkeypatch):
-    # qwen accumulates a live streaming partial, so opening a turn must
+    # Qwen accumulates a live streaming partial, so opening a turn must
     # drop it -- the new turn's first frame carries NONE of the pre-turn_start words.
     import voicemanager.config as cfg
     cfg._settings = None

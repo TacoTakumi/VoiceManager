@@ -4,9 +4,8 @@
 // to audio.cpp's own registry: registry.load({model_path, family_hint = family}) then
 // create_task_session({VoiceTaskKind, RunMode}, options). The fields here are the
 // lowercase spellings of audio.cpp's taxonomy so no concrete session class name ever
-// appears on the wire or in the loop. Five entries ship: nemotron (the first cut),
-// voxtral (the second model), dots (the first TTS entry), voxcpm2 (the second TTS
-// entry), and breeze (the third TTS entry).
+// appears on the wire or in the loop. Six entries ship: nemotron and voxtral (STT),
+// dots, voxcpm2, breeze and qwen3 (TTS).
 #pragma once
 
 #include "protocol.h"
