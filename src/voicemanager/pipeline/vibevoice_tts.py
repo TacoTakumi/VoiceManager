@@ -22,7 +22,7 @@ VIBEVOICE_VOICES = ["Carter", "Davis", "Emma", "Frank", "Grace", "Mike"]
 def _dtype_and_attn(device: str) -> tuple[torch.dtype, str]:
     """Pick (torch_dtype, attn_implementation) for a device string.
 
-    Any CUDA device — bare ``"cuda"`` or an explicit ``"cuda:N"`` — uses
+    Any CUDA device - bare ``"cuda"`` or an explicit ``"cuda:N"`` - uses
     bfloat16 + flash_attention_2. CPU (or anything non-CUDA) uses float32 +
     sdpa. The ``startswith`` check is deliberate: a plain ``== "cuda"`` would
     send ``cuda:N`` into the CPU branch and silently load in fp32.

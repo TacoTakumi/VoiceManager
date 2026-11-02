@@ -31,7 +31,7 @@ def load_models(settings) -> dict:
         settings: voicemanager.config.Settings instance
 
     Returns:
-        dict — keys depend on engine: whisper path returns whisper/vad_model/executor/device;
+        dict - keys depend on engine: whisper path returns whisper/vad_model/executor/device;
         qwen/nemotron/audiocpp paths return their engine handle + stt_engine_type/device
     """
     engine = settings.stt_engine
@@ -99,9 +99,9 @@ def _load_whisper_models(settings) -> dict:
 def _load_qwen_models(settings) -> dict:
     """Load Qwen3-ASR model at startup. Fail fast if loading fails.
 
-    Uses qwen-asr library wrapping vLLM. No ThreadPoolExecutor needed —
+    Uses qwen-asr library wrapping vLLM. No ThreadPoolExecutor needed -
     QwenSTTPipeline uses asyncio.to_thread() per-call.
-    No VAD model needed — Qwen3-ASR handles voice detection internally.
+    No VAD model needed - Qwen3-ASR handles voice detection internally.
 
     Args:
         settings: voicemanager.config.Settings instance
@@ -223,7 +223,7 @@ def _build_nemotron_cfg(settings, device: str):
                     "use_cuda_graph_decoder": False,
                     # Disabled: we configure no contextual biasing (no key phrases,
                     # boosting_tree.model_path=None), so this only drags in the
-                    # ngram_multi_advance Triton kernel — which has no compiled image
+                    # ngram_multi_advance Triton kernel - which has no compiled image
                     # for Blackwell/sm_120 (RTX 5060 Ti), crashing transcribe with
                     # "Triton Error [CUDA]: no kernel image is available". Off => the
                     # fusion-model advance path is skipped; transcripts are unchanged.
@@ -306,7 +306,7 @@ def _load_audiocpp_models(settings) -> dict:
 
     Unlike the in-process engines, the audio.cpp runtime lives in a separate sidecar
     process reached over a Unix-domain socket (crash isolation). This loader
-    does NOT spawn the sidecar or load the GGUF — the per-connection pipeline owns the
+    does NOT spawn the sidecar or load the GGUF - the per-connection pipeline owns the
     sidecar client lifecycle. It only resolves the device (for logging/record)
     and gathers the VM_AUDIOCPP_* config the pipeline will need, returning the engine
     type so app routing + /ws/stream dispatch to the audio.cpp path.

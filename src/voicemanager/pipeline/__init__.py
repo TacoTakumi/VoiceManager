@@ -25,7 +25,7 @@ class STTPipeline:
     def __init__(self, vad_model, whisper_model, executor, vad_threshold: float, silence_ms: int):
         self._whisper = whisper_model
         self._executor = executor
-        # vad_model may be None when TestClient skips lifespan — VAD disabled in that case
+        # vad_model may be None when TestClient skips lifespan - VAD disabled in that case
         self._vad_iter = (
             VADIterator(
                 vad_model,
@@ -72,7 +72,7 @@ class STTPipeline:
     async def run_inference(self, loop: asyncio.AbstractEventLoop):
         """Run transcription in executor thread, return segments and info.
 
-        CRITICAL: list(segments) consumed INSIDE executor — the generator is lazy
+        CRITICAL: list(segments) consumed INSIDE executor - the generator is lazy
         and calling next() triggers CTranslate2 inference. Must not iterate in event loop.
         """
         audio_np = _pcm_to_float32(bytes(self._buffer))

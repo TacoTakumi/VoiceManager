@@ -3,8 +3,8 @@
 Per-connection *transport-only* state for the nemotron STT path. When NeMo's
 acoustic end-of-utterance (EoU) fires, the transport begins a hold: it emits a
 provisional endpoint frame (is_final=false, endpoint=true) and starts an
-AUDIO-CLOCK timer. The hold is advanced by the duration of audio fed afterwards —
-not wall-clock time — and confirms an immutable final once the fed
+AUDIO-CLOCK timer. The hold is advanced by the duration of audio fed afterwards -
+not wall-clock time - and confirms an immutable final once the fed
 post-EoU audio reaches the hold window.
 
 The NeMo pipeline's decode/cache handling is never touched and no audio is
@@ -16,7 +16,7 @@ pending final is cancelled and its text becomes a *stitch prefix* space-joined o
 the resumed segment's partials and eventual final; the resumed NeMo segment is
 remapped onto the held segment_index (a growing offset keeps later segments
 contiguous). Once a hold *confirms*, it is the commit boundary: a later
-turn cannot reopen it — the transport is no longer holding — so it simply takes the
+turn cannot reopen it - the transport is no longer holding - so it simply takes the
 next segment_index through the same offset.
 """
 
@@ -62,7 +62,7 @@ class EndpointHoldMachine:
 
     @property
     def stitch_turn(self) -> int:
-        """Turn owning the active stitch prefix — the mid-stitch flush's turn."""
+        """Turn owning the active stitch prefix - the mid-stitch flush's turn."""
         return self._stitch_turn
 
     def begin_hold(self, text: str, language: str, segment_index: int,
@@ -107,7 +107,7 @@ class EndpointHoldMachine:
         return text
 
     def clear_stitch(self) -> None:
-        """Drop the active stitch prefix — the resumed turn has been committed.
+        """Drop the active stitch prefix - the resumed turn has been committed.
 
         Used at a teardown flush so a second flush is truly inert: without this the
         mid-stitch prefix would survive and re-stitch onto a re-finalized tail.

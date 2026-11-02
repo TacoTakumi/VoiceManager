@@ -1,6 +1,6 @@
 """Async Python client for VoiceManager STT/TTS server.
 
-Standalone module — requires only ``websockets`` and ``httpx``.
+Standalone module - requires only ``websockets`` and ``httpx``.
 Copy this file into any Python 3.12+ project.
 
 The client authenticates with a bearer token: it sends
@@ -267,7 +267,7 @@ class VoiceManagerClient:
         self.last_tts_sample_rate: int = 22050  # Updated by audio_start in stream_tts_live()
         # request_id of the most recently started TTS request. Exposed
         # so a caller can reach the id of the request it just started and call
-        # cancel_tts() on it — barge-in is impossible if the id stays internal.
+        # cancel_tts() on it - barge-in is impossible if the id stays internal.
         self.last_tts_request_id: str | None = None
         # request_ids the caller has cancelled. cancel_tts() adds one here
         # and returns immediately without awaiting audio_end; the live-yield path
@@ -355,7 +355,7 @@ class VoiceManagerClient:
         self._ws = None
         self._reader = None
 
-        # Drain all queues — put sentinel None to unblock any waiters
+        # Drain all queues - put sentinel None to unblock any waiters
         for q in (self._stt_queue, self._tts_queue, self._error_queue, self._turn_queue):
             while not q.empty():
                 try:
@@ -368,7 +368,7 @@ class VoiceManagerClient:
         """Reconnect with exponential backoff.
 
         Raises ConnectionError after max_retries attempts.
-        Sets self.reconnected = True on success — consumer must re-upload
+        Sets self.reconnected = True on success - consumer must re-upload
         their voice profile.
         """
         await self._disconnect()
@@ -387,7 +387,7 @@ class VoiceManagerClient:
                 await self._connect()
                 self.reconnected = True
                 self._logger.warning(
-                    "Reconnected — voice profile must be re-uploaded (session=%s)",
+                    "Reconnected - voice profile must be re-uploaded (session=%s)",
                     self.session_id,
                 )
                 return
@@ -409,7 +409,7 @@ class VoiceManagerClient:
     # ------------------------------------------------------------------
 
     async def _reader_loop(self) -> None:
-        """Background task — dispatches all received WebSocket frames to queues.
+        """Background task - dispatches all received WebSocket frames to queues.
 
         This is the ONLY place that calls recv().  Callers read from asyncio.Queue
         instances to avoid ConcurrencyError.
@@ -427,7 +427,7 @@ class VoiceManagerClient:
                     elif ftype in ("audio_start", "audio_end"):
                         await self._tts_queue.put(frame)
                     elif ftype == "turn_started":
-                        # Server-owned ack for a turn_start — routed to
+                        # Server-owned ack for a turn_start - routed to
                         # its own queue so turn_start() awaits it independently.
                         await self._turn_queue.put(frame)
                     elif ftype == "error":
@@ -488,7 +488,7 @@ class VoiceManagerClient:
         """Guarantee a transcription dict carries a turn_id key.
 
         The server stamps turn_id on every transcription frame (default 0), so
-        this is normally a no-op — but the client's public contract is that every
+        this is normally a no-op - but the client's public contract is that every
         dict it yields/returns has the key (0 when no turn was ever opened), so a
         Python consumer can filter by turn without a KeyError guard.
         """
@@ -556,8 +556,8 @@ class VoiceManagerClient:
         """Send audio and yield transcription dicts as they arrive.
 
         Unlike stream_stt() which collects all results, this yields each
-        transcription dict immediately — both interim (is_final=False) and
-        final (is_final=True) — so consumers can react to partials in
+        transcription dict immediately - both interim (is_final=False) and
+        final (is_final=True) - so consumers can react to partials in
         real-time.
 
         Args:
@@ -597,7 +597,7 @@ class VoiceManagerClient:
                         return
                     yield self._stamp_turn_id(item)
 
-            # Audio exhausted — wait for remaining transcriptions
+            # Audio exhausted - wait for remaining transcriptions
             try:
                 async with asyncio.timeout(5.0):
                     while True:
@@ -633,7 +633,7 @@ class VoiceManagerClient:
             timeout: Seconds to wait for the ``turn_started`` ack (default 5.0).
 
         Returns:
-            The newly opened turn's id — a positive, monotonically increasing int.
+            The newly opened turn's id - a positive, monotonically increasing int.
 
         Raises:
             STTError: If the connection is lost or the ack does not arrive in time.
@@ -668,7 +668,7 @@ class VoiceManagerClient:
 
         Returns:
             Tuple of (pcm_bytes, sample_rate).  Use sample_rate when writing
-            WAV files — TTS output rate depends on engine (22050 Hz for
+            WAV files - TTS output rate depends on engine (22050 Hz for
             OpenVoice, 24000 Hz for VibeVoice).
 
         Raises:
@@ -740,7 +740,7 @@ class VoiceManagerClient:
 
         Returns:
             Tuple of (pcm_bytes, sample_rate). Use sample_rate when writing
-            WAV files — TTS output rate depends on engine.
+            WAV files - TTS output rate depends on engine.
 
         Raises:
             TTSError: If the connection is lost or times out.
@@ -828,7 +828,7 @@ class VoiceManagerClient:
         """Stream text for TTS and yield audio bytes in real-time.
 
         Unlike stream_tts() which collects all audio, this yields each PCM
-        audio chunk as it arrives from the server — enabling real-time playback
+        audio chunk as it arrives from the server - enabling real-time playback
         while text is still being sent.
 
         Sample rate is available via client.last_tts_sample_rate after the
@@ -840,7 +840,7 @@ class VoiceManagerClient:
         request_id. Either supply one via the ``request_id`` argument (generate
         it yourself, e.g. ``str(uuid.uuid4())``, so you hold it before iteration
         begins), or read ``client.last_tts_request_id`` once iteration has
-        started. Pass that id to ``cancel_tts()`` — typically from a separate
+        started. Pass that id to ``cancel_tts()`` - typically from a separate
         task, since this generator is what you are iterating. Cancellation ends
         the iteration once the server's audio_end for the id arrives.
 
@@ -897,7 +897,7 @@ class VoiceManagerClient:
                     msg = json.dumps(payload)
                     await self._ws.send(msg)
                 except StopAsyncIteration:
-                    # All text sent — send done=True
+                    # All text sent - send done=True
                     await self._ws.send(json.dumps({
                         "type": "tts_stream",
                         "request_id": request_id,
@@ -928,7 +928,7 @@ class VoiceManagerClient:
                             self._cancelled_tts.discard(request_id)
                             return
 
-            # Text exhausted — collect remaining audio until audio_end
+            # Text exhausted - collect remaining audio until audio_end
             try:
                 async with asyncio.timeout(120.0):
                     while True:
@@ -958,14 +958,14 @@ class VoiceManagerClient:
     async def cancel_tts(self, request_id: str) -> None:
         """Cancel an in-progress TTS synthesis request.
 
-        Returns as soon as the tts_cancel frame is sent — it does NOT wait for
+        Returns as soon as the tts_cancel frame is sent - it does NOT wait for
         the server's audio_end, which may lag while the executor unwinds a long
         synthesis. Any binary frames still in flight for the cancelled request
         are discarded by the live-yield path (stream_tts_live) until that
         request's own audio_end arrives and ends the iteration.
 
         Args:
-            request_id: The request_id of the in-flight TTS request — either the
+            request_id: The request_id of the in-flight TTS request - either the
                 one supplied to stream_tts_live(), or read from
                 client.last_tts_request_id after starting any TTS request.
         """
@@ -980,20 +980,20 @@ class VoiceManagerClient:
 
         Puts exactly ONE tts_stream frame with flush=true and done=false on the
         wire for the given request_id. The server synthesizes everything it has
-        buffered for that request so far — exactly as-is — and leaves the request
+        buffered for that request so far - exactly as-is - and leaves the request
         OPEN for more text: no end-of-sentence sentinel is queued and no audio_end
         is emitted (that is what done=true does). This is what lets a one-sentence
         reply be spoken before the caller ever sends done=true.
 
-        WARNING — flush only at a boundary YOU have detected to be the end of a
+        WARNING - flush only at a boundary YOU have detected to be the end of a
         sentence. Flushing MID-sentence hands the server a partial sentence and
         will audibly CUT that sentence in HALF: the buffered fragment is spoken on
         its own and the remainder arrives as a separate, disjoint utterance. The
         correct use is a sentence boundary the client itself detected (e.g. after a
-        '.', '?' or '!' emerges from an LLM token stream) — never once per token.
+        '.', '?' or '!' emerges from an LLM token stream) - never once per token.
 
         Args:
-            request_id: The request_id of the in-flight streaming TTS request —
+            request_id: The request_id of the in-flight streaming TTS request -
                 either the one supplied to stream_tts_live(), or read from
                 client.last_tts_request_id after starting a streaming request.
         """
@@ -1050,7 +1050,7 @@ class VoiceManagerClient:
                 detail = response.text
             raise VoiceManagerError(f"Voice upload failed ({response.status_code}): {detail}")
 
-        # Voice profile re-established — clear the reconnected flag
+        # Voice profile re-established - clear the reconnected flag
         self.reconnected = False
         return response.json()
 
@@ -1059,7 +1059,7 @@ class VoiceManagerClient:
     # ------------------------------------------------------------------
 
     async def health(self) -> dict:
-        """GET /health — model readiness status.
+        """GET /health - model readiness status.
 
         Returns:
             ``{"status": "ok", "models": {"stt": ..., "vad": ..., "tts": ...}}``
@@ -1073,7 +1073,7 @@ class VoiceManagerClient:
         return response.json()
 
     async def info(self) -> dict:
-        """GET /info — loaded models, device, and active sessions.
+        """GET /info - loaded models, device, and active sessions.
 
         Returns:
             Dict with keys: models, device, whisper_model, tts_sample_rate, sessions.

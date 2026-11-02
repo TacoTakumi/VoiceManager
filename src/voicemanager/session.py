@@ -40,7 +40,7 @@ class SessionEntry:
 class SessionRegistry:
     """Async-safe registry for active WebSocket sessions.
 
-    Thread safety is achieved via asyncio.Lock — all operations acquire the lock
+    Thread safety is achieved via asyncio.Lock - all operations acquire the lock
     before mutating or reading session state (single event loop assumption).
     """
 

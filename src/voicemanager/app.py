@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     try:
         models = load_models(settings)
     except Exception as e:
-        logger.error("Model loading failed — refusing to start: %s", e)
+        logger.error("Model loading failed - refusing to start: %s", e)
         raise
 
     # Store engine type for WebSocket handler routing
@@ -83,7 +83,7 @@ async def lifespan(app: FastAPI):
     try:
         tts_models = load_tts_models(settings)
     except Exception as e:
-        logger.error("TTS model loading failed — refusing to start: %s", e)
+        logger.error("TTS model loading failed - refusing to start: %s", e)
         raise
     app.state.tts_engine = tts_models["tts_engine"]
     app.state.tts_executor = tts_models["tts_executor"]

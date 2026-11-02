@@ -33,7 +33,7 @@ class HandshakeMessage(BaseModel):
     type: Literal["ready"] = "ready"
     session_id: str
     audio_format: dict
-    stt_engine: str = "whisper"  # "whisper" or "qwen" — informational only
+    stt_engine: str = "whisper"  # "whisper" or "qwen" - informational only
     tts_engine: str = "openvoice"         # "openvoice" or "vibevoice"
     available_voices: list[str] = []      # populated for vibevoice, empty for openvoice
     # Additive: the voice a TTS request without 'voice' gets on this connection --
@@ -116,7 +116,7 @@ class TTSStreamMessage(BaseModel):
     text: str
     done: bool = False
     # Additive: dispatch the whole accumulated buffer for synthesis
-    # as-is — complete sentence or not — and leave the request open. Distinct from
+    # as-is - complete sentence or not - and leave the request open. Distinct from
     # `done`, which closes the request; flush never queues the end-of-sentence
     # sentinel and never yields an audio_end.
     flush: bool = False

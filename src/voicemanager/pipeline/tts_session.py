@@ -56,7 +56,7 @@ DEAD_ID_CAPACITY = 64
 class _GuardedSocket:
     """The socket a synthesis task speaks through. Goes silent once its request is cancelled.
 
-    A cancelled synthesis does NOT stop when told to — it is blocked in an executor
+    A cancelled synthesis does NOT stop when told to - it is blocked in an executor
     thread and will come back, sometimes seconds later, still trying to send its audio
     and its own `audio_end`. Routing it through here makes "no PCM ever follows audio_end"
     and "exactly ONE audio_end per request_id" true by construction:
@@ -99,11 +99,11 @@ class TTSSession:
         self._active_request_id: str | None = None  # the request the live task belongs to
         self._unwinding: list[asyncio.Task] = []    # cancelled, still finishing in a thread
         # The request_ids that are dead for the life of this connection. A ring, not
-        # a set — this grows once per cancel on a socket that may live for hours.
+        # a set - this grows once per cancel on a socket that may live for hours.
         self._dead_ids: collections.deque[str] = collections.deque(maxlen=DEAD_ID_CAPACITY)
         # The request_ids that finished on their own and already sent their ONE
         # audio_end(reason='complete'). A late cancel of such an id must be a no-op, not a
-        # second audio_end. Same bounded ring shape as _dead_ids, and for the same reason —
+        # second audio_end. Same bounded ring shape as _dead_ids, and for the same reason -
         # a long-lived socket completes indefinitely, so it must not grow without bound.
         self._completed_ids: collections.deque[str] = collections.deque(maxlen=DEAD_ID_CAPACITY)
 
@@ -145,7 +145,7 @@ class TTSSession:
         self._unwinding = [t for t in self._unwinding if not t.done()]
 
     def _is_cancelled(self, request_id: str) -> bool:
-        """True once this id has been cancelled — permanently, for this connection."""
+        """True once this id has been cancelled - permanently, for this connection."""
         return request_id in self._dead_ids
 
     def _mark_dead(self, request_id: str) -> None:
@@ -167,8 +167,8 @@ class TTSSession:
 
         A task that COMPLETED normally has already sent its own audio_end('complete'), so
         the id is terminal: a later cancel of it must be a no-op, not a second audio_end.
-        A task that was CANCELLED (a tts_cancel or a supersede) is skipped — cancel() has
-        already acked and marked it dead — and so is one that errored out (no clean
+        A task that was CANCELLED (a tts_cancel or a supersede) is skipped - cancel() has
+        already acked and marked it dead - and so is one that errored out (no clean
         audio_end went out to be a duplicate of).
 
         Attached at dispatch, BEFORE anything awaits the task, so it runs ahead of any
@@ -179,14 +179,14 @@ class TTSSession:
         exc = task.exception()
         if exc is not None:
             # No clean audio_end('complete') went out, so this id is NOT terminal. Log it
-            # rather than let it vanish — reading exception() here retrieves it, which would
+            # rather than let it vanish - reading exception() here retrieves it, which would
             # otherwise suppress asyncio's "Task exception was never retrieved" diagnostic.
             logger.warning("TTS synthesis for request_id=%s failed: %r", request_id, exc)
             return
         self._mark_completed(request_id)
 
     def _socket_for(self, request_id: str) -> _GuardedSocket:
-        """The socket this request's synthesis task speaks through — silenced if cancelled."""
+        """The socket this request's synthesis task speaks through - silenced if cancelled."""
         return _GuardedSocket(self._websocket, request_id, self._is_cancelled)
 
     # --- dispatch -------------------------------------------------------
@@ -194,8 +194,8 @@ class TTSSession:
     async def speak(self, text: str, request_id: str, voice: str | None = None) -> None:
         """Dispatch a one-shot `tts` request.
 
-        Supersedes anything already in flight — including a streaming request, which
-        the old receive loop left running alongside it — down the cancel path
+        Supersedes anything already in flight - including a streaming request, which
+        the old receive loop left running alongside it - down the cancel path
         (see `_supersede`).
         """
         # A dead id is dead. Checked BEFORE stopping anything, or a stale frame
@@ -234,15 +234,15 @@ class TTSSession:
         `chunking` is fixed by the request's first frame, like `voice`; the stream
         pipeline ignores the value on every later frame of the same request.
 
-        A chunk opening a NEW request supersedes anything in flight — one-shot or stream
-        — down the cancel path (see `_supersede`), which is also what keeps the
+        A chunk opening a NEW request supersedes anything in flight - one-shot or stream
+        - down the cancel path (see `_supersede`), which is also what keeps the
         single-flight invariant.
         """
         if self._stream_pipeline is None:
             return
 
         # The token that was already on the wire when the client cancelled. It
-        # must not reopen the request, and — checked before we stop anything — it must
+        # must not reopen the request, and - checked before we stop anything - it must
         # not disturb whatever request is current now either.
         if self._is_cancelled(request_id):
             logger.debug("Ignored tts_stream chunk for cancelled request_id=%s", request_id)
@@ -288,7 +288,7 @@ class TTSSession:
     async def cancel(self, request_id: str) -> None:
         """Stop the in-flight request and ack it at once.
 
-        Callable by ANY caller — a `tts_cancel` frame today, the STT path when
+        Callable by ANY caller - a `tts_cancel` frame today, the STT path when
         server-side barge-in arrives. It never awaits the cancelled synthesis:
         that task is blocked in an executor thread nobody can interrupt, so awaiting it
         would hold the caller for the rest of the synthesis (measured 858-1089ms) and,
@@ -296,12 +296,12 @@ class TTSSession:
 
         So: silence the request, send its `audio_end(reason='cancelled')` immediately,
         and cut the doomed task loose. It will wake up later and try to send its audio
-        and its own `audio_end` — and its guarded socket will drop every frame, which is
+        and its own `audio_end` - and its guarded socket will drop every frame, which is
         what leaves the client with exactly one `audio_end` and no PCM after it.
 
         Scoped to the in-flight request: the task teardown fires only when
         `request_id` is the one actually synthesizing (`_active_request_id`). Cancelling any
-        other id — client misuse, or a never-seen id — still acks and marks it dead, but must
+        other id - client misuse, or a never-seen id - still acks and marks it dead, but must
         NOT touch the live request; killing the reply the client did not cancel would strand
         it with an `audio_start` and no `audio_end`. The supersede path always cancels
         `_active_request_id`, so it still tears down.
@@ -309,15 +309,15 @@ class TTSSession:
         Idempotent and safe for an id that never started. Cancelling an id the
         server has not seen yet still acks and still kills it, which is what lets a client
         cancel unconditionally without racing its own in-flight tokens. Cancelling an id
-        that already reached a terminal `audio_end` is a no-op — whether it was cancelled
+        that already reached a terminal `audio_end` is a no-op - whether it was cancelled
         before, or finished on its own and sent `audio_end('complete')` (the barge-in race:
         the last word completes just as the client's cancel fires). Either way the one ack
         already went out, and at most ONE `audio_end` is ever emitted per request_id over
         the life of a connection.
         """
         # Global invariant: at most ONE audio_end per request_id over the life of a
-        # connection. An id that already reached a terminal audio_end — cancelled earlier,
-        # or finished on its own and sent audio_end('complete') — must not get a second one.
+        # connection. An id that already reached a terminal audio_end - cancelled earlier,
+        # or finished on its own and sent audio_end('complete') - must not get a second one.
         # (A genuinely never-seen id is NOT terminal, so it still acks below.)
         if self._is_cancelled(request_id):
             logger.debug("TTS cancel for already-cancelled request_id=%s (no-op)", request_id)
@@ -355,7 +355,7 @@ class TTSSession:
         # `_unwinding` must not grow without bound on a long-lived socket. The
         # doomed tasks a barge-in cuts loose DO finish on their own (the executor thread
         # runs to completion), they are just never awaited here. Prune the finished ones
-        # now — wait_idle() only prunes from tests, and the production receive loop never
+        # now - wait_idle() only prunes from tests, and the production receive loop never
         # calls it, so this cancel path is the only place a real socket ever prunes.
         self._unwinding = [t for t in self._unwinding if not t.done()]
         self._task = None
@@ -367,7 +367,7 @@ class TTSSession:
                     request_id)
 
     async def _supersede(self, request_id: str) -> None:
-        """A new request_id arriving over a live one IS a cancel — take that path.
+        """A new request_id arriving over a live one IS a cancel - take that path.
 
         A client that starts r2 while r1 is still speaking has cancelled r1; it just did
         not say so in a `tts_cancel` frame. So r1 gets exactly what the frame would have
@@ -375,8 +375,8 @@ class TTSSession:
         and a doomed task cut loose rather than awaited.
 
         That last part is the point. This runs on the receive path, and the old supersede
-        awaited the previous synthesis task — blocked in an executor thread nobody can
-        interrupt — so the server read nothing at all for the rest of the synthesis,
+        awaited the previous synthesis task - blocked in an executor thread nobody can
+        interrupt - so the server read nothing at all for the rest of the synthesis,
         including the audio of the human who just barged in. Superseding is the
         door a barging-in client is most likely to come through, so it cannot be the one
         door that still stalls.

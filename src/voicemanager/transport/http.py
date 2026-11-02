@@ -17,7 +17,7 @@ http_router = APIRouter(tags=["status"])
 def _audiocpp_stt_model_name(config: dict) -> str | None:
     """Human-readable audiocpp model name for /info.
 
-    The GGUF basename, not the full path — the filesystem layout stays
+    The GGUF basename, not the full path - the filesystem layout stays
     server-side while the basename still names the weights + quant. Falls back to the model_task when no path is configured.
     """
     return os.path.basename(config.get("model", "")) or config.get("model_task")
@@ -87,7 +87,7 @@ async def health(request: Request):
         "status": "degraded" if degraded else "ok",
         "models": {
             # audiocpp reports the model_task: the family label analog of
-            # "nemotron-streaming"/"qwen3-asr" — which family is serving depends on
+            # "nemotron-streaming"/"qwen3-asr" - which family is serving depends on
             # the loaded GGUF, and the task id names exactly that.
             "stt": "qwen3-asr" if stt_engine_type == "qwen" and qwen is not None
                    else "nemotron-streaming" if stt_engine_type == "nemotron" and nemotron is not None
@@ -140,7 +140,7 @@ async def info(request: Request, token: Token = Depends(require_token)):
         "qwen_model": settings.qwen_model if stt_engine_type == "qwen" else None,
         "nemotron_model": settings.nemotron_model if stt_engine_type == "nemotron" else None,
         # Sourced from app.state (the loaded truth), not settings, and gated on the
-        # config actually being present — mirrors the per-engine field pattern while
+        # config actually being present - mirrors the per-engine field pattern while
         # keeping the unloaded state an honest null.
         "audiocpp_model": (
             os.path.basename(audiocpp.get("model", "")) or None
@@ -306,7 +306,7 @@ async def upload_voice(
             if "too short" in str(exc):
                 raise HTTPException(
                     status_code=400,
-                    detail="Voice sample too short — need at least a few seconds of clear speech",
+                    detail="Voice sample too short - need at least a few seconds of clear speech",
                 )
             raise
         # Set voice profile on session's TTSPipeline (overwrite on re-upload)

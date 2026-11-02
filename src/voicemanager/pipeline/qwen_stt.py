@@ -1,7 +1,7 @@
 """Qwen3-ASR streaming STT pipeline.
 
 Per-connection state machine wrapping qwen-asr's streaming API.
-One instance per WebSocket connection — created on connect, disposed on disconnect.
+One instance per WebSocket connection - created on connect, disposed on disconnect.
 """
 import asyncio
 import logging
@@ -28,7 +28,7 @@ class QwenSTTPipeline:
     faster-whisper + Silero VAD. One instance per WebSocket connection.
 
     The qwen-asr streaming state accumulates audio and updates state.text
-    with progressive transcription results. No external VAD needed — the
+    with progressive transcription results. No external VAD needed - the
     model handles voice detection internally.
 
     IMPORTANT: feed_sync() calls streaming_transcribe() which blocks.
@@ -53,7 +53,7 @@ class QwenSTTPipeline:
         self._last_text = ""
 
     def feed_sync(self, pcm_bytes: bytes) -> bool:
-        """Feed PCM bytes to streaming engine (SYNCHRONOUS — blocks).
+        """Feed PCM bytes to streaming engine (SYNCHRONOUS - blocks).
 
         Converts PCM to float32, calls streaming_transcribe(), checks for
         text delta. Returns True if state.text changed from last call.
@@ -85,7 +85,7 @@ class QwenSTTPipeline:
         return text, language, self._segment_index
 
     def finalize_sync(self) -> tuple[str, str, int]:
-        """Flush remaining audio and return final result (SYNCHRONOUS — blocks).
+        """Flush remaining audio and return final result (SYNCHRONOUS - blocks).
 
         Calls finish_streaming_transcribe() to process buffered audio.
         Returns (text, language, segment_index).
@@ -101,7 +101,7 @@ class QwenSTTPipeline:
         return text, language, self._segment_index
 
     async def finalize(self) -> tuple[str, str, int]:
-        """Async wrapper for finalize_sync — runs in thread pool.
+        """Async wrapper for finalize_sync - runs in thread pool.
 
         Returns (text, language, segment_index) of the final transcription.
         """

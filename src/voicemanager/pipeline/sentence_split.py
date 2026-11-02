@@ -34,12 +34,15 @@ def split_sentence(text: str, min_len: int = 10, language_str: str = "[EN]") -> 
 
 def split_sentences_latin(text: str, min_len: int = 10) -> list[str]:
     """Split long text into short sentences of more than min_len words."""
-    # CJK full stop, exclamation, question mark and semicolon; CJK comma; curly quotes
-    text = re.sub("[。！？；]", ".", text)
-    text = re.sub("[，]", ",", text)
-    text = re.sub("[“”]", '"', text)
-    text = re.sub("[‘’]", "'", text)
-    text = re.sub(r"[\<\>\(\)\[\]\"«»]+", "", text)
+    # Written as escapes so the file stays ASCII: U+3002 ideographic full stop,
+    # U+FF01 fullwidth exclamation, U+FF1F fullwidth question mark, U+FF1B fullwidth
+    # semicolon, U+FF0C fullwidth comma, U+201C/U+201D curly double quotes,
+    # U+2018/U+2019 curly single quotes, U+00AB/U+00BB guillemets.
+    text = re.sub("[\u3002\uff01\uff1f\uff1b]", ".", text)
+    text = re.sub("[\uff0c]", ",", text)
+    text = re.sub("[\u201c\u201d]", '"', text)
+    text = re.sub("[\u2018\u2019]", "'", text)
+    text = re.sub(r"[\<\>\(\)\[\]\"\u00ab\u00bb]+", "", text)
     text = re.sub("[\n\t ]+", " ", text)
     text = re.sub("([,.!?;])", r"\1 $#!", text)
     sentences = [s.strip() for s in text.split("$#!")]
@@ -78,8 +81,9 @@ def merge_short_sentences_latin(sens: list[str]) -> list[str]:
 
 def split_sentences_zh(text: str, min_len: int = 10) -> list[str]:
     """Split long text into short sentences of more than min_len characters."""
-    text = re.sub("[。！？；]", ".", text)
-    text = re.sub("[，]", ",", text)
+    # Same CJK punctuation as the Latin splitter above, as escapes.
+    text = re.sub("[\u3002\uff01\uff1f\uff1b]", ".", text)
+    text = re.sub("[\uff0c]", ",", text)
     text = re.sub("[\n\t ]+", " ", text)
     text = re.sub("([,.!?;])", r"\1 $#!", text)
     sentences = [s.strip() for s in text.split("$#!")]

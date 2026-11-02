@@ -159,7 +159,7 @@ class OpenVoiceTTSEngine(TTSEngine):
         yield audio_np
 
     def synthesize_cloned(self, text: str, tgt_se, speaker_key: str = "EN-US", speed: float = 1.0) -> tuple[np.ndarray, int]:
-        """Synthesize with voice cloning — applies tone color conversion with target speaker embedding.
+        """Synthesize with voice cloning - applies tone color conversion with target speaker embedding.
 
         Args:
             text: Single sentence to synthesize
@@ -497,7 +497,7 @@ class TTSStreamPipeline:
 
     @property
     def synthesis_task(self) -> asyncio.Task | None:
-        """The live synthesis task, if any — read-only.
+        """The live synthesis task, if any - read-only.
 
         TTSSession needs to see this one to enforce "at most one TTS request in flight
         per connection" across both it and the one-shot `tts` task it owns.
@@ -537,7 +537,7 @@ class TTSStreamPipeline:
             chunking: "sentence" or "clause"; fixed at request start. Validated
                 upstream by the protocol model.
         """
-        # New request — start fresh
+        # New request - start fresh
         if self._request_id != request_id:
             # The superseded synthesis is cut loose, never awaited. cancel() would
             # await it, and a task blocked inside run_in_executor cannot be interrupted --
@@ -593,7 +593,7 @@ class TTSStreamPipeline:
                 for s in sentences[:-1]:
                     await self._sentence_queue.put(s)
                 self._text_buffer = sentences[-1]
-            # else: single element or empty — keep in buffer, may be fragment
+            # else: single element or empty - keep in buffer, may be fragment
 
     async def flush_timeout(self, websocket, request_id: str) -> None:
         """Safety flush when no chunk arrives within timeout.
@@ -816,7 +816,7 @@ class TTSStreamPipeline:
         finally:
             # Send audio_end after all sentences synthesized
             if not self._audio_started:
-                # No sentences were synthesized — still send audio_start + audio_end pair
+                # No sentences were synthesized - still send audio_start + audio_end pair
                 await websocket.send_text(
                     AudioStartMessage(
                         request_id=request_id,
@@ -839,7 +839,7 @@ class TTSStreamPipeline:
 
         AWAITS the cancelled task, so it parks the caller until a blocked executor
         thread finishes. Fine when superseding a request on a path that can afford to
-        wait; NOT usable on the cancel path — see abandon().
+        wait; NOT usable on the cancel path - see abandon().
         """
         if self._synthesis_task is not None and not self._synthesis_task.done():
             self._synthesis_task.cancel()

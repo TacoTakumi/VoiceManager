@@ -16,7 +16,7 @@ scripts/spike_nemotron_2606.py):
   1. transcribe_step(requests) routes by Frame.stream_id and auto-manages per-stream
      state: a Frame with is_first=True creates the state (init_state), is_last=True
      deletes it AND frees the stream's slot in the shared feature bufferer. We rely on
-     this instead of open_session()/close_session() — those reset the ENTIRE shared
+     this instead of open_session()/close_session() - those reset the ENTIRE shared
      state pool (every concurrent connection), so a per-connection wrapper must never
      call them.
   2. The shared bufferer advances exactly one chunk_size_in_secs step per Frame, using
@@ -59,7 +59,7 @@ class NemotronSTTPipeline:
             stream_id: unique per-connection stream id (keys this connection's
                 state + bufferer slot; must be unique across live connections).
             att_context_size: [left, right] cache-aware latency mode (informational
-                here — the shared model's att_context_size is set once at load).
+                here - the shared model's att_context_size is set once at load).
         """
         self._pipeline = shared_pipeline
         self._stream_id = stream_id
@@ -69,7 +69,7 @@ class NemotronSTTPipeline:
         chunk_secs = getattr(shared_pipeline, "chunk_size_in_secs", None)
         if chunk_secs is None:
             raise ValueError(
-                "shared_pipeline is missing chunk_size_in_secs — cannot size the "
+                "shared_pipeline is missing chunk_size_in_secs - cannot size the "
                 "cache-aware feed buffer"
             )
         self._chunk_samples = int(round(chunk_secs * SAMPLE_RATE))
@@ -146,7 +146,7 @@ class NemotronSTTPipeline:
 
         Each EoU step completes an utterance: queue exactly one final
         carrying the current segment_index, advance the segment, and do NOT count it
-        as an interim — the completed text is a final, surfaced via take_final(), so
+        as an interim - the completed text is a final, surfaced via take_final(), so
         it is never emitted twice. A single feed() may span zero, one, or several
         chunks depending on frame size; interim/final bookkeeping is per chunk.
         """
@@ -213,7 +213,7 @@ class NemotronSTTPipeline:
     def reset(self) -> None:
         """Clear the live partial after a final.
 
-        Does NOT advance segment_index — feed() already advanced it on the EoU step
+        Does NOT advance segment_index - feed() already advanced it on the EoU step
         (unlike qwen, where reset() owns the increment).
         """
         self._last_partial = ""

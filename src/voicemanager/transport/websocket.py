@@ -45,7 +45,7 @@ def _make_hold_machine(settings) -> EndpointHoldMachine | None:
     """Build the speculative endpoint-hold machine, or None when disabled.
 
     VM_STT_ENDPOINT_HOLD_MS=0 -> None -> the nemotron branch bypasses the hold
-    machine entirely (immediate finals, no endpoint frames — pre-feature behavior).
+    machine entirely (immediate finals, no endpoint frames - pre-feature behavior).
     """
     if settings.stt_endpoint_hold_ms > 0:
         return EndpointHoldMachine(settings.stt_endpoint_hold_ms)
@@ -56,13 +56,13 @@ async def _drive_nemotron_stt(pipeline, hold_machine, data: bytes, send, *, sess
     """Drive one inbound nemotron audio frame; emit TranscriptionMessages via `send`.
 
     `send` is an async callable taking a TranscriptionMessage (websocket send in
-    production, a list collector in tests) — the WS handler and the tests share this
+    production, a list collector in tests) - the WS handler and the tests share this
     one code path so behavior can't drift.
 
     Two regimes:
-      * hold_machine is None — speculation disabled (VM_STT_ENDPOINT_HOLD_MS=0):
+      * hold_machine is None - speculation disabled (VM_STT_ENDPOINT_HOLD_MS=0):
         legacy immediate-final path, byte-for-byte pre-feature behavior.
-      * hold_machine set — speculative endpoint-hold: on
+      * hold_machine set - speculative endpoint-hold: on
         acoustic EoU emit a provisional endpoint frame (is_final=false,
         endpoint=true) and start an audio-clock hold; once a hold-window's worth of
         post-EoU audio has been fed, emit the immutable confirmed final.
@@ -100,7 +100,7 @@ async def _drive_nemotron_stt(pipeline, hold_machine, data: bytes, send, *, sess
         finals.append(final)
 
     # Decoded speech (an interim partial or a fresh final) during the hold
-    # reopens the held turn — cancel its pending confirm, fold the held text into a
+    # reopens the held turn - cancel its pending confirm, fold the held text into a
     # stitch prefix, and remap the resumed NeMo segment onto the held segment_index.
     # The complement: once a hold has confirmed, was_holding is False here,
     # so a later turn never reopens and simply takes the next remapped segment_index.
@@ -132,7 +132,7 @@ async def _drive_nemotron_stt(pipeline, hold_machine, data: bytes, send, *, sess
 
     # Audio fed after the EoU point advances the audio clock; once the
     # hold window elapses, confirm the immutable final. Skip on a frame that just
-    # (re)started a hold or reopened — that frame's audio is the boundary, not the hold.
+    # (re)started a hold or reopened - that frame's audio is the boundary, not the hold.
     if was_holding and not new_eou:
         confirmed = hold_machine.advance(n_samples)
         if confirmed is not None:
@@ -164,15 +164,15 @@ async def _teardown_nemotron_stt(pipeline, hold_machine, send, *, session_id: st
     (the WS finally-block after client end/disconnect). Runs pipeline.finalize() to flush the
     NeMo residue, then emits ONE is_final=true frame that never silently drops held text:
 
-      * hold pending — the held text is already stitched and at its emitted segment_index;
+      * hold pending - the held text is already stitched and at its emitted segment_index;
         merge any finalize tail into the same turn (one final per turn).
-      * mid-stitch (reopened, awaiting the resumed EoU) — fold the stitch prefix in and remap
+      * mid-stitch (reopened, awaiting the resumed EoU) - fold the stitch prefix in and remap
         the pipeline's tail so the held prefix is never lost.
-      * hold disabled (hold_machine None) — legacy tail-only final at the pipeline segment.
+      * hold disabled (hold_machine None) - legacy tail-only final at the pipeline segment.
 
-    Idempotent by state: after emitting, the flush clears its sources —
+    Idempotent by state: after emitting, the flush clears its sources -
     take_held()/finalize() gate their own state, and pipeline.reset() + clear_stitch()
-    drop the live partial and mid-stitch prefix — so a second call emits nothing,
+    drop the live partial and mid-stitch prefix - so a second call emits nothing,
     regardless of whether the socket is still open. `send` is the same async sink used
     by _drive_nemotron_stt so behavior can't drift.
     """
@@ -293,18 +293,18 @@ async def websocket_endpoint(websocket: WebSocket):
     """Main WebSocket handler for full-duplex audio streaming (STT + TTS).
 
     Protocol flow:
-    1. Auth check before accept — the handshake request must carry
+    1. Auth check before accept - the handshake request must carry
        'Authorization: Bearer <token>'; without a valid token it is rejected during
        the handshake, which clients see as an HTTP 403. The token is kept
        on websocket.state.token for the rest of the connection
-    2. Accept and send handshake — session_id + audio_format
+    2. Accept and send handshake - session_id + audio_format
     3. Create STTPipeline and TTSPipeline per connection
     4. Register session in registry
     5. Unified receive() loop with inactivity timeout: binary frames -> STT, text frames -> TTS routing
-    6. First binary frame validated — error frame + close 1003 on mismatch
+    6. First binary frame validated - error frame + close 1003 on mismatch
     7. TTS dispatched through the connection's TTSSession, which owns the single
        in-flight request and runs it as an asyncio.Task for full-duplex
-    8. TTS cancellation is a method on that session, not logic inlined here — the
+    8. TTS cancellation is a method on that session, not logic inlined here - the
        tts_cancel branch is a thin delegation
     9. TTSPipeline disposed and session removed in finally block
     """
@@ -312,7 +312,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # Reject before accept without a valid bearer token. websocket_token
     # closes the socket with 1008 before accept(), so no WebSocket is ever
-    # established and this code never reaches the client — the ASGI server rejects
+    # established and this code never reaches the client - the ASGI server rejects
     # the handshake with HTTP 403 instead. A token in the query string is
     # ignored; the store lookup runs in the thread pool.
     token = await websocket_token(websocket)
@@ -400,7 +400,7 @@ async def websocket_endpoint(websocket: WebSocket):
         audiocpp_preroll = bytearray()
     else:
         # Whisper path: existing behavior
-        # Use getattr for safe access — app.state attributes absent when TestClient skips lifespan
+        # Use getattr for safe access - app.state attributes absent when TestClient skips lifespan
         vad_model = getattr(websocket.app.state, "vad_model", None)
         whisper_model = getattr(websocket.app.state, "whisper_model", None)
         executor = getattr(websocket.app.state, "executor", None)
@@ -438,7 +438,7 @@ async def websocket_endpoint(websocket: WebSocket):
         def clear_partial() -> None:
             # Drop the streaming engine's uncommitted partial. reset() reinitialises the
             # streaming state and advances to the next (monotonic, never rewound)
-            # segment_index. Applies to qwen and audio.cpp — both keep a live
+            # segment_index. Applies to qwen and audio.cpp - both keep a live
             # get_current_text() partial and no speculative hold to preserve.
             pipeline.reset()
     turn_tracker = TurnTracker(clear_partial=clear_partial)
@@ -550,7 +550,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # The connection's single in-flight TTS request lives on the session,
     # not in this loop. Both the `tts` and `tts_stream` branches dispatch through it, so
-    # at most one synthesis task can ever be live here — and cancellation is a method any
+    # at most one synthesis task can ever be live here - and cancellation is a method any
     # caller can reach (a future server-side barge-in fires from the STT path).
     tts_session: TTSSession | None = None
     if tts_pipeline is not None:
@@ -579,7 +579,7 @@ async def websocket_endpoint(websocket: WebSocket):
         -- so no engine can emit an un-stamped frame.
 
         One exception: a held final (is_final under the endpoint-hold) already carries
-        the turn its audio was received in — set from the hold, which may predate the
+        the turn its audio was received in - set from the hold, which may predate the
         current turn when it confirms across a turn_start. Do NOT overwrite that with the
         send-time turn; the id on the frame is the race-free fence the client reads. Only the
         nemotron hold path has held finals; whisper/qwen (hold_machine None) stamp normally.
@@ -618,11 +618,11 @@ async def websocket_endpoint(websocket: WebSocket):
             remaining = timeout - elapsed
 
             if remaining <= 0:
-                # Timeout expired — close connection.
+                # Timeout expired - close connection.
                 # Flush any held/stitched nemotron text as the confirmed
                 # final BEFORE closing. The finally-block teardown runs after close()
                 # (its send would fail on a closed socket), and the mid-stitch state
-                # (reopened, is_holding=False) has no wall-clock fallback — so without
+                # (reopened, is_holding=False) has no wall-clock fallback - so without
                 # this the stitched turn is silently dropped at the inactivity timeout.
                 # _teardown_nemotron_stt is idempotent, so the finally call is then a no-op.
                 if stt_engine_type in ("nemotron", "audiocpp"):
@@ -674,7 +674,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 effective_timeout = min(effective_timeout, settings.stt_endpoint_hold_ms / 1000.0)
             # While an audio.cpp utterance is un-flushed, cap the receive timeout to the
             # silence window so a gap in inbound audio wakes the loop at the endpoint threshold
-            # (below) instead of only at session close — the mid-session FLUSH that surfaces
+            # (below) instead of only at session close - the mid-session FLUSH that surfaces
             # per-utterance partials + a final. Bounded like the nemotron hold's silent-client
             # backstop; while audio keeps arriving each frame returns before this elapses.
             if stt_engine_type == "audiocpp" and audiocpp_last_audio is not None:
@@ -780,7 +780,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # (not the turn that may open while its inference is still in flight).
                 turn_tracker.mark_received()
 
-                # STT path — route to correct pipeline
+                # STT path - route to correct pipeline
                 if stt_engine_type == "nemotron":
                     # Generic streaming drive path over the feed/get_current_text/take_final
                     # contract: acoustic-EoU driven, with a speculative endpoint-hold when
@@ -918,7 +918,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         tts_req.voice,
                     )
                     # The session dispatches the synthesis task and supersedes
-                    # whatever was in flight — one TTS request per connection.
+                    # whatever was in flight - one TTS request per connection.
                     await tts_session.speak(
                         text=tts_req.text,
                         request_id=tts_req.request_id,
@@ -1137,7 +1137,7 @@ async def _send_transcription(
 
     Each segment from faster-whisper becomes a separate transcription frame. `send` is the
     handler's shared stamping sink (_emit), so whisper's finals carry the receive-time
-    turn_id like every other engine's frames — this function never touches the
+    turn_id like every other engine's frames - this function never touches the
     socket directly.
     """
     segments, info, duration = await pipeline.run_inference(loop)
