@@ -22,6 +22,8 @@ PASSWORD = "correct horse battery"
 SIGNIN = "/signin"
 SIGNOUT = "/signout"
 TOKENS = "/tokens"
+CREATE = "/tokens/create"
+ACCOUNT = "/account"
 
 
 @pytest.fixture
@@ -300,19 +302,31 @@ def test_a_use_that_moves_the_expiry_sets_the_cookie_again(ann, db_path):
 
 # --- the content security policy ----------------------------------------------
 
-def _pages(client_with_session: TestClient, client_without: TestClient):
+def _signed_in() -> tuple[TestClient, str]:
+    """A client with a session, and that session's secret for the forms."""
+    client = make_client()
+    header = session_cookie_header(sign_in(client))
+    secret = header.split(";", 1)[0].split("=", 1)[1]
+    return client, secret
+
+
+def _pages(client_with_session: TestClient, client_without: TestClient, session_secret: str):
     """Every page the shell serves, as (label, response)."""
+    created = client_with_session.post(
+        CREATE, data={"name": "csp-check", SESSION_FIELD: session_secret})
+    assert created.status_code == 200, created.text[:200]
     return [
         ("signin", client_without.get(SIGNIN)),
         ("signin-failed", sign_in(client_without, password="not it")),
         ("tokens", client_with_session.get(TOKENS)),
+        ("account", client_with_session.get(ACCOUNT)),
+        ("tokens-after-create", created),
     ]
 
 
 def test_every_page_has_a_strict_csp_and_no_script(ann):
-    signed_in = make_client()
-    sign_in(signed_in)
-    for label, response in _pages(signed_in, make_client()):
+    signed_in, session_secret = _signed_in()
+    for label, response in _pages(signed_in, make_client(), session_secret):
         assert response.headers["content-type"].startswith("text/html"), label
         directives = csp_directives(response)
         policy = response.headers["content-security-policy"]
@@ -379,9 +393,8 @@ def test_the_favicon_files_hold_the_sizes_browsers_ask_for(ann):
 
 
 def test_every_page_links_the_favicons_and_draws_the_mark(ann):
-    signed_in = make_client()
-    sign_in(signed_in)
-    for label, response in _pages(signed_in, make_client()):
+    signed_in, session_secret = _signed_in()
+    for label, response in _pages(signed_in, make_client(), session_secret):
         html = response.text
         assert '<link rel="icon" href="/favicon.svg" type="image/svg+xml">' in html, label
         assert '<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">' in html, label

@@ -629,6 +629,14 @@ def test_mint_returns_a_vmp_secret(store):
     assert mint_token(store, "ann", "phone") != secret
 
 
+def test_mint_token_strips_the_name(store):
+    """' phone' and 'phone' are one name, from the CLI as from the web form."""
+    mint_token(store, "ann", "  phone ")
+    assert [t.name for t in list_tokens(store, "ann")] == ["phone"]
+    with pytest.raises(AccountError, match="already has a token named 'phone'"):
+        mint_token(store, "ann", "phone")
+
+
 def test_store_holds_only_the_hash_and_last4_of_a_token(store, db_path):
     secret = mint_token(store, "ann", "laptop")
     token_for(store, secret, now=T0)

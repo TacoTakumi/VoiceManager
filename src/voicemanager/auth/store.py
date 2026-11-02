@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
@@ -130,7 +131,15 @@ class SqliteStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The store holds password and token hashes, and VM_DB_PATH may point
+        # outside a private home: a new directory is 0700 and a new file 0600,
+        # created with those modes so there is no window at the umask default.
+        # Existing files and directories keep whatever mode they have.
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
+            pass
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")

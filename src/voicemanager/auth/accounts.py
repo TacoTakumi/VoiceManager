@@ -519,6 +519,7 @@ def mint_token(
     owner = require_user(store, owner).name
     if not name or not name.strip():
         raise AccountError("A token needs a name.")
+    name = name.strip()
     secret = TOKEN_PREFIX + secrets.token_urlsafe(32)
     token = Token(
         owner=owner,

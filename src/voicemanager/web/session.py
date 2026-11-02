@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import dataclasses
 import secrets
-from pathlib import Path
 
 from fastapi import Request, Response
 from fastapi.responses import PlainTextResponse
@@ -57,18 +56,14 @@ class WebUser:
     secret: str
 
 
-def store_file(request: HTTPConnection) -> Path | None:
-    """The store file the app was built with, or None for the configured one."""
-    return getattr(request.app.state, "store_file", None)
-
-
 def open_web_store(request: HTTPConnection) -> SqliteStore:
-    """Open the auth store for one unit of work on ``request``.
+    """Open the configured auth store for one unit of work on ``request``.
 
-    Call it from a plain ``def`` route or dependency (FastAPI runs those in
-    the thread pool), so the SQLite work stays off the event loop.
+    The same store the bearer lookup uses. Call it from a plain ``def`` route
+    or dependency (FastAPI runs those in the thread pool), so the SQLite work
+    stays off the event loop.
     """
-    return open_store(store_file(request))
+    return open_store()
 
 
 def resume_user(request: Request) -> WebUser | None:

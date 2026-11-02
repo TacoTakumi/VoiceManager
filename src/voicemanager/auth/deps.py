@@ -22,14 +22,21 @@ from voicemanager.auth.store import Token, open_store
 
 logger = logging.getLogger(__name__)
 
-BEARER_PREFIX = "Bearer "
+BEARER_SCHEME = "bearer"
 
 
 def bearer_secret(authorization: str | None) -> str | None:
-    """The secret in an Authorization header value, or None when it carries none."""
-    if not authorization or not authorization.startswith(BEARER_PREFIX):
+    """The secret in an Authorization header value, or None when it carries none.
+
+    The scheme is matched case-insensitively, as RFC 7235 says it must be;
+    the secret keeps its case.
+    """
+    if not authorization:
         return None
-    return authorization[len(BEARER_PREFIX):].strip() or None
+    scheme, separator, rest = authorization.partition(" ")
+    if not separator or scheme.lower() != BEARER_SCHEME:
+        return None
+    return rest.strip() or None
 
 
 def lookup_token(secret: str) -> Token | None:

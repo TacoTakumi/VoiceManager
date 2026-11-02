@@ -182,6 +182,10 @@ def test_voice_upload_returns_401(client, revoked_secret, case):
     ("bearerabc", None),
     ("Bearer abc", "abc"),
     ("Bearer  abc ", "abc"),
+    # The scheme is case-insensitive (RFC 7235); the secret is not.
+    ("bearer abc", "abc"),
+    ("BEARER abc", "abc"),
+    ("BeArEr aBc", "aBc"),
 ])
 def test_bearer_secret(value, expected):
     assert deps.bearer_secret(value) == expected

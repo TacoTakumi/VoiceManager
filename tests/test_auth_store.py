@@ -4,7 +4,9 @@ Model-free and server-free: every store lives under pytest's tmp_path, and the
 environment that decides the default location (HOME, XDG_STATE_HOME,
 VM_DB_PATH) is set per test with monkeypatch.
 """
+import os
 import sqlite3
+import stat
 
 import pytest
 
@@ -98,6 +100,29 @@ def test_open_store_default_creates_file_at_resolved_path(clean_env, tmp_path, m
         store.add_user(_user())
     assert (tmp_path / "xdg" / "voicemanager" / STORE_FILENAME).is_file()
     assert not clean_env.exists()
+
+
+def test_open_store_creates_a_private_file_and_directory(tmp_path):
+    """A fresh store is 0600 in a 0700 directory whatever the umask says."""
+    path = tmp_path / "state" / "voicemanager" / "state.db"
+    previous = os.umask(0o022)
+    try:
+        with open_store(path) as store:
+            store.add_user(_user())
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_open_store_leaves_an_existing_file_mode_alone(tmp_path):
+    path = tmp_path / "state.db"
+    with open_store(path):
+        pass
+    path.chmod(0o644)
+    with open_store(path) as store:
+        store.add_user(_user())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 
 def test_open_store_explicit_path(tmp_path):
