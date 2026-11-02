@@ -201,7 +201,41 @@ def _too_large(limit: int) -> HTTPException:
     )
 
 
-@http_router.post("/voice/upload")
+def _declared_length(value: str) -> int | None:
+    """The Content-Length a client declared, or None when it is not a plain number.
+
+    str.isdigit() alone also accepts digits int() rejects (a superscript two,
+    for one), so the value must be ASCII as well. A value that is not a plain
+    number is treated like a missing header: the body cap still applies.
+    """
+    if value.isascii() and value.isdigit():
+        return int(value)
+    return None
+
+
+# The handler reads the multipart body itself (see its docstring), so FastAPI
+# does not know the request body; this keeps /docs and /openapi.json honest.
+_UPLOAD_REQUEST_BODY = {
+    "required": True,
+    "content": {
+        "multipart/form-data": {
+            "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "format": "binary",
+                        "description": "A WAV voice sample for cloning.",
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+@http_router.post("/voice/upload", openapi_extra={"requestBody": _UPLOAD_REQUEST_BODY})
 async def upload_voice(
     request: Request,
     session_id: str = Query(default=""),
@@ -260,8 +294,8 @@ async def upload_voice(
         raise HTTPException(status_code=503, detail="TTS engine not loaded")
 
     limit = get_settings().upload_max_bytes
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > limit:
+    declared = _declared_length(request.headers.get("content-length", ""))
+    if declared is not None and declared > limit:
         raise _too_large(limit)
     capped = Request(request.scope, _capped_receive(request.receive, limit))
     try:

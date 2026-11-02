@@ -154,13 +154,44 @@ def test_unknown_session_refused_before_the_body_is_read():
     assert counter.bytes_read == 0
 
 
-def test_form_without_file_field_is_400(fake_extractor):
+@pytest.mark.parametrize("form", [
+    pytest.param({"files": {"other": ("note.txt", b"hello", "text/plain")}}, id="no-file-field"),
+    pytest.param({"files": {"other": ("note.txt", b"hello", "text/plain")},
+                  "data": {"file": "hello"}}, id="file-is-a-text-field"),
+])
+def test_form_without_a_file_upload_is_400(fake_extractor, form):
     app, counter, client = _app()
     _live_session(app)
-    resp = _post(client, headers=authkit.auth_headers(),
-                 files={"other": ("note.txt", b"hello", "text/plain")})
+    resp = client.post("/voice/upload", params={"session_id": "live-session"},
+                       headers=authkit.auth_headers(), **form)
     assert resp.status_code == 400
+    assert resp.json()["detail"] == "Missing file field"
     assert fake_extractor == []
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("", None),
+    ("12", 12),
+    ("007", 7),
+    ("-1", None),
+    ("1e3", None),
+    ("\u00b2", None),  # superscript two: isdigit() is true, int() rejects it
+    ("\uff11\uff12", None),  # fullwidth digits: int() accepts, but not a plain number
+])
+def test_declared_length_accepts_only_plain_ascii_digits(value, expected):
+    from voicemanager.transport.http import _declared_length
+
+    assert _declared_length(value) == expected
+
+
+def test_openapi_describes_the_multipart_upload_body():
+    app, counter, client = _app()
+    operation = app.openapi()["paths"]["/voice/upload"]["post"]
+    body = operation["requestBody"]
+    assert body["required"] is True
+    schema = body["content"]["multipart/form-data"]["schema"]
+    assert schema["required"] == ["file"]
+    assert schema["properties"]["file"]["format"] == "binary"
 
 
 def test_empty_file_is_400(fake_extractor):
