@@ -730,6 +730,11 @@ class LiveSession:
             "cancelled": cancelled,
         })
 
+    @property
+    def t0(self) -> float:
+        """The clock time the log's ``t`` counts from."""
+        return self._t0
+
     def summary_line(self) -> str:
         """One line for the end of a call: turn time, first audio, budget, cut-ins, mode."""
         turns = [r.turn_ms for r in self.results]
@@ -775,12 +780,15 @@ def capture_paths(wav_path: str | pathlib.Path) -> tuple[str, str, str]:
 
 
 def write_capture(wav_path: str | pathlib.Path, mic: MicCapture, player: AudioPlayer,
-                  out_rate: int | None) -> tuple[str, str, str]:
+                  out_rate: int | None, log_t0: float | None = None) -> tuple[str, str, str]:
     """Write the mic, the output timeline (silence included) and both start times.
 
     To align the two offline, put the output's first sample at
     ``out.first_dac_time - mic.first_adc_time`` seconds into the mic (or use the
-    monotonic times when the DAC/ADC times are missing or zero).
+    monotonic times when the DAC/ADC times are missing or zero). ``log_t0`` is the
+    ``time.monotonic()`` the call log's ``t`` counts from: a log line falls at
+    ``t + log.t0_monotonic - mic.first_adc_time`` seconds into the mic when the stream
+    time is the monotonic clock (``mic.first_monotonic`` is a looser stand-in).
     """
     mic_path, out_path, json_path = capture_paths(wav_path)
     with mic._lock:
@@ -795,6 +803,7 @@ def write_capture(wav_path: str | pathlib.Path, mic: MicCapture, player: AudioPl
         "out": {"wav": out_path, "sample_rate": out_rate, "samples": len(timeline) // 2,
                 "first_dac_time": player.first_dac_time,
                 "first_monotonic": player.first_monotonic},
+        "log": {"t0_monotonic": log_t0},
         "clock": "first_*_time: PortAudio stream time from sounddevice time_info; "
                  "first_monotonic: time.monotonic() at the first callback",
     }
@@ -953,7 +962,8 @@ async def live(args: argparse.Namespace) -> None:
     print(f"log: {log_path}  wav: {wav_path}")
     if capture is not None:
         mic_path, out_path, json_path = write_capture(
-            wav_path, capture, player, player.sample_rate or client.last_tts_sample_rate)
+            wav_path, capture, player, player.sample_rate or client.last_tts_sample_rate,
+            log_t0=session.t0 if session is not None else None)
         print(f"capture: {mic_path}  {out_path}  {json_path}")
     if session is not None:
         print(session.summary_line())

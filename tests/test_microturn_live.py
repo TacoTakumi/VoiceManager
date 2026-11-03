@@ -291,6 +291,28 @@ def test_live_write_capture_writes_mic_timeline_and_times(tmp_path):
     assert meta["mic"]["first_adc_time"] == 5.0 and meta["mic"]["samples"] == 2
     assert meta["out"]["first_dac_time"] == 5.5 and meta["out"]["samples"] == 2
     assert meta["out"]["sample_rate"] == 24000
+    assert meta["log"]["t0_monotonic"] is None
+
+
+def test_live_write_capture_saves_the_log_origin(tmp_path):
+    player = mc.AudioPlayer(timeline=True)
+    _, _, json_path = mc.write_capture(tmp_path / "call.wav", mc.MicCapture(), player, 24000,
+                                       log_t0=263463.576)
+    meta = json.loads(pathlib.Path(json_path).read_text())
+    assert meta["log"]["t0_monotonic"] == 263463.576
+
+
+def test_live_session_exposes_the_origin_its_log_counts_from():
+    session, log, _ = _session([LISTEN])
+    assert session.t0 == 100.0  # the fake clock's time when the session was made
+
+    async def run():
+        session.on_transcription(_frame("hi"), 100.2)
+        await session.run_tick(100.6)
+
+    asyncio.run(run())
+    tick = [line for line in _lines(log) if line["type"] == "tick"][0]
+    assert tick["t"] == pytest.approx(100.6 - session.t0)
 
 
 def test_live_wav_valid(tmp_path):

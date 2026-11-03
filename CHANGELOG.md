@@ -13,6 +13,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   silence (`<stem>-out.wav`) and both streams' first-sample clock times
   (`<stem>-capture.json`), so an offline turn-model replay can line the two
   channels up. Off by default; the existing WAV is unchanged.
+  The JSON also holds `log.t0_monotonic`, the clock time the call log's `t`
+  counts from, so each log line can be placed on the mic's clock.
 
 ## [0.4.1]
 
