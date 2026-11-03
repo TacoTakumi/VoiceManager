@@ -538,10 +538,18 @@ class AudioPlayer:
     The TTS task feeds a byte buffer with ``enqueue``; the output stream's callback, on
     the audio thread, takes from it with ``pull``, which pads with silence when the
     buffer runs dry. Every real byte pulled is kept in ``played`` for the WAV.
+
+    With ``timeline=True`` it also keeps ``timeline``: every byte sent to the device,
+    the silence padding included, so the output can be laid against the mic on one
+    clock. ``first_dac_time`` (PortAudio stream time) and ``first_monotonic`` mark the
+    first callback.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, timeline: bool = False) -> None:
         self.played = bytearray()
+        self.timeline: bytearray | None = bytearray() if timeline else None
+        self.first_dac_time: float | None = None
+        self.first_monotonic: float | None = None
         self.sample_rate: int | None = None
         self._buf = bytearray()
         self._lock = threading.Lock()
@@ -561,6 +569,9 @@ class AudioPlayer:
     def _callback(self, outdata, frames: int, time_info, status) -> None:
         if status:
             logger.debug("output status: %s", status)
+        if self.first_monotonic is None:
+            self.first_monotonic = time.monotonic()
+            self.first_dac_time = getattr(time_info, "outputBufferDacTime", None)
         outdata[:] = self.pull(frames * 2)
 
     def enqueue(self, pcm: bytes) -> None:
@@ -574,7 +585,10 @@ class AudioPlayer:
             chunk = bytes(self._buf[:n])
             del self._buf[:n]
             self.played += chunk
-        return chunk + b"\x00" * (n - len(chunk))
+        out = chunk + b"\x00" * (n - len(chunk))
+        if self.timeline is not None:
+            self.timeline += out
+        return out
 
     def is_playing(self) -> bool:
         """True while queued audio remains."""
@@ -728,8 +742,71 @@ class LiveSession:
                 f"{self.orchestrator.cutins} cut-ins, tts mode {self.orchestrator.mode}")
 
 
-async def _mic_task(duplex) -> None:
-    """Send the microphone to VoiceManager as 16 kHz mono int16 blocks of 100 ms."""
+class MicCapture:
+    """The mic as captured, for an offline replay: every block, and the first one's time.
+
+    ``first_adc_time`` is PortAudio stream time (the clock the output's DAC time uses);
+    ``first_monotonic`` is ``time.monotonic()`` at the first block, a fallback when the
+    host API reports no stream time.
+    """
+
+    SAMPLE_RATE = 16000
+
+    def __init__(self) -> None:
+        self.pcm = bytearray()
+        self.first_adc_time: float | None = None
+        self.first_monotonic: float | None = None
+        self._lock = threading.Lock()
+
+    def add(self, block: bytes, time_info=None) -> None:
+        """Keep one block; runs on the audio thread."""
+        with self._lock:
+            if self.first_monotonic is None:
+                self.first_monotonic = time.monotonic()
+                self.first_adc_time = getattr(time_info, "inputBufferAdcTime", None)
+            self.pcm += block
+
+
+def capture_paths(wav_path: str | pathlib.Path) -> tuple[str, str, str]:
+    """The mic WAV, output-timeline WAV and timing JSON beside the call's WAV."""
+    p = pathlib.Path(wav_path)
+    stem = p.with_suffix("")
+    return (f"{stem}-mic.wav", f"{stem}-out.wav", f"{stem}-capture.json")
+
+
+def write_capture(wav_path: str | pathlib.Path, mic: MicCapture, player: AudioPlayer,
+                  out_rate: int | None) -> tuple[str, str, str]:
+    """Write the mic, the output timeline (silence included) and both start times.
+
+    To align the two offline, put the output's first sample at
+    ``out.first_dac_time - mic.first_adc_time`` seconds into the mic (or use the
+    monotonic times when the DAC/ADC times are missing or zero).
+    """
+    mic_path, out_path, json_path = capture_paths(wav_path)
+    with mic._lock:
+        mic_pcm = bytes(mic.pcm)
+    write_wav(mic_path, mic_pcm, MicCapture.SAMPLE_RATE)
+    timeline = bytes(player.timeline or b"")
+    write_wav(out_path, timeline, out_rate or MicCapture.SAMPLE_RATE)
+    meta = {
+        "mic": {"wav": mic_path, "sample_rate": MicCapture.SAMPLE_RATE,
+                "samples": len(mic_pcm) // 2, "first_adc_time": mic.first_adc_time,
+                "first_monotonic": mic.first_monotonic},
+        "out": {"wav": out_path, "sample_rate": out_rate, "samples": len(timeline) // 2,
+                "first_dac_time": player.first_dac_time,
+                "first_monotonic": player.first_monotonic},
+        "clock": "first_*_time: PortAudio stream time from sounddevice time_info; "
+                 "first_monotonic: time.monotonic() at the first callback",
+    }
+    pathlib.Path(json_path).write_text(json.dumps(meta, indent=2) + "\n")
+    return mic_path, out_path, json_path
+
+
+async def _mic_task(duplex, capture: MicCapture | None = None) -> None:
+    """Send the microphone to VoiceManager as 16 kHz mono int16 blocks of 100 ms.
+
+    With ``capture`` each block is also kept there, as captured.
+    """
     import sounddevice as sd
 
     loop = asyncio.get_running_loop()
@@ -737,7 +814,10 @@ async def _mic_task(duplex) -> None:
 
     def callback(indata, frames: int, time_info, status) -> None:
         # Runs on the audio thread; hand the block to the event loop.
-        loop.call_soon_threadsafe(blocks.put_nowait, bytes(indata))
+        block = bytes(indata)
+        if capture is not None:
+            capture.add(block, time_info)
+        loop.call_soon_threadsafe(blocks.put_nowait, block)
 
     with sd.RawInputStream(samplerate=16000, channels=1, dtype="int16", blocksize=1600,
                            callback=callback):
@@ -826,12 +906,15 @@ async def live(args: argparse.Namespace) -> None:
 
     log_path, wav_path = live_output_paths(args)
     print("warning: use headphones; there is no echo cancellation")
+    capture = MicCapture() if args.capture else None
+    if capture is not None:
+        print("capture: the mic and the output timeline are saved beside the WAV")
     client = VoiceManagerClient(host=args.vm_host, port=args.vm_port, token=token)
     try:
         await client.__aenter__()
     except (VoiceManagerError, OSError) as exc:
         raise SystemExit(f"error: cannot connect to VoiceManager: {exc}") from exc
-    player = AudioPlayer()
+    player = AudioPlayer(timeline=capture is not None)
     engine = LlamaServerEngine(args.url, model=args.model)
     session = None
     try:
@@ -843,7 +926,7 @@ async def live(args: argparse.Namespace) -> None:
                 session = LiveSession(engine, TickSlicer(), orchestrator, log,
                                       cancelled=sink.is_cancelled)
                 tasks = [asyncio.create_task(c) for c in (
-                    _mic_task(duplex), _stt_task(duplex, session),
+                    _mic_task(duplex, capture), _stt_task(duplex, session),
                     _tts_task(duplex, session, player, sink), _tick_task(session),
                     _errors_task(duplex))]
                 try:
@@ -868,6 +951,10 @@ async def live(args: argparse.Namespace) -> None:
         await client.__aexit__(None, None, None)
     write_wav(wav_path, bytes(player.played), player.sample_rate or client.last_tts_sample_rate)
     print(f"log: {log_path}  wav: {wav_path}")
+    if capture is not None:
+        mic_path, out_path, json_path = write_capture(
+            wav_path, capture, player, player.sample_rate or client.last_tts_sample_rate)
+        print(f"capture: {mic_path}  {out_path}  {json_path}")
     if session is not None:
         print(session.summary_line())
 
@@ -899,6 +986,10 @@ def add_live_arguments(parser: argparse.ArgumentParser) -> None:
                         help="JSON lines log (default: runs/microturn/microturn-<stamp>.jsonl)")
     parser.add_argument("--wav", default=None,
                         help="WAV of the audio played (default: runs/microturn/microturn-<stamp>.wav)")
+    parser.add_argument("--capture", action="store_true",
+                        help="also save the mic as captured (<stem>-mic.wav), the output with "
+                             "its silence (<stem>-out.wav) and both start times "
+                             "(<stem>-capture.json), for an offline turn-model replay")
     parser.add_argument("--tts-mode", choices=TTS_MODES, default="clause",
                         help="clause: the server cuts each utterance into small pieces; "
                              "flush: flush each speaking tick's words (default: clause)")

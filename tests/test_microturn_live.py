@@ -190,6 +190,109 @@ def test_live_player_buffer():
     assert bytes(player.played) == b"\x01\x02\x03\x04\x05\x06"
 
 
+def test_live_player_has_no_timeline_by_default():
+    player = mc.AudioPlayer()
+    player.enqueue(b"\x01\x02")
+    player.pull(4)
+    assert player.timeline is None
+
+
+def test_live_player_timeline_keeps_the_silence_padding():
+    """The capture timeline is every byte sent to the device, so gaps stay in place."""
+    player = mc.AudioPlayer(timeline=True)
+    assert player.pull(4) == b"\x00" * 4  # nothing queued yet: silence
+    player.enqueue(b"\x01\x02")
+    player.pull(4)
+    assert bytes(player.timeline) == b"\x00" * 4 + b"\x01\x02\x00\x00"
+    assert bytes(player.played) == b"\x01\x02"
+
+
+def test_live_player_callback_notes_the_first_dac_time():
+    import types
+
+    player = mc.AudioPlayer(timeline=True)
+    out = bytearray(4)
+    player._callback(out, 2, types.SimpleNamespace(outputBufferDacTime=12.5), None)
+    first = player.first_monotonic
+    assert player.first_dac_time == 12.5 and first is not None
+    player._callback(out, 2, types.SimpleNamespace(outputBufferDacTime=99.0), None)
+    assert player.first_dac_time == 12.5 and player.first_monotonic == first
+    assert len(player.timeline) == 8
+
+
+def test_live_mic_capture_keeps_blocks_and_the_first_adc_time():
+    import types
+
+    cap = mc.MicCapture()
+    cap.add(b"\x01\x00", types.SimpleNamespace(inputBufferAdcTime=3.25))
+    cap.add(b"\x02\x00", types.SimpleNamespace(inputBufferAdcTime=3.35))
+    assert bytes(cap.pcm) == b"\x01\x00\x02\x00"
+    assert cap.first_adc_time == 3.25 and cap.first_monotonic is not None
+
+
+def test_live_mic_task_feeds_the_capture_what_it_sends(monkeypatch):
+    """Each mic block goes both to VoiceManager and, unchanged, into the capture."""
+    import types
+
+    blocks = [b"\x01\x00" * 1600, b"\x02\x00" * 1600]
+
+    class FakeInput:
+        def __init__(self, callback, **kwargs):
+            assert kwargs["samplerate"] == 16000 and kwargs["channels"] == 1
+            self.callback = callback
+
+        def __enter__(self):
+            for i, b in enumerate(blocks):
+                self.callback(b, 1600, types.SimpleNamespace(inputBufferAdcTime=7.0 + i), None)
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Stop(Exception):
+        pass
+
+    class FakeDuplex:
+        def __init__(self):
+            self.sent = []
+
+        async def send_audio(self, pcm):
+            self.sent.append(pcm)
+            if len(self.sent) == len(blocks):
+                raise Stop
+
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(RawInputStream=FakeInput))
+    duplex, cap = FakeDuplex(), mc.MicCapture()
+    with pytest.raises(Stop):
+        asyncio.run(mc._mic_task(duplex, cap))
+    assert duplex.sent == blocks
+    assert bytes(cap.pcm) == b"".join(blocks) and cap.first_adc_time == 7.0
+
+
+def test_live_capture_paths_sit_beside_the_wav():
+    assert mc.capture_paths("runs/microturn/microturn-1.wav") == (
+        "runs/microturn/microturn-1-mic.wav", "runs/microturn/microturn-1-out.wav",
+        "runs/microturn/microturn-1-capture.json")
+
+
+def test_live_write_capture_writes_mic_timeline_and_times(tmp_path):
+    import types
+
+    cap = mc.MicCapture()
+    cap.add(b"\x01\x00\x02\x00", types.SimpleNamespace(inputBufferAdcTime=5.0))
+    player = mc.AudioPlayer(timeline=True)
+    player._callback(bytearray(4), 2, types.SimpleNamespace(outputBufferDacTime=5.5), None)
+    mic_path, out_path, json_path = mc.write_capture(tmp_path / "call.wav", cap, player, 24000)
+    with wave.open(mic_path, "rb") as wf:
+        assert wf.getframerate() == 16000 and wf.readframes(2) == b"\x01\x00\x02\x00"
+    with wave.open(out_path, "rb") as wf:
+        assert wf.getframerate() == 24000 and wf.getnframes() == 2
+    meta = json.loads(pathlib.Path(json_path).read_text())
+    assert meta["mic"]["first_adc_time"] == 5.0 and meta["mic"]["samples"] == 2
+    assert meta["out"]["first_dac_time"] == 5.5 and meta["out"]["samples"] == 2
+    assert meta["out"]["sample_rate"] == 24000
+
+
 def test_live_wav_valid(tmp_path):
     path = tmp_path / "out.wav"
     pcm = b"\x01\x00\x02\x00\x03\x00"
@@ -299,7 +402,8 @@ class FakeSession:
 def _live_args(**overrides) -> argparse.Namespace:
     """The namespace the microturn subcommand of voice_agent.py produces, by default."""
     values = dict(url="http://127.0.0.1:8080", model=None, vm_host="localhost", vm_port=8255,
-                  voice=None, duration=None, log=None, wav=None, tts_mode="clause")
+                  voice=None, duration=None, log=None, wav=None, tts_mode="clause",
+                  capture=False)
     values.update(overrides)
     return argparse.Namespace(**values)
 

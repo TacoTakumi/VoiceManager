@@ -4,6 +4,16 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2]
+
+### Added
+
+- `scripts/voice_agent.py microturn --capture` also saves the mic as captured
+  (`<stem>-mic.wav`, 16 kHz), everything sent to the output device with its
+  silence (`<stem>-out.wav`) and both streams' first-sample clock times
+  (`<stem>-capture.json`), so an offline turn-model replay can line the two
+  channels up. Off by default; the existing WAV is unchanged.
+
 ## [0.4.1]
 
 A sweep of the small corrections that earlier review rounds left open.
