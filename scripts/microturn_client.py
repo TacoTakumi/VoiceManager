@@ -408,10 +408,12 @@ class TTSOrchestrator:
 
     def __init__(self, sink: TTSSink, player: Player,
                  new_id: Callable[[], str] = lambda: str(uuid.uuid4()),
-                 mode: str = "flush"):
+                 mode: str = "flush", cut_in: bool = True):
         if mode not in TTS_MODES:
             raise ValueError(f"unknown TTS mode {mode!r}; expected one of {TTS_MODES}")
         self.mode = mode
+        # False: user words over a playing reply never stop it (echo tests on speakers).
+        self.cut_in = cut_in
         self.sink = sink
         self.player = player
         self.new_id = new_id
@@ -435,7 +437,7 @@ class TTSOrchestrator:
                 await self.sink.flush(self.request_id)
             return
         user_spoke = bool(heard) and heard != NOVOICE
-        if user_spoke and self.player.is_playing():
+        if self.cut_in and user_spoke and self.player.is_playing():
             # After done the server may still be sending audio for the request, so it
             # is cancelled too, not only an open one.
             if self.live:
@@ -930,7 +932,7 @@ async def live(args: argparse.Namespace) -> None:
         check_stt_engine(client.stt_engine)
         async with client.duplex() as duplex:
             sink = SessionTTSSink(duplex, voice=args.voice)
-            orchestrator = TTSOrchestrator(sink, player, mode=args.tts_mode)
+            orchestrator = TTSOrchestrator(sink, player, mode=args.tts_mode, cut_in=args.cut_in)
             with open(log_path, "w") as log:
                 session = LiveSession(engine, TickSlicer(), orchestrator, log,
                                       cancelled=sink.is_cancelled)
@@ -1000,6 +1002,9 @@ def add_live_arguments(parser: argparse.ArgumentParser) -> None:
                         help="also save the mic as captured (<stem>-mic.wav), the output with "
                              "its silence (<stem>-out.wav) and both start times "
                              "(<stem>-capture.json), for an offline turn-model replay")
+    parser.add_argument("--no-cut-in", dest="cut_in", action="store_false",
+                        help="user words over a playing reply never stop it, so the reply "
+                             "plays out (for echo tests on speakers; default: they stop it)")
     parser.add_argument("--tts-mode", choices=TTS_MODES, default="clause",
                         help="clause: the server cuts each utterance into small pieces; "
                              "flush: flush each speaking tick's words (default: clause)")

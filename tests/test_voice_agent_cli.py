@@ -47,6 +47,8 @@ def test_microturn_keeps_the_live_mode_options():
     assert args.url == "http://127.0.0.1:8080"
     assert va.build_parser().parse_args(["microturn"]).capture is False
     assert va.build_parser().parse_args(["microturn", "--capture"]).capture is True
+    assert va.build_parser().parse_args(["microturn"]).cut_in is True
+    assert va.build_parser().parse_args(["microturn", "--no-cut-in"]).cut_in is False
     assert va.build_parser().parse_args(["microturn"]).tts_mode == "clause"
     assert va.build_parser().parse_args(["microturn", "--tts-mode", "flush"]).tts_mode == "flush"
     with pytest.raises(SystemExit):

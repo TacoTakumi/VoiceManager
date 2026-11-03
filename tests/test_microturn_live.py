@@ -425,7 +425,7 @@ def _live_args(**overrides) -> argparse.Namespace:
     """The namespace the microturn subcommand of voice_agent.py produces, by default."""
     values = dict(url="http://127.0.0.1:8080", model=None, vm_host="localhost", vm_port=8255,
                   voice=None, duration=None, log=None, wav=None, tts_mode="clause",
-                  capture=False)
+                  capture=False, cut_in=True)
     values.update(overrides)
     return argparse.Namespace(**values)
 

@@ -15,6 +15,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   channels up. Off by default; the existing WAV is unchanged.
   The JSON also holds `log.t0_monotonic`, the clock time the call log's `t`
   counts from, so each log line can be placed on the mic's clock.
+- `scripts/voice_agent.py microturn --no-cut-in` lets a playing reply play out
+  when the user's words arrive over it, for echo tests on speakers. The cut-in
+  stays on by default.
 
 ## [0.4.1]
 

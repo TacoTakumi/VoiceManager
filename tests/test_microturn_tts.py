@@ -109,6 +109,23 @@ def test_cutin_cancels_and_clears():
     assert sink.calls == before
 
 
+def test_no_cut_in_lets_a_playing_reply_play_out():
+    """With cut-in off, user words over a playing reply cancel nothing and clear nothing."""
+    sink, player = FakeSink(), FakePlayer()
+    orch = mc.TTSOrchestrator(sink, player, new_id=_ids(), cut_in=False)
+    _run(orch, [(NOVOICE, "Do not mix")])
+    player.playing, player.queue = True, [b"chunk1", b"chunk2"]
+    _run(orch, [("wait stop", LISTEN), ("stop it", LISTEN)])
+    assert not [c for c in sink.calls if c[0] == "cancel"]
+    assert sink.calls[-1] == ("done", "req-1")  # the reply is closed, not cut
+    assert player.queue == [b"chunk1", b"chunk2"] and player.clears == 0
+    assert orch.cutins == 0
+
+
+def test_cut_in_is_on_by_default():
+    assert mc.TTSOrchestrator(FakeSink(), FakePlayer()).cut_in is True
+
+
 def test_cutin_after_done_still_cancels():
     sink, player, orch = _make()
     _run(orch, [(NOVOICE, "Do not mix"), (NOVOICE, LISTEN)])
