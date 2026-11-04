@@ -446,13 +446,21 @@ class TygerScorer:
         self.model = model
 
     @classmethod
-    def load(cls, model: str, revision: str | None, device: str) -> "TygerScorer":
+    def load(cls, model: str, revision: str | None, device: str,
+             threads: int = 1) -> "TygerScorer":
         """Find the bundle (no download), check it and load it onto ``device``.
         ``cuda:N`` counts GPUs in PCI bus order (nvidia-smi's) unless
-        CUDA_DEVICE_ORDER says otherwise."""
+        CUDA_DEVICE_ORDER says otherwise. ``threads`` caps torch's CPU intra-op
+        threads: the per-hop encode is CPU-bound, and on a busy CPU many threads
+        make each hop slower, not faster."""
         check_device(device)
+        if threads < 1:
+            raise ValueError(f"threads must be 1 or more, not {threads}")
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         folder = resolve_bundle(model, revision)
+        import torch
+        torch.set_num_threads(threads)
+        logger.info("torch uses %d CPU intra-op thread(s)", threads)
         logger.info("Loading the Tyger bundle from %s on %s", folder, device)
         return cls(TygerModel(folder, device))
 

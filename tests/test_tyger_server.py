@@ -9,7 +9,8 @@ Covers: two sessions fed interleaved hops each get exactly the events their own
 script gives alone (and the same as a later connection fed alone); the rule
 settings come from the command line; a malformed hop, a text message and a scorer
 failure each give an error event line and the session goes on; a bad rule setting
-stops the script at once; scorer.py imports with the standard library alone.
+stops the script at once; scorer.py imports with the standard library alone;
+--torch-threads defaults to 1, refuses 0 and reaches the real scorer's load.
 """
 import json
 import socket
@@ -289,3 +290,48 @@ print("ok")
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "ok"
+
+
+def test_torch_threads_defaults_to_one_and_refuses_zero(capsys):
+    from voicemanager.pipeline.tyger import server
+    assert server.build_parser().parse_args([]).torch_threads == 1
+    assert server.build_parser().parse_args(["--torch-threads", "4"]).torch_threads == 4
+    for bad in ("0", "-2", "two"):
+        with pytest.raises(SystemExit) as exc:
+            server.build_parser().parse_args(["--torch-threads", bad])
+        assert exc.value.code == 2
+        assert "--torch-threads" in capsys.readouterr().err
+
+
+def test_main_passes_torch_threads_to_the_scorer_load(monkeypatch):
+    """main hands --torch-threads to TygerScorer.load; nothing loads or serves."""
+    import types
+
+    import uvicorn
+
+    from voicemanager.pipeline.tyger import server
+    seen = {}
+
+    def fake_create_app(settings, **kwargs):
+        seen.update(kwargs)
+        return types.SimpleNamespace(state=types.SimpleNamespace(load_error=None))
+
+    def fake_load(model, revision, device, threads):
+        seen["load"] = (model, revision, device, threads)
+        return "loaded"
+
+    class FakeServer:
+        def __init__(self, config):
+            pass
+
+        def run(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr(server, "create_app", fake_create_app)
+    monkeypatch.setattr(server.scorer.TygerScorer, "load", staticmethod(fake_load))
+    monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: None)
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    server.main(["--device", "cpu", "--torch-threads", "3", "--revision", "abc"])
+    assert seen["ran"] is True
+    assert seen["load_scorer"]() == "loaded"
+    assert seen["load"] == (server.DEFAULT_MODEL, "abc", "cpu", 3)

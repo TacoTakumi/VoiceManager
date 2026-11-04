@@ -259,6 +259,16 @@ def _device(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, not {number}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default=DEFAULT_HOST,
@@ -268,6 +278,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the bundle: a Hugging Face repo in the local cache, or a directory")
     parser.add_argument("--revision", default=None, help="the bundle's revision in the cache")
     parser.add_argument("--device", type=_device, default="cuda", help="cpu, cuda or cuda:N")
+    parser.add_argument("--torch-threads", type=_positive_int, default=1, metavar="N",
+                        help="limit torch's CPU intra-op threads to N (default 1): the "
+                             "per-hop encode is CPU-bound, and many threads slow it down "
+                             "on a busy CPU")
     parser.add_argument("--fake-scorer", type=Path, default=None, metavar="SCRIPT",
                         help="score from this JSON script instead of the model (tests)")
     defaults = rules.TurnRuleSettings()
@@ -299,7 +313,8 @@ def main(argv: list[str] | None = None) -> None:
             parser.error(str(exc))
     else:
         def load_scorer():
-            return scorer.TygerScorer.load(args.model, args.revision, args.device)
+            return scorer.TygerScorer.load(args.model, args.revision, args.device,
+                                           threads=args.torch_threads)
 
     server: Any = None
 
