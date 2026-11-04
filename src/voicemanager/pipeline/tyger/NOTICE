@@ -1,15 +1,18 @@
 VoiceManager - Tyger turn rules
 
-rules.py in this directory is adapted from tyger-s2s by NineNineSix
-(https://github.com/nineninesix-ai/tyger-s2s), commit 97d011d, which is
-licensed under the Apache License, Version 2.0. A copy of that licence is in
-the LICENSE file next to this notice.
+rules.py and parts of scorer.py in this directory are adapted from tyger-s2s
+by NineNineSix (https://github.com/nineninesix-ai/tyger-s2s), commit 97d011d,
+which is licensed under the Apache License, Version 2.0. A copy of that
+licence is in the LICENSE file next to this notice.
 
 Files adapted from tyger-s2s at that commit:
 
   app/plugins/ears/tyger/rules.py       the turn rules (endpoint, barge, onset)
+                                        in rules.py; frame_energy in scorer.py
   app/plugins/ears/tyger/session.py     the per-session state and thresholds
   app/plugins/ears/tyger/constants.py   the frame grid and the rule constants
+  app/plugins/ears/tyger/bundle.py      the bundle checks and loader in scorer.py
+  app/plugins/ears/tyger/controller.py  the turn-taker GRU in scorer.py
 
 These files were modified for VoiceManager. The rules were rewritten as one
 standard-library-only class per session that takes its thresholds from a
@@ -19,3 +22,8 @@ when the endpoint head has not; events carry mic-stream sample positions in
 VoiceManager's wire format instead of seconds; a barge latches until the mode
 returns to listening; the backchannel, partial-transcript, frame-display and
 turn-audio bookkeeping were removed.
+
+The scorer in scorer.py follows the bundle loader and the turn-taker GRU of
+tyger-s2s, changed to score one session's hops from VoiceManager's wire format
+and to skip the bundle checks that pin the turn rules, which VoiceManager takes
+from its own settings.
