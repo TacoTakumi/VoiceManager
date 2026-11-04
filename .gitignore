@@ -42,3 +42,6 @@ runs/
 
 # The VoXtream TTS sidecar environment (VM_TTS_ENGINE=voxtream), created by hand.
 venv-voxtream/
+
+# The Tyger turn-engine sidecar environment (VM_TURN_ENGINE=tyger), from requirements-tyger.txt.
+venv-tyger/
