@@ -596,6 +596,37 @@ def _load_voxtream_tts(settings) -> dict:
     }
 
 
+def load_turn_engine(settings):
+    """Start the turn engine's sidecar at startup, or nothing when it is off.
+
+    With VM_TURN_ENGINE=off (the default) nothing is spawned and None comes back.
+    With 'tyger' the Tyger sidecar is started from VM_TYGER_PY on VM_TYGER_DEVICE (a
+    blank value means the device VM_DEVICE resolves to), and this waits until it
+    reports ready; a failure raises TygerStartupError naming the setting at fault,
+    which the lifespan turns into a refusal to start. Nothing of Tyger's model code
+    is imported into this process.
+
+    Args:
+        settings: voicemanager.config.Settings instance
+
+    Returns:
+        TygerSidecar | None - the started sidecar, or None with the engine off
+    """
+    engine = settings.turn_engine
+    if engine == "off":
+        return None
+    if engine != "tyger":
+        raise ValueError(f"unknown VM_TURN_ENGINE {engine!r}: expected 'off' or 'tyger'")
+    from voicemanager.pipeline.tyger.sidecar import TygerSidecar
+
+    resolved_device = _resolve_device(settings.tyger_device or settings.device)
+    logger.info("Starting the Tyger turn engine (python=%s, port=%d, device=%s, model=%s)",
+                settings.tyger_py, settings.tyger_port, resolved_device, settings.tyger_model)
+    sidecar = TygerSidecar.from_settings(settings, device=resolved_device)
+    sidecar.start()
+    return sidecar
+
+
 def _resolve_device(device_setting: str) -> str:
     """Auto-detect or use explicit device setting.
 

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from voicemanager.config import get_settings
-from voicemanager.models import load_models, load_tts_models
+from voicemanager.models import load_models, load_tts_models, load_turn_engine
 from voicemanager.session import SessionRegistry
 from voicemanager.transport.http import http_router
 from voicemanager.transport.websocket import websocket_router
@@ -25,6 +25,8 @@ async def lifespan(app: FastAPI):
     Loads STT models (faster-whisper, Qwen3-ASR, or Nemotron cache-aware) and Silero VAD.
     Fails fast if model loading fails.
     Engine selected via VM_STT_ENGINE (whisper|qwen|nemotron).
+    With VM_TURN_ENGINE=tyger it also starts the Tyger sidecar, watches it and stops
+    it at shutdown; with it off (the default) nothing more is spawned.
     """
     settings = get_settings()
     logger.info(
@@ -99,8 +101,33 @@ async def lifespan(app: FastAPI):
         # it dies, so TTS comes back without a restart of the server.
         sidecar_watcher = asyncio.create_task(tts_models["tts_engine"].watch())
     app.state.sidecar_watcher = sidecar_watcher
+
+    try:
+        turn_engine_sidecar = load_turn_engine(settings)
+    except Exception as e:
+        logger.error("Turn engine startup failed - refusing to start: %s", e)
+        # The TTS sidecar is already running; do not leave it behind.
+        if sidecar_watcher is not None:
+            sidecar_watcher.cancel()
+            await asyncio.gather(sidecar_watcher, return_exceptions=True)
+        if tts_models.get("tts_engine_type") == "voxtream":
+            tts_models["tts_engine"].dispose()
+        raise
+    turn_engine_watcher = None
+    if turn_engine_sidecar is not None:
+        # One shared child process: watch it and start it again when it exits.
+        # Sessions that opted in learn of the loss and the return from the sidecar.
+        turn_engine_watcher = asyncio.create_task(turn_engine_sidecar.watch())
+    app.state.turn_engine_sidecar = turn_engine_sidecar
+    app.state.turn_engine_watcher = turn_engine_watcher
     yield
     # Shutdown
+    if turn_engine_watcher is not None:
+        # Before the sidecar is stopped, so the shutdown never starts a new one.
+        turn_engine_watcher.cancel()
+        await asyncio.gather(turn_engine_watcher, return_exceptions=True)
+    if turn_engine_sidecar is not None:
+        turn_engine_sidecar.close()
     if sidecar_watcher is not None:
         # Before the sidecar is stopped, so the shutdown never starts a new one.
         sidecar_watcher.cancel()
