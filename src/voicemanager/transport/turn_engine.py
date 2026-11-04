@@ -94,10 +94,18 @@ order the frames came in, from the replies whose playback start came
    holds ``mic_sample`` from its start on, and a reply that may still get PCM (no
    audio_end yet) has a span open at its end, since the client can play what is
    still to come. A stopped reply holds a barge whose ``onset_mic_sample`` is at or
-   before its stop's ``mic_sample`` (the user began over the reply) and whose
-   ``mic_sample`` is at or before the stop plus the hold tail. The client reports a
-   stop by DAC time, so the stop frame can come in before the sidecar has scored the
-   mic audio up to it: a barge over the last moments of a reply comes after its stop;
+   before its stop's ``mic_sample`` (the user began over the reply) while the mic
+   hold still waits for the sidecar's progress on that reply (see "The mic hold"),
+   and not once that hold has ended (its audio dropped, or fed after an earlier
+   barge). With a sidecar that reports no progress, nothing waits, and the barge's
+   ``mic_sample`` must be at or before the stop plus the hold tail, or the end of
+   the last hop sent in speaking mode over the reply, whichever is later. The
+   client reports a stop by DAC time, so the stop frame can come in before the
+   sidecar has scored the mic audio up to it: a barge over the last moments of a
+   reply comes after its stop. The hop that holds the stop overlaps the played span,
+   so all of it goes out in speaking mode and the yield head may decide a barge on
+   any of its frames, up to a hop past the stop; a late stop leaves the hops already
+   sent with the reply in speaking mode further past it;
 2. else the latest-started one with no stop, which covers a client whose playback
    runs behind the PCM count (a stall, a deep buffer) and so past the span the
    server works out.
@@ -132,12 +140,13 @@ each reply's playback state from the ``HopFeed``; positions are mic samples:
   in order. From the start on the reply is in play.
 * A stop ends the play at its ``mic_sample`` plus the hold tail (VM_TYGER_HOLD_TAIL_MS).
   A barge for the reply can still come until the sidecar has scored the mic audio up
-  to there, so the in-play audio stays held until its progress reaches the stop plus
-  the tail. Then, with no barge, it is dropped; with a barge, it is fed as below. A
-  sidecar that reports no progress leaves nothing to wait for: the audio is dropped
-  at the stop. A slow one is waited for until the mic stream is the start wait (in
-  mic samples) past the stop plus the tail; the audio is then dropped as if no barge
-  came.
+  to there and every hop sent in speaking mode over the reply, so the in-play audio
+  stays held until its progress reaches the stop plus the tail or the end of the
+  last such hop, whichever is later (the reply's wait end). Then, with no barge, it
+  is dropped; with a barge, it is fed as below. A sidecar that reports no progress
+  leaves nothing to wait for: the audio is dropped at the stop. A slow one is waited
+  for until the mic stream is the start wait (in mic samples) past the stop plus the
+  tail; the audio is then dropped as if no barge came.
 * A barge the session acts on (it picked a played reply) feeds the held audio from
   ``max(onset_mic_sample, mic_sample - BARGE_LOOKBACK_SAMPLES)``: every reply whose
   audio_start went out by the barge's mic_sample stops holding there (one with no
@@ -152,8 +161,9 @@ each reply's playback state from the ``HopFeed``; positions are mic samples:
 Several replies may be kept at once. Each holds as above, and the hold is their
 union: a sample is held while any reply still holds it (a reply with no start yet, one
 in play with no stop, or a stopped one the sidecar has not scored past), else dropped
-while any reply's played span covers it, else fed. The STT gets audio strictly in mic order: the oldest held sample blocks
-everything after it, so audio released late still goes before any later audio.
+while any reply's played span covers it, else fed. The STT gets audio strictly in mic
+order: the oldest held sample blocks everything after it, so audio released late
+still goes before any later audio.
 
 Memory is bounded. In-play audio is kept for ``BARGE_LOOKBACK_SAMPLES`` plus
 ``HOLD_MARGIN_SAMPLES`` (4 s and 1 s): older audio of a reply still in play is dropped,
@@ -169,13 +179,14 @@ limit; when the sidecar is lost, the hold ends at once (see "Losing the sidecar"
 Every STT drive happens under the handler's STT lock. The handler routes each mic
 frame through ``take_stt_audio`` under it; when the hold may let audio go without a
 new frame (a playback frame, a barge, a progress line that passes a stopped reply's
-end, the start wait), the session calls the handler's ``release_held``, which takes the lock
-and feeds what ``take_stt_audio`` gives. As each taker removes audio from the front
-of the hold under the lock, no release reorders with a live frame. A barge's release runs before the reader handles
-the next event, so a turn end that follows it flushes the user's words. A turn end
-feeds whatever the hold has let go and then flushes; audio still held stays held and
-reaches the STT after that turn_end. A held first frame is fed without its WAV
-header. When the connection ends, audio still held is dropped.
+wait end, the start wait), the session calls the handler's ``release_held``, which
+takes the lock and feeds what ``take_stt_audio`` gives. As each taker removes audio
+from the front of the hold under the lock, no release reorders with a live frame. A
+barge's release runs before the reader handles the next event, so a turn end that
+follows it flushes the user's words. A turn end feeds whatever the hold has let go
+and then flushes; audio still held stays held and reaches the STT after that
+turn_end. A held first frame is fed without its WAV header. When the connection
+ends, audio still held is dropped.
 
 The turn end
 ------------
@@ -290,6 +301,7 @@ class _Reply:
     start: int | None = None          # the start frame's mic_sample
     stop_mic: int | None = None       # the stop frame's mic_sample
     cut16: int | None = None          # the stop frame's reply_sample, at 16 kHz
+    speaking_end: int | None = None   # the end of the last hop cut speaking over it
     # The mic hold's own marks (see "The mic hold" in the module docstring).
     start_wait_over: bool = False     # no start came by the start wait: never held again
     barge_at: int | None = None       # a barge ended its hold here
@@ -411,11 +423,20 @@ class HopFeed:
         return list(self._replies.values())
 
     def played_reply(self, mic_sample: int, onset_mic_sample: int | None = None,
-                     tail_samples: int = 0) -> _Reply | None:
+                     tail_samples: int = 0,
+                     hold_state: Callable[[_Reply], bool | None] | None = None,
+                     ) -> _Reply | None:
         """The reply a barge at ``mic_sample`` cut in over: see "A barge" in the module
-        docstring. A stopped reply takes a barge whose speech began by its stop
-        (``onset_mic_sample``, else ``mic_sample``) and that the sidecar decided by
-        the stop plus ``tail_samples``."""
+        docstring.
+
+        A stopped reply takes a barge whose speech began by its stop
+        (``onset_mic_sample``, else ``mic_sample``). ``hold_state`` gives, for a
+        stopped reply, True while the mic hold still waits for the sidecar's progress
+        on it, False once that hold has ended, and None when there is no such wait
+        (the sidecar reports no progress). While it waits, the barge is taken; once
+        it has ended, it is not; with no wait (or no ``hold_state``), the barge is
+        taken when its ``mic_sample`` is by the stop plus ``tail_samples`` or by the
+        end of the last hop sent in speaking mode over the reply."""
         started = [r for r in self._replies.values() if r.start is not None]
         onset = mic_sample if onset_mic_sample is None else onset_mic_sample
 
@@ -423,7 +444,13 @@ class HopFeed:
             if mic_sample < reply.start:
                 return False
             if reply.stop_mic is not None:
-                return onset <= reply.stop_mic and mic_sample <= reply.stop_mic + tail_samples
+                if onset > reply.stop_mic:
+                    return False  # the user began after the reply stopped
+                state = None if hold_state is None else hold_state(reply)
+                if state is not None:
+                    return state
+                end = max(reply.stop_mic + tail_samples, reply.speaking_end or 0)
+                return mic_sample <= end
             return not reply.complete or mic_sample < reply.start + reply.length16
 
         holding = [r for r in started if holds(r)]
@@ -568,6 +595,7 @@ class HopFeed:
             if not (s1 > s0 and s0 < end and s1 > start):
                 continue
             speaking = True
+            reply.speaking_end = end
             piece = self._piece(reply, start, end)
             if piece is not None:
                 pieces.append(piece)
@@ -645,10 +673,43 @@ class MicHold:
         self._scored = mic_sample
         if before is None:
             return False  # nothing waited for progress before the first line
-        return any(before < reply.stop_mic + self._tail <= mic_sample
+        return any(before < self._wait_end(reply) <= mic_sample
                    for reply in self._feed.replies()
                    if reply.start is not None and reply.stop_mic is not None
                    and reply.barge_at is None)
+
+    def hold_state(self, reply: _Reply) -> bool | None:
+        """For a stopped reply: whether its hold still waits for the sidecar's progress.
+
+        True while it waits (a barge for it may still come and be fed), False once it
+        has ended (dropped, or released by a barge), None when the sidecar reports no
+        progress, or when the hold never held the reply (its start came after the start
+        wait), so nothing waits."""
+        if self._scored is None or reply.start_wait_over:
+            return None
+        if reply.barge_at is not None:
+            return False
+        return self._waits(reply, self._feed.mic_samples)
+
+    def _wait_end(self, reply: _Reply) -> int:
+        """How far the sidecar must score before no barge can come for a stopped reply.
+
+        The stop plus the tail, or the end of the last hop sent in speaking mode over
+        the reply when that is later: the yield head may decide a barge on any frame
+        of a speaking hop, and a late stop leaves hops already sent with the reply
+        past the cut."""
+        return max(reply.stop_mic + self._tail, reply.speaking_end or 0)
+
+    def _waits(self, reply: _Reply, now: int) -> bool:
+        """The stopped reply's in-play audio still waits for the sidecar's progress.
+
+        False when the sidecar reports no progress (as before it could), when it has
+        scored through the reply's wait end, or when the mic stream is the start wait
+        past the stop plus the tail with no such progress: a slow sidecar holds the
+        audio no longer than that."""
+        end = reply.stop_mic + self._tail
+        return (self._scored is not None and self._scored < self._wait_end(reply)
+                and now < end + self._start_wait)
 
     @property
     def held_samples(self) -> int:
@@ -707,8 +768,8 @@ class MicHold:
             end = None if reply.stop_mic is None else reply.stop_mic + self._tail
             if reply.barge_at is not None:
                 end = reply.barge_at if end is None else min(end, reply.barge_at)
-            elif end is not None and not self._scored_past(end, now):
-                # Stopped, but the sidecar may still report a barge up to the end.
+            elif end is not None and self._waits(reply, now):
+                # Stopped, but the sidecar may still report a barge for it.
                 keep_from = max(start, now - self._play_keep)
                 if keep_from > start:
                     rules.append((start, min(keep_from, end), _DROP))
@@ -729,15 +790,6 @@ class MicHold:
             if open_end > keep_from:
                 rules.append((keep_from, open_end, _HOLD))
         return rules
-
-    def _scored_past(self, end: int, now: int) -> bool:
-        """No barge can come any more for mic audio up to ``end``.
-
-        True when the sidecar reports no progress (as before it could), when it has
-        scored through ``end``, or when the mic stream is the start wait past ``end``
-        with no such progress: a slow sidecar holds the audio no longer than that."""
-        return (self._scored is None or self._scored >= end
-                or now >= end + self._start_wait)
 
     @staticmethod
     def _kind(at: int, rules: list[tuple[int, float, str]]) -> tuple[str, float]:
@@ -1187,7 +1239,7 @@ class TurnEngineSession:
     async def _on_barge(self, event: wire.BargeEvent) -> None:
         """Stop the reply the user cut in over: see "A barge" in the module docstring."""
         reply = self._feed.played_reply(event.mic_sample, event.onset_mic_sample,
-                                        self._tail_samples)
+                                        self._tail_samples, self._hold.hold_state)
         if reply is None:
             logger.debug("Barge with no played reply ignored: session=%s at mic_sample=%s",
                          self._label, event.mic_sample)

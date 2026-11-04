@@ -5,14 +5,16 @@ server before the mic audio it points to has been scored. A barge the user start
 over the end of a reply then comes in after the stop. The server must still act on
 it:
 
-* a barge whose mic_sample is in a stopped reply's played span, from its start to
-  the stop's mic_sample plus the hold tail, picks that reply: the barge frame goes
+* a barge whose speech began by a stopped reply's stop picks that reply while the
+  reply's mic hold still waits for the sidecar's progress: the barge frame goes
   out, then audio_end 'interrupted' if the request is still open, or alone if its
-  audio_end already went out;
-* a barge past that span, or one whose speech began after the stop, does not pick
-  the reply;
+  audio_end already went out. That covers a barge decided late in the hop that
+  holds the stop, and one from a hop sent in speaking mode before a late stop;
+* a barge whose speech began after the stop, or one that comes once the hold for
+  the reply has ended (dropped, or released by an earlier barge), does not pick it;
 * the in-play mic audio of a stopped reply stays held until the sidecar's progress
-  (its scored lines) passes the stop plus the tail: then, with no barge, it is
+  (its scored lines) passes the stop plus the tail, or the end of the last hop sent
+  in speaking mode over the reply when that is later: then, with no barge, it is
   dropped, and with a barge it goes to the STT from the onset, before later audio;
 * a sidecar that does not report progress, or one too slow to, cannot hold it for
   longer than the start wait of mic audio past the stop plus the tail.
@@ -38,8 +40,8 @@ from voicemanager.transport import turn_engine as te
 
 from tyger_fake_sidecar import FakeTygerSidecar
 from tyger_ws_kit import (
-    FakeTTSEngine, GatedTTSEngine, StandInSidecar, barrier, errors, frame, make_app,
-    opt_in, speak,
+    TTS_RATE, FakeTTSEngine, GatedTTSEngine, StandInSidecar, barrier, errors, frame,
+    make_app, opt_in, speak,
 )
 
 #: Samples per mic frame the tests send.
@@ -246,7 +248,7 @@ def test_a_barge_after_the_stop_of_a_finished_reply_sends_the_frame_alone(
                            "mic_sample": 4300}]
 
 
-def test_a_barge_past_the_stop_plus_the_tail_does_not_pick_the_reply(
+def test_a_barge_past_the_stop_plus_the_tail_after_the_hold_ended_does_not_pick_it(
         tyger, make_client, dispatched):
     with make_client(FakeTTSEngine(_chunks())) as client, \
             authkit.ws_connect(client, "/ws/stream") as ws:
@@ -255,6 +257,8 @@ def test_a_barge_past_the_stop_plus_the_tail_does_not_pick_the_reply(
         ws.send_json(_start("r1", 1000))
         ws.send_json(_stop("r1", 4200))
         assert errors(barrier(ws)) == []
+        # The sidecar has scored past the stop plus the tail: the hold for r1 is over.
+        _events(ws, tyger, dispatched, wire.ScoredEvent(mic_sample=4200 + TAIL))
         assert _events(ws, tyger, dispatched, _barge(4000, 4200 + TAIL + 1)) == []
 
 
@@ -382,6 +386,190 @@ def test_a_hold_with_progress_waits_for_it_past_the_stop_plus_the_tail():
     assert hold.take() == []
     hold.on_scored(4000 + TAIL)
     assert hold.take() == [_s(4000 + TAIL, 8192)]
+
+
+# --- (3) a barge from a hop sent in speaking mode past the stop plus the tail ----
+
+def _speaking_hops(tyger) -> list[tuple[str, int]]:
+    """(mode, mic_sample) of every hop the sidecar got, once they are all in."""
+    return [(h.mode, h.mic_sample) for h in tyger.sessions[0].hops]
+
+
+def _stopped_early(ws, tyger, dispatched) -> _Mic:
+    """r1 started at 3000 and stopped at 6000 before the mic got there; mic to 10240.
+
+    Both hops overlap the played span [3000, 6000), so both go out in speaking mode,
+    and every frame of the second one, [5120, 10240), may give a barge up to 10240.
+    """
+    _opted_in(ws, tyger, dispatched)
+    mic = _Mic(ws)
+    speak(ws, "r1")
+    ws.send_json(_start("r1", 3000))
+    mic.send(4096)
+    ws.send_json(_stop("r1", 6000, reply_sample=3000 * TTS_RATE // 16000))
+    mic.send(10240 - mic.at)
+    assert errors(barrier(ws)) == []
+    assert tyger.wait_for(lambda: len(tyger.sessions[0].hops) >= 2, timeout=5)
+    assert _speaking_hops(tyger) == [(wire.MODE_SPEAKING, 5120), (wire.MODE_SPEAKING, 10240)]
+    return mic
+
+
+def test_a_barge_late_in_the_speaking_hop_that_holds_the_stop_is_acted_on(
+        tyger, make_client, made, dispatched):
+    with make_client(FakeTTSEngine(_chunks(5))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        mic = _stopped_early(ws, tyger, dispatched)
+        stt = made[0]
+        assert stt.fed == _s(0, 3000)
+        # Decided 8960 - 6000 samples (360 ms) past the stop, before the hop's scored line.
+        frames = _events(ws, tyger, dispatched, _barge(5000, 8960),
+                         wire.ScoredEvent(mic_sample=10240))
+        assert _of_type(frames, "barge") == [
+            {"type": "barge", "request_id": "r1", "onset_mic_sample": 5000,
+             "mic_sample": 8960}]
+        assert stt.fed == _s(0, 3000) + _s(5000, 10240)
+        mic.send(1024)
+        barrier(ws)
+        assert stt.fed == _s(0, 3000) + _s(5000, 11264)
+
+
+def test_a_late_stop_keeps_the_hold_and_takes_a_barge_from_hops_sent_speaking(
+        tyger, make_client, made, dispatched):
+    # r1 is 1 s long at 16 kHz and starts at 0: hops to 15360 go out with the whole
+    # reply in them, all speaking. The stop at 3000 comes only after that.
+    with make_client(FakeTTSEngine(_chunks(10))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        _opted_in(ws, tyger, dispatched)
+        mic = _Mic(ws)
+        speak(ws, "r1")
+        ws.send_json(_start("r1", 0))
+        mic.send(15360)
+        assert tyger.wait_for(lambda: len(tyger.sessions[0].hops) >= 3, timeout=5)
+        ws.send_json(_stop("r1", 3000, reply_sample=3000 * TTS_RATE // 16000))
+        assert errors(barrier(ws)) == []
+        assert [m for m, _ in _speaking_hops(tyger)] == [wire.MODE_SPEAKING] * 3
+        stt = made[0]
+        # Scored past the stop plus the tail, but not past the hops sent speaking.
+        _events(ws, tyger, dispatched, wire.ScoredEvent(mic_sample=5120),
+                wire.ScoredEvent(mic_sample=10240))
+        assert stt.fed == b""
+        frames = _events(ws, tyger, dispatched, _barge(2500, 12000),
+                         wire.ScoredEvent(mic_sample=15360))
+        assert [f["request_id"] for f in _of_type(frames, "barge")] == ["r1"]
+        assert stt.fed == _s(2500, 15360)
+        mic.send(1024)
+        barrier(ws)
+        assert stt.fed == _s(2500, 16384)
+
+
+def test_a_late_stop_with_no_barge_drops_the_echo_once_the_speaking_hops_are_scored(
+        tyger, make_client, made, dispatched):
+    with make_client(FakeTTSEngine(_chunks(10))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        _opted_in(ws, tyger, dispatched)
+        mic = _Mic(ws)
+        speak(ws, "r1")
+        ws.send_json(_start("r1", 0))
+        mic.send(15360)
+        assert tyger.wait_for(lambda: len(tyger.sessions[0].hops) >= 3, timeout=5)
+        ws.send_json(_stop("r1", 3000, reply_sample=3000 * TTS_RATE // 16000))
+        assert errors(barrier(ws)) == []
+        stt = made[0]
+        _events(ws, tyger, dispatched, wire.ScoredEvent(mic_sample=10240))
+        assert stt.fed == b""
+        _events(ws, tyger, dispatched, wire.ScoredEvent(mic_sample=15360))
+        assert stt.fed == _s(3000 + TAIL, 15360)
+        mic.send(1024)
+        barrier(ws)
+        assert stt.fed == _s(3000 + TAIL, 16384)
+
+
+def test_a_barge_whose_speech_began_after_the_stop_is_ignored_in_a_speaking_hop(
+        tyger, make_client, made, dispatched):
+    with make_client(FakeTTSEngine(_chunks(5))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        _stopped_early(ws, tyger, dispatched)
+        stt = made[0]
+        frames = _events(ws, tyger, dispatched, _barge(6001, 8960),
+                         wire.ScoredEvent(mic_sample=10240))
+        assert _of_type(frames, "barge") == []
+        assert stt.fed == _s(0, 3000) + _s(6000 + TAIL, 10240)
+
+
+def test_a_barge_after_the_hold_was_dropped_is_ignored(
+        tyger, make_client, made, dispatched):
+    with make_client(FakeTTSEngine(_chunks(5))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        _stopped_early(ws, tyger, dispatched)
+        stt = made[0]
+        _events(ws, tyger, dispatched, wire.ScoredEvent(mic_sample=10240))
+        assert stt.fed == _s(0, 3000) + _s(6000 + TAIL, 10240)
+        assert _events(ws, tyger, dispatched, _barge(5000, 8960)) == []
+        assert stt.fed == _s(0, 3000) + _s(6000 + TAIL, 10240)
+
+
+def test_a_barge_after_the_slow_sidecar_bound_dropped_the_hold_is_ignored(
+        tyger, make_client, made, dispatched, env):
+    env(VM_TYGER_START_WAIT_MS=200)          # 3200 mic samples past the stop plus the tail
+    with make_client(FakeTTSEngine(_chunks(5))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        mic = _stopped_early(ws, tyger, dispatched)
+        stt = made[0]
+        mic.send(6000 + TAIL + 3200 + FRAME - mic.at)
+        barrier(ws)
+        assert stt.fed == _s(0, 3000) + _s(6000 + TAIL, mic.at)
+        assert _events(ws, tyger, dispatched, _barge(5000, 8960)) == []
+        assert stt.fed == _s(0, 3000) + _s(6000 + TAIL, mic.at)
+
+
+def test_a_second_barge_after_the_first_released_the_hold_is_ignored(
+        tyger, make_client, made, dispatched):
+    with make_client(FakeTTSEngine(_chunks(5))) as client, \
+            authkit.ws_connect(client, "/ws/stream") as ws:
+        _stopped_early(ws, tyger, dispatched)
+        frames = _events(ws, tyger, dispatched, _barge(5000, 8000))
+        assert len(_of_type(frames, "barge")) == 1
+        assert _events(ws, tyger, dispatched, _barge(5500, 8960)) == []
+
+
+def _cut_feed(start: int, stop: int, mic: int) -> te.HopFeed:
+    """r1, 1 s long, started at ``start``; hops cut to ``mic``, then stopped at ``stop``."""
+    feed = te.HopFeed()
+    feed.on_tts_text("r1", _audio_start("r1"))
+    feed.on_tts_pcm("r1", b"\x01\x00" * 16000)
+    assert feed.playback(_start("r1", start)) is None
+    feed.feed_mic(b"\x00\x00" * mic)
+    feed.due_hops()
+    assert feed.playback(_stop("r1", stop, stop - start)) is None
+    return feed
+
+
+def test_a_stopped_reply_takes_a_barge_through_its_last_hop_sent_speaking():
+    feed = _cut_feed(0, 3000, 15360)        # three hops went out speaking
+    assert feed.played_reply(15360, 2500, TAIL).request_id == "r1"
+    assert feed.played_reply(15361, 2500, TAIL) is None
+    assert feed.played_reply(12000, 3001, TAIL) is None
+
+
+def test_a_hold_state_decides_a_stopped_reply_over_the_span():
+    feed = _cut_feed(0, 3000, 15360)
+    assert feed.played_reply(20000, 2500, TAIL, lambda r: True).request_id == "r1"
+    assert feed.played_reply(4000, 2500, TAIL, lambda r: False) is None
+    assert feed.played_reply(20000, 3001, TAIL, lambda r: True) is None
+
+
+def test_a_hold_with_progress_waits_for_the_last_hop_sent_speaking():
+    feed = _cut_feed(0, 3000, 15360)
+    hold = te.MicHold(feed, tail_samples=TAIL, start_wait_samples=32000)
+    hold.on_scored(0)
+    data = _s(0, 15360)
+    hold.push(0, data, data)
+    reply = feed.reply("r1")
+    assert hold.on_scored(10240) is False
+    assert hold.take() == [] and hold.hold_state(reply) is True
+    assert hold.on_scored(15360) is True
+    assert hold.take() == [_s(3000 + TAIL, 15360)]
+    assert hold.hold_state(reply) is False
 
 
 # --- the sidecar's progress lines -----------------------------------------------
