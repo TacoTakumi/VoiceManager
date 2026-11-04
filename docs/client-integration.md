@@ -16,6 +16,7 @@ implementation of it. Every symbol named here exists in current source - see
 - [Voice selection](#voice-selection)
 - [The endpoint-hold consumption model](#the-endpoint-hold-consumption-model)
 - [Turn-taking protocol surface](#turn-taking-protocol-surface)
+- [Turn engine](#turn-engine)
 - [WebSocket message-schema reference](#websocket-message-schema-reference)
 - [Client method reference](#client-method-reference)
   - [Full duplex: `duplex()`](#full-duplex-duplex)
@@ -820,8 +821,10 @@ A cut at a clause mark sends the text up to the last qualifying mark and keeps t
   failure - the next `tts` on the same connection proceeds normally. (A
   backend-fatal fault still closes the whole session with an `error` frame and
   close code 1011, as before.)
-- `"interrupted"` - reserved for future server-side barge-in; never emitted
-  today.
+- `"interrupted"` - the turn engine heard the user cut in over the reply, and
+  the server cancelled it. Only a connection that opted in to the turn engine
+  gets it, always after that request's `barge` frame (see
+  [Turn engine](#turn-engine)).
 
 A client that does not read `reason` sees an `audio_end` and treats the reply as
 over, exactly as before.
@@ -893,6 +896,211 @@ window is the only place a stale token can still be in flight). The practical
 rule for clients: **never reuse a `request_id` after cancelling it** - always
 mint a fresh id (e.g. a new UUID) for the next reply.
 
+## Turn engine
+
+A turn engine is a model that listens to the user's mic and to the agent's own reply as it plays, and decides two things: when the user's turn ended, and when the user cut in over the reply (a barge). The server runs one, Tyger, as a sidecar process when the operator sets `VM_TURN_ENGINE=tyger` (see the README for the setup). It works only with the `audiocpp` STT engine.
+
+A connection uses the turn engine only after it opts in. A connection that never sends `turn_engine` gets none of the frames in this section and behaves exactly as described in the rest of this guide. Five frame types are added to `MessageType`: `turn_engine` and `playback` go from client to server, `turn_engine_ready`, `barge` and `turn_end` go from server to client. The models are in `protocol.py`.
+
+An opted-in connection changes in four ways:
+
+- The client reports when each reply starts and stops playing at its speaker, with `playback` frames. The server needs this to build the agent channel: the reply audio placed where it played on the client's mic stream.
+- The server sends `barge` when the user cut in over a playing reply, and ends that reply itself with `audio_end` reason `"interrupted"`. The client does not send `tts_cancel` for it.
+- The server sends `turn_end` when the user's turn ended. Finals still arrive as before, but **the turn ends on `turn_end`, not on a final** or an endpoint frame.
+- While a reply plays, the server holds the mic audio back from the STT, so the STT does not transcribe the agent's own voice from the speaker (see [The mic hold](#the-mic-hold)).
+
+One call in outline (the server frames are on the right):
+
+```text
+client -> { "type": "turn_engine", "engine": "tyger" }      (before any audio)
+                                 server -> { "type": "turn_engine_ready", "engine": "tyger" }
+client -> binary mic PCM, continuously from here on
+                                 server -> transcription frames, as before
+                                 server -> { "type": "turn_end", ... }    (the user's turn ended)
+client -> tts_stream frames for the reply
+                                 server -> audio_start, PCM, ..., audio_end
+client -> { "type": "playback", "event": "start", ... }    (first sample at the speaker)
+client -> { "type": "playback", "event": "stop", ... }     (last played sample)
+```
+
+And a barge, the user cuts in while the reply plays:
+
+```text
+                                 server -> { "type": "barge", ... }
+                                 server -> { "type": "audio_end", "reason": "interrupted", ... }
+client -> clears its playback, then { "type": "playback", "event": "stop", ... }
+                                 server -> transcription frames of the user's words
+                                 server -> { "type": "turn_end", ... }
+```
+
+### Opting in
+
+Send one `turn_engine` frame after the `ready` handshake and **before the first audio frame** of the connection. The server answers with `turn_engine_ready`, or with one `error` frame. No answer closes the socket. The server checks the opt-in in this order and the first check that fails gives the answer:
+
+1. The turn engine is off on this server: `turn_engine_unavailable`.
+2. The connection's STT engine is not `audiocpp`: `turn_engine_unsupported`.
+3. The frame is wrong: it has no string `engine`, it names an engine not in `TURN_ENGINES` (only `"tyger"`), it comes after the first audio frame, it is a second opt-in after a `turn_engine_ready`, or the connection lost its turn engine earlier: `invalid_request`.
+4. The sidecar is starting or restarting, or the server cannot connect to it: `turn_engine_unavailable`.
+
+A refused opt-in changes nothing. The connection goes on as one that never opted in, and the client may send a corrected opt-in if it has not sent audio yet. A second opt-in after a `turn_engine_ready` leaves the first one in place. A client that wants the turn engine and gets `turn_engine_unavailable` from check 4 can open a new connection later and try again.
+
+The Python client does the round trip in `DuplexSession.enable_turn_engine()`, which raises `TurnEngineError` (with the server's `error_type`) on a refusal.
+
+### Turn engine frames
+
+Integers in these frames are JSON integers. In `playback` they are strict: a string, a float or a boolean makes the frame malformed.
+
+#### `turn_engine` - `TurnEngineMessage`
+
+Client to server. Opts the connection in to a turn engine.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"turn_engine"` | Frame discriminator. |
+| `engine` | string | *(required)* | The turn engine to use. The known names are `TURN_ENGINES`: `"tyger"`. |
+
+```json
+{ "type": "turn_engine", "engine": "tyger" }
+```
+
+#### `turn_engine_ready` - `TurnEngineReadyMessage`
+
+Server to client. The answer to an opt-in that succeeded. From this frame on, the connection is opted in.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"turn_engine_ready"` | Frame discriminator. |
+| `engine` | string | *(required)* | The turn engine the connection now uses. |
+
+```json
+{ "type": "turn_engine_ready", "engine": "tyger" }
+```
+
+#### `playback` - `PlaybackMessage`
+
+Client to server. Reports that a reply's playback started or stopped at the speaker. The frame carries no audio: the server builds the agent channel from the PCM it sent for `request_id`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"playback"` | Frame discriminator. |
+| `request_id` | string | *(required)* | The reply that started or stopped playing. |
+| `event` | string | *(required)* | `"start"` or `"stop"` (`PLAYBACK_EVENTS`). |
+| `mic_sample` | integer >= 0 | *(required)* | Where the edge reached the speaker, as an index on the client's own outgoing 16 kHz mic stream: the number of mic samples the client sent on this connection since its first audio frame (a WAV header on the first frame does not count). |
+| `reply_sample` | integer >= 0 | absent | On `"stop"` only, and required there: how many samples of the reply played. It counts samples of the reply PCM at the `sample_rate` of the reply's `audio_start` (for example 24000 Hz), not 16 kHz samples. Do not send it on `"start"`. |
+
+```json
+{ "type": "playback", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "event": "start", "mic_sample": 81920 }
+```
+
+```json
+{ "type": "playback", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "event": "stop", "mic_sample": 129600, "reply_sample": 71520 }
+```
+
+In the stop example the reply played for 47680 mic samples (2.98 s at 16 kHz), which is 71520 samples of the reply at 24000 Hz.
+
+**When to send them.** Send one `start` per reply, when the reply's first sample reaches the speaker. Send one `stop` per reply, when the playback of the reply ends: after its last sample played, or when the client stops it early (a barge, or the client's own `tts_cancel`). `reply_sample` is the count that really played, so after a barge it is less than the samples the server sent. Send each frame as soon as the edge happens. A `start` can arrive after the mic audio it points into: the server waits up to one hop (5120 samples, 320 ms) of later mic audio for it, so a `start` later than that leaves the first part of the reply out of the agent channel. If no `start` comes within `VM_TYGER_START_WAIT_MS` (default 2000) after the reply's `audio_end`, the mic hold treats the reply as never played (see [The mic hold](#the-mic-hold)). The server assumes the reply plays without gaps from its `start` to its `stop`; a mid-reply underrun is not reported.
+
+**Computing `mic_sample`.** The index must put the speaker edge on the same timeline as the mic audio the client sends. Use the audio devices' hardware timestamps, on one clock:
+
+```text
+mic_sample = max(0, round((dac_time - first_adc_time) * 16000))
+```
+
+- `first_adc_time` is the time the first mic sample the client sent was captured at the ADC. Read it from the input callback of the first block you send (PortAudio: `inputBufferAdcTime`).
+- `dac_time` is the time the edge reaches the DAC. Read the output callback's DAC time for the block that holds the edge (PortAudio: `outputBufferDacTime`) and add the position of the edge in the block: a sample `k` samples into a block at output rate `r` plays at `block_dac_time + k / r`. For `start`, the edge is the reply's first sample; for `stop`, it is the end of the last sample that played.
+- Both times must come from the same clock (PortAudio's stream clock is shared by input and output). On another platform, use the output's presentation timestamp and the input's capture timestamp on one clock. If the device reports no such times, the time the callbacks run on a monotonic clock is a looser fallback.
+- The formula counts captured samples, so send the mic continuously, silence included. A client that does not send some of its mic audio must count the samples it sent instead.
+
+The Python client's `DuplexSession.mic_sample` property is the count of samples sent so far, and `scripts/voice_agent.py classic --turn-engine tyger` shows the DAC and ADC mapping in `playback_mic_sample()`.
+
+**Refused frames.** The server answers a bad `playback` frame with an `error` frame of `error_type` `"invalid_request"`, drops the frame and keeps the connection open. The cases: a malformed frame (a missing field, a wrong type, `reply_sample` on a start or missing on a stop), an unknown `request_id` (one not sent on this connection, or one the server forgot: it keeps the last 4 replies), a second `start` for a reply, a stop without a start, a second `stop`, and a `stop` whose `mic_sample` is before its start's. On a connection that did not opt in, or after the turn engine was lost, a `playback` frame is dropped with no answer.
+
+#### `barge` - `BargeMessage`
+
+Server to client. The user cut in over a reply that plays at the client. The server picks the reply that plays at the barge's `mic_sample`, from the replies with a `start` and no `stop`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"barge"` | Frame discriminator. |
+| `request_id` | string | *(required)* | The reply the user cut in over. |
+| `onset_mic_sample` | integer | *(required)* | Where on the client's mic stream the user's speech began. |
+| `mic_sample` | integer | *(required)* | Where on the client's mic stream the turn engine decided. |
+
+```json
+{ "type": "barge", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "onset_mic_sample": 112000, "mic_sample": 115840 }
+```
+
+The order is fixed. The server cancels the request and sends the `barge` frame first, then that request's `audio_end` with `reason: "interrupted"`, and **no PCM for the request after the `barge` frame**. If the reply's `audio_end` already went out (the server sent all of it and it still plays at the client), the `barge` frame comes alone and there is no second `audio_end`.
+
+On a `barge` the client must:
+
+1. Clear its playback of that request at once (the queued audio too, not only the current block).
+2. Send `playback` `stop` for the request with what really played (`mic_sample` and `reply_sample` as above).
+3. Not send `tts_cancel` for it. The request is cancelled and its `request_id` is dead (see [Turn-taking](#7-a-cancelled-request_id-is-permanently-dead)); mint a new one for the next reply.
+
+The user's words from the onset reach the STT (see [The mic hold](#the-mic-hold)) and end with a `turn_end` as usual.
+
+#### `turn_end` - `TurnEndMessage`
+
+Server to client. The user's turn ended.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"turn_end"` | Frame discriminator. |
+| `turn_id` | integer | *(required)* | The `turn_id` of the last final in `text`. |
+| `text` | string | *(required)* | Every final sent since the previous `turn_end`, in order: each one stripped, empty ones skipped, joined with one space. |
+| `mic_sample` | integer | *(required)* | Where on the client's mic stream the turn engine decided. |
+| `by` | string | *(required)* | What ended the turn (`TURN_END_BY`): `"model"`, the model's end-of-turn score, or `"silence"`, its fallback after `VM_TYGER_SILENCE_FALLBACK_MS` of silence. |
+
+```json
+{ "type": "turn_end", "turn_id": 4, "text": "book me a flight to boston on friday", "mic_sample": 163840, "by": "model" }
+```
+
+At a turn end the server first flushes the open utterance, so its final is sent before the `turn_end` and is part of its `text`. With no final text since the previous `turn_end`, no frame goes out. Transcription frames (interims and finals) still arrive as before, and Silero still ends utterances, so one turn can hold several finals. For an opted-in connection, act on the turn when `turn_end` arrives, not on a final or an endpoint frame. A final that arrives after a `turn_end` belongs to the next one.
+
+### Turn engine errors
+
+The turn engine adds three `error_type` values (`TURN_ENGINE_ERROR_TYPES`). None of them closes the socket.
+
+| `error_type` | When | What a client should do |
+|---|---|---|
+| `turn_engine_unavailable` | An opt-in while the turn engine is off on the server (`VM_TURN_ENGINE=off`), or while its sidecar is starting or restarting or cannot be reached. | Go on without the turn engine: end turns on finals or endpoint frames. For the second case, a new connection may opt in later. |
+| `turn_engine_unsupported` | An opt-in on a server whose STT engine is not `audiocpp`. | Go on without the turn engine. Only an operator can change this. |
+| `turn_engine_lost` | Sent once to an opted-in connection when the server loses the turn engine's sidecar. | Go on as a connection that never opted in (see [Losing the sidecar](#losing-the-sidecar)). |
+
+The `turn_engine` and `playback` frames also use `invalid_request` for a bad frame, as listed above under each frame.
+
+```json
+{ "type": "error", "error_type": "turn_engine_unsupported", "message": "The turn engine needs the audiocpp STT engine; this server runs whisper." }
+```
+
+### The mic hold
+
+While a reply plays, the mic picks up the speaker, and the STT would transcribe the agent's own voice. So for an opted-in connection the server sends the mic audio to the STT through a hold. The turn engine still gets every mic sample at once, as it needs the user's audio during the reply to hear a barge. Positions are on the client's mic stream:
+
+- From a reply's `audio_start`, the mic audio is held.
+- The `playback` `start` releases the audio before its `mic_sample` to the STT, in order.
+- From the `start` to the `stop`'s `mic_sample` plus `VM_TYGER_HOLD_TAIL_MS` (default 150 ms, for room echo), the audio is dropped: the STT does not hear the echo of the reply.
+- After a `barge`, the held audio goes to the STT from the user's onset (`onset_mic_sample`, at most 4 s before the barge's `mic_sample`), so **the user's speech from the onset is transcribed**, and the audio after it goes on to the STT.
+- With no `start` within `VM_TYGER_START_WAIT_MS` after the reply's `audio_end`, the held audio goes to the STT as if the reply never played. A reply that sent no PCM holds nothing.
+
+What a client sees: no transcription of the reply's echo; transcripts of audio held during a reply arrive late, when the hold lets the audio go; and speech during a reply that the turn engine does not take as a barge (a short "mm-hm") is dropped with the echo. A client that never sends `playback` frames makes the STT wait for each reply plus the start wait, so always report playback on an opted-in connection.
+
+### Losing the sidecar
+
+If the turn engine's sidecar exits or the server loses its link to it, each opted-in connection gets **one** `error` frame with `error_type` `"turn_engine_lost"`, and from then on it is a plain connection, as if it never opted in:
+
+- The held mic audio goes to the STT in order, and later audio goes straight to it.
+- No more `barge` or `turn_end` frames. Finals and endpoint frames end turns, as for any connection.
+- `playback` frames are dropped with no answer.
+- TTS replies go on as before.
+
+```json
+{ "type": "error", "error_type": "turn_engine_lost", "message": "The turn engine stopped; the session goes on without it (silero endpointing, no barge or turn_end frames)." }
+```
+
+The connection stays without a turn engine: a new opt-in on it gets `invalid_request`. The server starts the sidecar again on its own; to use the turn engine again, open **a new connection** and opt in. While the sidecar is starting again, that opt-in gets `turn_engine_unavailable`.
+
 ## WebSocket message-schema reference
 
 All WebSocket **text** frames are JSON objects with a `type` field that routes
@@ -902,6 +1110,10 @@ Pydantic model in `protocol.py` (named in its heading), except the bare
 types; the **Default** column is the value a field takes when the sender omits
 it, and *(required)* marks a field with no default. Binary frames carry no JSON
 envelope - see [Binary frames](#binary-frames) at the end of this section.
+
+The turn-engine frames (`turn_engine`, `turn_engine_ready`, `playback`, `barge`
+and `turn_end`) are documented with their fields and examples in
+[Turn engine frames](#turn-engine-frames).
 
 `MessageType` also declares `audio_chunk`, which is **reserved and currently
 unused**: no frame of that type is ever sent in either direction. STT input and
@@ -967,7 +1179,7 @@ Marks the end of one TTS reply. Exactly one `audio_end` is emitted per
 |---|---|---|---|
 | `type` | string | `"audio_end"` | Frame discriminator. |
 | `request_id` | string or null | `null` | The completed reply's `request_id`. |
-| `reason` | string | `"complete"` | Why the reply ended: `"complete"`, `"cancelled"`, `"error"`, or (reserved) `"interrupted"`. See [Turn-taking](#turn-taking-protocol-surface). |
+| `reason` | string | `"complete"` | Why the reply ended: `"complete"`, `"cancelled"`, `"error"`, or `"interrupted"` (a barge on a connection that opted in to the turn engine; the `barge` frame comes first). See [Turn-taking](#turn-taking-protocol-surface) and [Turn engine](#turn-engine). |
 
 #### `turn_started` - `TurnStartedMessage`
 
@@ -1113,7 +1325,16 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `TTSRequest.done` | `()` | `None` | End the text; the server answers with one `audio_end`. A later `send` raises. |
 | `TTSRequest.cancel` | `()` | `None` | Stop the reply; the server answers with one `audio_end` carrying `reason: "cancelled"`. |
 | `DuplexSession.audio` | `()` | `AsyncIterator[tuple]` | Yield `("audio_start", frame)`, `("pcm", bytes, request_id)` and `("audio_end", frame)` in arrival order. The pcm of a cancelled request is dropped until its `audio_end`, which is still yielded. |
-| `DuplexSession.errors` | `()` | `AsyncIterator[dict]` | Yield the server's `error` frames (timeout warnings, invalid requests). |
+| `DuplexSession.errors` | `()` | `AsyncIterator[dict]` | Yield the server's `error` frames (timeout warnings, invalid requests, `turn_engine_lost`). |
+| `DuplexSession.enable_turn_engine` | `(engine="tyger", timeout=10.0)` | `str` | Send the `turn_engine` opt-in before the first `send_audio` and wait for `turn_engine_ready`; returns the engine. Raises `TurnEngineError` (its `error_type` is the server's, or `None` on a timeout) on a refusal. |
+| `DuplexSession.mic_sample` | property | `int` | Mic samples sent on this connection since its first audio frame: the index a `playback` frame's `mic_sample` counts in. |
+| `DuplexSession.playback_start` | `(request, mic_sample=None)` | `None` | Send `playback` `start` for a `TTSRequest` or `request_id`; `mic_sample` defaults to `mic_sample` now. |
+| `DuplexSession.playback_stop` | `(request, mic_sample=None, *, reply_sample)` | `None` | Send `playback` `stop`, with `reply_sample` in samples of the reply at its `audio_start` rate. |
+| `DuplexSession.turn_ends` | `()` | `AsyncIterator[dict]` | Yield each `turn_end` frame of an opted-in connection. |
+
+On an opted-in connection, `DuplexSession.audio` also yields `("barge", frame)`,
+before that request's `audio_end` (reason `"interrupted"`), and drops any PCM of
+the barged request.
 | `DuplexSession.close` | `()` | `None` | End the session; the one-sided methods work again. |
 
 A classic turn loop in outline (the full version, with supersede on a revised
@@ -1223,6 +1444,13 @@ frame, no close. The client-visible effect is one utterance that produces no
 `transcription`; the cause is logged server-side. Ending a healthy session over
 a single bad utterance would cost far more than the utterance does.
 
+**Some `error` frames do not close the socket.** `timeout_warning`,
+`invalid_request` (for example a bad `tts_stream` `chunking` value or a bad
+`playback` frame) and the turn engine's `turn_engine_unavailable`,
+`turn_engine_unsupported` and `turn_engine_lost` are notices: the frame is
+dropped or the opt-in refused, and the connection stays open. See
+[Turn engine errors](#turn-engine-errors).
+
 Why `1008` is a special case is expanded under [Gotchas](#gotchas): auth is
 verified before `accept()`, so a bad token can only manifest as a 403, never as a
 `1008` close.
@@ -1256,6 +1484,10 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS` | `4000` | Clause mode, audiocpp: how many ms from the end of the previous piece's audio join that reference, when continuation is on. |
 | `VM_AUDIOCPP_TTS_START_BUFFER_MS` | `250` | audiocpp `tts_stream`: the first audio of each engine request is held until this many ms are in hand and sent as one chunk. Adds up to this much to the first audio of each piece. `0` sends every chunk on arrival. |
 | `VM_DEVICE` | `auto` | Compute device (`auto`, `cpu`, `cuda`, `cuda:N`); affects latency, not the protocol. |
+| `VM_TURN_ENGINE` | `off` | `tyger` starts the turn engine, which a connection may then [opt in to](#turn-engine); with `off` every opt-in gets `turn_engine_unavailable`. |
+| `VM_TYGER_HOLD_TAIL_MS` | `150` | Turn engine: mic audio up to a `playback` `stop` plus this many ms stays out of the STT. |
+| `VM_TYGER_START_WAIT_MS` | `2000` | Turn engine: with no `playback` `start` this many ms after a reply's `audio_end`, the held mic audio goes to the STT as if the reply never played. |
+| `VM_TYGER_SILENCE_FALLBACK_MS` | `1200` | Turn engine: this many ms of silence after speech end the turn with `by: "silence"` when the model has not ended it. |
 
 The server has many more `VM_` variables for model selection and tuning
 (Whisper, Qwen, Nemotron, OpenVoice, and VibeVoice parameters). Those are
@@ -1540,7 +1772,7 @@ engine: the shared-index, revise-in-place shape is what you can depend on.
 
 This doc names symbols, not line numbers, so it stays valid as the code moves. To
 confirm any claim here against the code as it stands, or to catch drift after a
-protocol change, diff these five files - together they define the entire
+protocol change, diff these six files - together they define the entire
 client-visible contract:
 
 - `src/voicemanager/protocol.py` - every WebSocket message type and its fields,
@@ -1553,6 +1785,9 @@ client-visible contract:
   and `/voice/upload`.
 - `src/voicemanager/auth/deps.py` - bearer token parsing and lookup for the
   WebSocket pre-accept check and the REST endpoints.
+- `src/voicemanager/transport/turn_engine.py` - the turn engine per connection:
+  the opt-in checks, `playback` handling, `barge`, `turn_end`, the mic hold and
+  losing the sidecar (its module docstring states the rules).
 - `src/voicemanager/client.py` - the reference Python client, whose methods map
   onto the frames above and encode the client-side rules (post-cancel discard,
   turn stamping) as working code.

@@ -12,6 +12,7 @@ VoiceManager is made for voice agents that talk with a person in real time. One 
 - **End of speech.** The audiocpp STT engine uses Silero VAD to detect when the person stops speaking, also when the client streams the microphone without a pause.
 - **Barge-in.** `tts_cancel` stops a reply at once. The server sends one `audio_end` with `reason: "cancelled"` and no more audio for that request, so the agent can stop talking when the person starts.
 - **Turns.** `turn_start` opens a new turn, and each transcript carries the `turn_id` of the audio it came from. A client can then drop late transcripts that belong to a turn it already ended.
+- **Turn engine.** With `VM_TURN_ENGINE=tyger`, a client can opt in to a turn-taking model that hears the mic and the reply as it plays. The server then sends `turn_end` when the user's turn ended and `barge` when the user cut in over the reply, which it stops itself (`audio_end` reason `interrupted`). See [Tyger](#tyger).
 - **Flush.** A `tts_stream` frame with `flush: true` speaks the buffered text now and keeps the request open for more text.
 - **Clause mode.** A client that streams a few words at a time can set `chunking: "clause"` on the first `tts_stream` frame. The server then holds the text and cuts pieces by clause marks, word counts and how much audio is still unplayed, so the speech is smoother. The default is `"sentence"`. `flush` and `done` keep their meaning. Five settings tune it: `VM_TTS_CLAUSE_FIRST_WORDS` (3), `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` (300), `VM_TTS_CLAUSE_LATER_WORDS` (12), `VM_TTS_CLAUSE_MARGIN_MS` (1000) and `VM_TTS_CLAUSE_MARK_MIN_WORDS` (3). See [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause).
 
@@ -203,6 +204,39 @@ The server watches the sidecar and starts it again when it dies (a crash, an OOM
 
 The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM. One generation is capped at 60 s of audio by the shipped generator config: a `tts_stream` request whose speech would run past 60 s is cut there with a normal `audio_end` (reason `complete`) and the rest of its text is dropped, so keep one request to one reply. Voice cloning from an upload (`/voice/upload`) is not offered on this engine (the upload answers 400); it is English only; and the weights are published under CC BY-NC 4.0, so check the licence before any commercial use.
 
+### Tyger
+
+Tyger (https://huggingface.co/nineninesix/tyger) is a turn-taking model by NineNineSix. It hears the user's mic and the agent's reply as it plays at the client, and decides when the user's turn ended and when the user cut in over the reply. With it on, a client that opts in gets `turn_end` and `barge` frames, and the server ends a barged reply itself and keeps the reply's echo out of the STT. A client that does not opt in sees no change. The frames are in [Turn engine](docs/client-integration.md#turn-engine). It works only with the audiocpp STT engine (`VM_STT_ENGINE=audiocpp`); on another STT engine every opt-in is refused with `turn_engine_unsupported`.
+
+Tyger pins its own PyTorch and transformers 5.x, so it runs as one separate process from its own virtual environment, which VoiceManager starts and stops with the server. All sessions share that one process.
+
+```bash
+python3.12 -m venv venv-tyger
+# torch needs a CUDA build for your driver: with uv, --torch-backend=auto picks it
+uv pip install --python venv-tyger/bin/python -r requirements-tyger.txt --torch-backend=auto
+# or with pip, the PyTorch index for your CUDA version (cuXXX, for example cu130)
+venv-tyger/bin/pip install -r requirements-tyger.txt --index-url https://download.pytorch.org/whl/cuXXX --extra-index-url https://pypi.org/simple
+
+python setup_models.py tyger   # run with the server's python
+```
+
+`python setup_models.py tyger` downloads the model bundle (`VM_TYGER_MODEL`, default `nineninesix/tyger`) at the pinned revision `VM_TYGER_REVISION` into the Hugging Face cache, where the sidecar loads it from, and checks each file against the checksums in the bundle's `config.json`. If the download is refused, the bundle may need a Hugging Face login: set `HF_TOKEN` or run `hf auth login`, then run it again. `VM_TYGER_MODEL` can also be the path of a local bundle directory, which is checked without a download.
+
+Set `VM_TURN_ENGINE=tyger`. The other settings are optional:
+
+- `VM_TYGER_PY`: the python of that environment (default `venv-tyger/bin/python`, relative to the VoiceManager home).
+- `VM_TYGER_DEVICE`: the GPU for the model. Blank (the default) means the device `VM_DEVICE` resolves to; else `auto`, `cpu`, `cuda` or `cuda:N`.
+- `VM_TYGER_PORT`: the loopback port the sidecar listens on (default 8257).
+- `VM_TYGER_READY_TIMEOUT`: seconds to wait for the sidecar to load the model (default 180).
+- The turn rules, on Tyger's 80 ms frames: `VM_TYGER_ENDPOINT_THRESHOLD` (0.915) and `VM_TYGER_ENDPOINT_DEBOUNCE` (2 frames) end a turn, after at least `VM_TYGER_MIN_SPEECH_MS` (350) of voice; `VM_TYGER_BARGE_THRESHOLD` (0.6) and `VM_TYGER_BARGE_DEBOUNCE` (2 frames) make a barge, never in the first `VM_TYGER_WARMUP_FRAMES` (6) after a reply starts to play; audio below `VM_TYGER_VOICE_GATE_DB` (-50 dBFS) is silence, and `VM_TYGER_SILENCE_FALLBACK_MS` (1200) of it ends a turn that the model has not ended.
+- The mic hold: `VM_TYGER_HOLD_TAIL_MS` (150) of room echo after a reply stops stays out of the STT, and with no playback start from the client `VM_TYGER_START_WAIT_MS` (2000) after a reply's `audio_end` the held mic audio goes to the STT as if the reply never played.
+
+`.env.example` lists all of them with an explanation.
+
+The model needs about 3 GiB of GPU memory. The server does not start if the sidecar does not come up; the error names the setting to fix. While the server runs, it watches the sidecar and starts it again when it dies. Each opted-in session then gets one `turn_engine_lost` error frame and goes on without the turn engine; a new connection can opt in again once the sidecar is back.
+
+Licences. The bundle is under the OpenMDW License Agreement, version 1.1 (OpenMDW-1.1), and has two parts. The Tyger turn-taker (the `turn_taker.*` tensors) and Tyger's configuration and documentation are NineNineSix's, under OpenMDW-1.1. The ASR encoder is NVIDIA's Nemotron 3.5 ASR Streaming 0.6B (the `nemotron.*` tensors and the files in `nemotron/`), unchanged, under NVIDIA's own licence grant for it, also OpenMDW-1.1 (https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b). `setup_models.py` fetches only the files the sidecar loads, so read `LICENSE.md`, `NOTICE.md` and `licenses/OpenMDW-1.1.txt` on the model page before you use or share the weights. The turn rules in `src/voicemanager/pipeline/tyger/` (`rules.py` and parts of `scorer.py`) are adapted from tyger-s2s (https://github.com/nineninesix-ai/tyger-s2s), which is under the Apache License 2.0 (Apache-2.0); its `LICENSE` and a `NOTICE` that names the source files and the changes are next to that code.
+
 ## Configuration
 
 All settings are `VM_*` variables in `.env`. `.env.example` lists each one with its default and an explanation. The server does not start if `.env` contains an unknown `VM_` key.
@@ -294,3 +328,4 @@ Other parts have their own terms:
 - Model weights have their own licenses. Breeze-TTS 2 has a non-commercial license. Read each model's license before you use it.
 - The `lcars_demo` voice is for personal, non-commercial use only. See the copyright notice above.
 - The openvoice extra (`requirements-openvoice.txt`) installs GPL packages: Unidecode and phonemizer.
+- The Tyger turn-engine bundle is under OpenMDW-1.1, NVIDIA's Nemotron weights in it under NVIDIA's own OpenMDW-1.1 grant, and the turn-rule code adapted from tyger-s2s in `src/voicemanager/pipeline/tyger/` is under Apache-2.0 with its `LICENSE` and `NOTICE` there. See [Tyger](#tyger).

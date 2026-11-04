@@ -4,6 +4,51 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+### Added
+
+- A turn engine: `VM_TURN_ENGINE=tyger` starts the Tyger turn-taking model
+  (NineNineSix) as one sidecar process from its own virtual environment
+  (`venv-tyger`, `requirements-tyger.txt`, `VM_TYGER_PY`), on `VM_TYGER_DEVICE`.
+  It hears the user's mic and the reply as it plays at the client, and decides
+  when the user's turn ended and when the user cut in. It works with the audiocpp
+  STT engine only. `python setup_models.py tyger` downloads the bundle at a pinned
+  revision and checks its checksums. The turn rules are `VM_TYGER_*` settings
+  (see `.env.example`). The server watches the sidecar and starts it again when
+  it dies. The bundle is under OpenMDW-1.1 (NVIDIA's Nemotron weights in it under
+  NVIDIA's own OpenMDW-1.1 grant); the turn-rule code adapted from tyger-s2s
+  ships with its Apache-2.0 `LICENSE` and a `NOTICE`.
+- Opt-in turn-engine frames on the WebSocket, all additive: a client sends
+  `turn_engine` before its first audio frame and gets `turn_engine_ready`, reports
+  each reply's playback edges with `playback` (`start` and `stop`, placed on its
+  own mic stream by `mic_sample`), and then gets `barge` when the user cut in over
+  a reply and `turn_end` (the finals of the turn joined, `by` `model` or
+  `silence`) when the user's turn ended. New `error_type` values
+  `turn_engine_unavailable`, `turn_engine_unsupported` and `turn_engine_lost`.
+  A connection that does not opt in, and a server with `VM_TURN_ENGINE=off`,
+  behave as before.
+- For an opted-in connection the server holds the mic audio back from the STT
+  while a reply plays, so the STT does not transcribe the reply's echo; after a
+  barge, the user's speech from its onset is transcribed. If the sidecar is lost,
+  each opted-in connection gets one `turn_engine_lost` frame and goes on as a
+  plain connection.
+- Python client: `DuplexSession.enable_turn_engine()`, `playback_start()`,
+  `playback_stop()`, the `mic_sample` property, `turn_ends()`, `("barge", frame)`
+  on `audio()` and `TurnEngineError`.
+- `scripts/voice_agent.py classic --turn-engine tyger` opts in, reports playback
+  edges from the output DAC time and the mic's first ADC time, ends a turn on
+  `turn_end` and clears its playback on a barge. `classic --capture` saves the
+  same mic, output and timing files as `microturn --capture`.
+- `docs/client-integration.md` documents the turn engine for clients in any
+  language, and the README covers its setup and licences.
+
+### Changed
+
+- `audio_end` reason `interrupted`, reserved until now, is sent: it ends a reply
+  the turn engine took as barged, after that request's `barge` frame. Only an
+  opted-in connection can get it.
+
 ## [0.4.2]
 
 ### Added
