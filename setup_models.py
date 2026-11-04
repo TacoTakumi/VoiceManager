@@ -8,27 +8,37 @@ Usage::
     python setup_models.py whisper      # only Whisper (faster-whisper, VM_WHISPER_MODEL)
     python setup_models.py openvoice    # only OpenVoice v2 checkpoints + NLTK
     python setup_models.py vibevoice    # only VibeVoice model + voice presets
+    python setup_models.py tyger        # only the Tyger turn-engine bundle (VM_TYGER_MODEL)
     python setup_models.py whisper vibevoice  # multiple targets
 
 requirements.txt covers only the default audiocpp engines. When an engine needs
 packages from its requirements-<engine>.txt that are missing, this script asks
 before it installs them, and only prints the pip command when stdin is not a TTY.
+The Tyger sidecar runs from its own environment (requirements-tyger.txt), so the
+tyger target only downloads and checks the bundle; it needs nothing beyond the core.
 """
 import argparse
+import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
 from voicemanager.config import get_settings
 
 
 VOICES_DIR = "voices/streaming_model"
 AUDIOCPP_GGUF_REPO = "audio-cpp/audio.cpp-gguf"
+# The files of the Tyger bundle the sidecar loads: the weights, the config that
+# describes them and carries the checksums, and nemotron's config and tokenizer.
+TYGER_FILES = ["config.json", "model.safetensors", "nemotron/*.json"]
 
 # Setup target for each configured engine. None means the engine has no setup step.
 STT_TARGETS = {"audiocpp": "audiocpp-stt", "whisper": "whisper", "nemotron": None, "qwen": None}
@@ -155,6 +165,71 @@ def setup_vibevoice(model_name: str = "microsoft/VibeVoice-Realtime-0.5B"):
     _setup_voice_presets()
 
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def verify_tyger_bundle(folder) -> None:
+    """Check the bundle's files against the checksums its config.json carries.
+
+    config.json holds ``weights_sha256`` for model.safetensors and
+    ``frontend_file_sha256``, a map of each nemotron/ file to its digest. Raises
+    ValueError naming the first file that is missing or does not match.
+    """
+    folder = Path(folder)
+    config_path = folder / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"bundle {folder}: cannot read config.json ({e})") from e
+    weights = config.get("weights_sha256")
+    frontend = config.get("frontend_file_sha256")
+    if not isinstance(weights, str) or not isinstance(frontend, dict) or not frontend:
+        raise ValueError(
+            f"bundle {folder}: config.json has no weights_sha256 or frontend_file_sha256")
+    expected = {"model.safetensors": weights}
+    expected.update({f"nemotron/{name}": digest for name, digest in frontend.items()})
+    for name, digest in expected.items():
+        path = folder / name
+        if not path.is_file():
+            raise ValueError(f"bundle {folder}: {name} is missing")
+        if _sha256(path) != digest:
+            raise ValueError(f"bundle {folder}: {name} does not match its checksum")
+
+
+def setup_tyger():
+    """Download the Tyger bundle at the pinned revision and check its checksums.
+
+    A local bundle directory in VM_TYGER_MODEL is checked without a download. The
+    files land in the Hugging Face cache, where the sidecar loads them from.
+    """
+    print("--- Setting up the Tyger turn-engine bundle ---")
+    settings = get_settings()
+    repo, revision = settings.tyger_model, settings.tyger_revision
+    if Path(repo).expanduser().is_dir():
+        folder = Path(repo).expanduser()
+        print(f"Using the local bundle {folder}")
+    else:
+        print(f"Downloading {repo} at revision {revision}")
+        try:
+            folder = Path(snapshot_download(
+                repo_id=repo, revision=revision, allow_patterns=TYGER_FILES))
+        except (RepositoryNotFoundError, GatedRepoError) as e:
+            sys.exit(f"tyger: cannot download {repo}: {e}\n"
+                     "The bundle may need a Hugging Face login: set HF_TOKEN or run "
+                     "'hf auth login'.")
+    print("Checking checksums...")
+    try:
+        verify_tyger_bundle(folder)
+    except ValueError as e:
+        sys.exit(f"tyger: {e}")
+    print(f"Tyger bundle ready in {folder}\n")
+
+
 def _setup_voice_presets():
     """Download voice preset .pt files from the VibeVoice GitHub repo."""
     os.makedirs(VOICES_DIR, exist_ok=True)
@@ -209,6 +284,7 @@ TARGETS = {
     "whisper": setup_whisper,
     "openvoice": setup_openvoice,
     "vibevoice": setup_vibevoice,
+    "tyger": setup_tyger,
 }
 
 
@@ -236,7 +312,8 @@ if __name__ == "__main__":
                 skipped = True
     else:
         settings = get_settings()
-        print(f"Configured engines: STT={settings.stt_engine}, TTS={settings.tts_engine}\n")
+        print(f"Configured engines: STT={settings.stt_engine}, TTS={settings.tts_engine}, "
+              f"turn={settings.turn_engine}\n")
         for engine, table in ((settings.stt_engine, STT_TARGETS),
                               (settings.tts_engine, TTS_TARGETS)):
             if not ensure_requirements(engine):
@@ -247,6 +324,8 @@ if __name__ == "__main__":
                 print(f"{engine}: no setup step, it downloads its model on first start.\n")
             elif target not in targets:
                 targets.append(target)
+        if settings.turn_engine == "tyger":
+            targets.append("tyger")
 
     for name in targets:
         TARGETS[name]()

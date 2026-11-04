@@ -1,10 +1,12 @@
 """VoiceManager configuration via pydantic-settings."""
 import logging
 import os
+import re
 import sys
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,10 @@ REMOVED_KEY_MESSAGE = (
     f"{REMOVED_KEY_ENV} was removed: remove it from the environment and .env, "
     "and create a bearer token with 'voicemanager user token add'."
 )
+
+
+# The forms VM_DEVICE takes, which VM_TYGER_DEVICE also accepts.
+_DEVICE_RE = re.compile(r"auto|cpu|cuda(:[0-9]+)?")
 
 
 class RemovedSettingError(ValueError):
@@ -303,6 +309,47 @@ class Settings(BaseSettings):
     voxtream_ready_timeout: float = Field(default=180.0, gt=0)  # VM_VOXTREAM_READY_TIMEOUT
     voxtream_compile: bool = Field(default=False)              # VM_VOXTREAM_COMPILE (torch.compile)
 
+    # Turn engine. "off" (the default) keeps silero endpointing and starts nothing.
+    # "tyger" starts the Tyger sidecar: a model that hears the mic and the reply being
+    # played and decides when the user's turn ends and when the user barges in. A
+    # session uses it only after it opts in. Tyger pins transformers 5.x and its own
+    # torch, so it runs as one separate process from its own virtual environment
+    # (requirements-tyger.txt): VM_TYGER_PY is that environment's python.
+    turn_engine: Literal["off", "tyger"] = Field(default="off")  # VM_TURN_ENGINE: off|tyger
+    tyger_py: str = Field(default="venv-tyger/bin/python", min_length=1)  # VM_TYGER_PY
+    tyger_port: int = Field(default=8257, gt=0)                # VM_TYGER_PORT (loopback)
+    # Blank (the default) means the device VM_DEVICE resolves to; otherwise the same
+    # forms VM_DEVICE takes: auto|cpu|cuda|cuda:N.
+    tyger_device: str = Field(default="")                      # VM_TYGER_DEVICE
+    # The model bundle, as `python setup_models.py tyger` downloads it: a Hugging Face
+    # repo at a pinned revision (its config.json carries the checksums the setup
+    # checks), or the path of a local bundle directory.
+    tyger_model: str = Field(default="nineninesix/tyger", min_length=1)  # VM_TYGER_MODEL
+    tyger_revision: str = Field(
+        default="a5d4d73bb74fa4a7082dcd4387e44a1e5ac151b6", min_length=1)  # VM_TYGER_REVISION
+    # Turn rules, on Tyger's 80 ms frames. A turn ends when the endpoint score is at
+    # or above the threshold on this many frames in a row, after at least
+    # min_speech_ms of voiced audio; if the score has not ended it, silence_fallback_ms
+    # of audio below the voice gate ends it by 'silence'. While a reply plays, a barge
+    # fires when the yield score is at or above its threshold on this many frames in a
+    # row, never during the warm-up frames after each switch to speaking.
+    tyger_endpoint_threshold: float = Field(default=0.915, ge=0.0, le=1.0)  # VM_TYGER_ENDPOINT_THRESHOLD
+    tyger_endpoint_debounce: int = Field(default=2, gt=0)      # VM_TYGER_ENDPOINT_DEBOUNCE (frames)
+    tyger_barge_threshold: float = Field(default=0.6, ge=0.0, le=1.0)  # VM_TYGER_BARGE_THRESHOLD
+    tyger_barge_debounce: int = Field(default=2, gt=0)         # VM_TYGER_BARGE_DEBOUNCE (frames)
+    tyger_warmup_frames: int = Field(default=6, ge=0)          # VM_TYGER_WARMUP_FRAMES
+    tyger_min_speech_ms: int = Field(default=350, ge=0)        # VM_TYGER_MIN_SPEECH_MS
+    tyger_voice_gate_db: float = Field(default=-50.0, le=0.0)  # VM_TYGER_VOICE_GATE_DB (dBFS)
+    tyger_silence_fallback_ms: int = Field(default=1200, gt=0)  # VM_TYGER_SILENCE_FALLBACK_MS
+    # Mic audio hold while a reply plays: audio up to the client's playback stop plus
+    # this tail stays out of the STT (room echo after the last played sample).
+    tyger_hold_tail_ms: int = Field(default=150, ge=0)         # VM_TYGER_HOLD_TAIL_MS
+    # With no playback start from the client this long after a reply's audio_end, the
+    # hold ends and the held audio goes to the STT, as if the reply never played.
+    tyger_start_wait_ms: int = Field(default=2000, gt=0)       # VM_TYGER_START_WAIT_MS
+    # Seconds to wait for the sidecar's /health to answer 200 after the spawn.
+    tyger_ready_timeout: float = Field(default=180.0, gt=0)    # VM_TYGER_READY_TIMEOUT
+
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
     # when the piece up to it holds at least mark_min_words words. The first piece
@@ -329,11 +376,20 @@ class Settings(BaseSettings):
         "vibevoice_voices_dir",
         "voxtream_py",
         "voxtream_voices",
+        "tyger_py",
     )
 
     def __init__(self, **values) -> None:
         values.setdefault("_env_file", resolve_home() / ".env")
         super().__init__(**values)
+
+    @field_validator("tyger_device")
+    @classmethod
+    def _check_tyger_device(cls, value: str) -> str:
+        if value and not _DEVICE_RE.fullmatch(value):
+            raise ValueError(
+                f"expected blank, auto, cpu, cuda or cuda:N, got {value!r}")
+        return value
 
     @model_validator(mode="after")
     def _anchor_relative_paths(self) -> "Settings":

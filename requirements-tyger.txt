@@ -1,0 +1,27 @@
+# VM_TURN_ENGINE=tyger: the Tyger sidecar's OWN virtual environment, not the server's.
+# The sidecar runs the Tyger scorer (nemotron-3.5-asr layer 15 plus the turn-taker
+# GRU); the server never imports it. Python 3.12:
+#
+#   python3.12 -m venv venv-tyger
+#   venv-tyger/bin/pip install -r requirements-tyger.txt
+#
+# torch: the CUDA build is chosen at install time, not here. With uv,
+#   uv pip install --python venv-tyger/bin/python -r requirements-tyger.txt --torch-backend=auto
+# picks the build for the installed driver; with pip, add the matching
+# --index-url https://download.pytorch.org/whl/cuXXX. Tested with torch 2.15.0+cu132
+# on this setup, and upstream with 2.13.0+cu130.
+
+# The scorer. nemotron-3.5-asr needs transformers 5.13 or newer; the bundle was
+# validated on 5.14.1.
+torch==2.15.0
+transformers==5.14.1
+safetensors==0.8.0
+huggingface_hub==1.33.0
+numpy==2.5.4
+# The nemotron feature extractor computes its mel filters with librosa.
+librosa==1.0.0
+
+# The sidecar's loopback server (/health and the WebSocket), as the VoXtream sidecar.
+fastapi
+uvicorn
+websockets
