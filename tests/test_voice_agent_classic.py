@@ -707,3 +707,580 @@ def test_a_frame_arriving_while_the_next_turn_opens_does_not_touch_the_answered_
         "question one", "First.", "question two"]
     assert session.history[:2] == [{"role": "user", "content": "question one"},
                                    {"role": "assistant", "content": "First."}]
+
+
+# --- the turn engine: playback edges on the mic clock, turn_end, barge ------------------
+
+import types  # noqa: E402
+
+
+class TurnDuplex(FakeDuplex):
+    """A duplex that also takes playback reports."""
+
+    def __init__(self):
+        super().__init__()
+        self.playback: list[tuple] = []
+
+    async def playback_start(self, request, mic_sample=None) -> None:
+        self.playback.append(("start", request, mic_sample))
+        self.events.append(("playback_start", request, mic_sample))
+
+    async def playback_stop(self, request, mic_sample=None, *, reply_sample) -> None:
+        self.playback.append(("stop", request, mic_sample, reply_sample))
+        self.events.append(("playback_stop", request, mic_sample, reply_sample))
+
+
+class TurnPlayer(FakePlayer):
+    """A fake player that also notes which reply its audio belongs to."""
+
+    def __init__(self):
+        super().__init__()
+        self.begun: list[str] = []
+        self.ended: list[str] = []
+
+    def begin_reply(self, request_id: str) -> None:
+        self.begun.append(request_id)
+
+    def end_reply(self, request_id: str) -> None:
+        self.ended.append(request_id)
+
+
+def _turn_session(factory: ChatFactory, mic=None):
+    duplex, player, log = TurnDuplex(), TurnPlayer(), io.StringIO()
+    clock = {"t": 100.0}
+    session = va.ClassicSession(duplex, factory, player, log, clock=lambda: clock["t"],
+                                voice="alice", chunking="clause", turn_engine="tyger",
+                                mic_clock=mic)
+    return session, duplex, player, log, clock
+
+
+def _turn_end(text: str, turn_id: int = 1, mic_sample: int = 32000, by: str = "model") -> dict:
+    return {"type": "turn_end", "turn_id": turn_id, "text": text, "mic_sample": mic_sample,
+            "by": by}
+
+
+def _mic(adc: float | None = 10.0, mono: float | None = 500.0):
+    mic = va.MicClock()
+    mic.add(b"\x00\x00", types.SimpleNamespace(inputBufferAdcTime=adc))
+    if mono is not None:
+        mic.first_monotonic = mono
+    return mic
+
+
+def test_mic_sample_at_maps_a_dac_time_onto_the_mic_stream():
+    assert va.mic_sample_at(10.5, 10.0) == 8000
+    assert va.mic_sample_at(10.0, 10.0) == 0
+    assert va.mic_sample_at(12.00003, 10.0) == 32000  # rounded to the nearest sample
+    assert va.mic_sample_at(12.00004, 10.0) == 32001
+    assert va.mic_sample_at(9.0, 10.0) == 0  # an edge before the first mic sample
+
+
+def test_playback_mic_sample_uses_stream_time_else_the_monotonic_clock():
+    mic = _mic(adc=10.0, mono=500.0)
+    assert va.playback_mic_sample(10.25, 777.0, mic) == 4000
+    # A host API that reports no stream time (None or zero) falls back to monotonic.
+    assert va.playback_mic_sample(None, 500.5, mic) == 8000
+    assert va.playback_mic_sample(10.25, 500.5, _mic(adc=0.0, mono=500.0)) == 8000
+    # Before the mic has captured anything there is no clock to map onto.
+    assert va.playback_mic_sample(10.25, 500.5, va.MicClock()) is None
+    assert va.playback_mic_sample(10.25, 500.5, None) is None
+
+
+def test_mic_clock_keeps_only_the_first_block_times():
+    mic = va.MicClock()
+    mic.add(b"\x01\x00" * 1600, types.SimpleNamespace(inputBufferAdcTime=3.25))
+    first = mic.first_monotonic
+    mic.add(b"\x02\x00" * 1600, types.SimpleNamespace(inputBufferAdcTime=3.35))
+    assert mic.first_adc_time == 3.25 and mic.first_monotonic == first is not None
+
+
+# --- the tracked player ---------------------------------------------------------------
+
+def _tracked(rate: int = 16000):
+    player = va.TrackedPlayer()
+    player.sample_rate = rate
+    edges: list = []
+    player.on_edge = edges.append
+    return player, edges
+
+
+def _play(player, frames: int, dac: float) -> bytes:
+    out = bytearray(frames * 2)
+    player._callback(out, frames, types.SimpleNamespace(outputBufferDacTime=dac,
+                                                        currentTime=dac - 0.05), None)
+    return bytes(out)
+
+
+def test_tracked_player_reports_the_first_sample_at_its_dac_time():
+    player, edges = _tracked()
+    _play(player, 4, 1.0)  # silence before the reply: no edge
+    player.begin_reply("r1")
+    player.enqueue(b"\x01\x00" * 6)
+    out = _play(player, 4, 2.0)
+    assert out == b"\x01\x00" * 4
+    assert [(e.event, e.request_id, e.dac_time) for e in edges] == [("start", "r1", 2.0)]
+    assert edges[0].monotonic is not None and edges[0].reply_sample is None
+
+
+def test_tracked_player_start_inside_a_block_is_offset_by_the_samples_before_it():
+    player, edges = _tracked(rate=24000)
+    player.enqueue(b"\x05\x00" * 3)  # audio of no reply (another request's tail)
+    player.begin_reply("r2")
+    player.enqueue(b"\x01\x00" * 10)
+    _play(player, 12, 4.0)
+    assert [(e.event, e.request_id) for e in edges] == [("start", "r2")]
+    assert edges[0].dac_time == pytest.approx(4.0 + 3 / 24000)
+
+
+def test_tracked_player_reports_the_stop_once_the_ended_reply_has_drained():
+    player, edges = _tracked()
+    player.begin_reply("r1")
+    player.enqueue(b"\x01\x00" * 6)
+    player.end_reply("r1")  # audio_end: the reply is whole, but not yet played
+    _play(player, 4, 2.0)
+    assert [e.event for e in edges] == ["start"]
+    _play(player, 4, 2.00025)  # 2 more samples, then silence
+    assert [e.event for e in edges] == ["start", "stop"]
+    stop = edges[1]
+    assert stop.request_id == "r1" and stop.reply_sample == 6
+    # The edge is the end of the last sample played.
+    assert stop.dac_time == pytest.approx(2.00025 + 2 / 16000)
+
+
+def test_tracked_player_stops_at_audio_end_when_the_reply_already_played_out():
+    player, edges = _tracked()
+    player.begin_reply("r1")
+    player.enqueue(b"\x01\x00" * 4)
+    _play(player, 4, 2.0)
+    _play(player, 4, 2.00025)  # an underrun: the reply is open, so no stop yet
+    assert [e.event for e in edges] == ["start"]
+    player.end_reply("r1")
+    assert [e.event for e in edges] == ["start", "stop"]
+    assert edges[1].reply_sample == 4 and edges[1].dac_time == pytest.approx(2.00025)
+
+
+def test_tracked_player_clear_stops_a_playing_reply_at_what_played():
+    player, edges = _tracked()
+    player.begin_reply("r1")
+    player.enqueue(b"\x01\x00" * 100)
+    _play(player, 10, 3.0)
+    player.clear()
+    assert [(e.event, e.reply_sample) for e in edges] == [("start", None), ("stop", 10)]
+    assert edges[1].dac_time == pytest.approx(3.0 + 10 / 16000)
+    assert player.is_playing() is False
+    _play(player, 10, 3.1)
+    assert len(edges) == 2  # nothing more for the cleared reply
+
+
+def test_tracked_player_clear_before_the_first_sample_reports_nothing():
+    player, edges = _tracked()
+    player.begin_reply("r1")
+    player.enqueue(b"\x01\x00" * 10)
+    player.clear()
+    player.end_reply("r1")
+    _play(player, 10, 3.0)
+    assert edges == []
+
+
+def test_tracked_player_two_replies_back_to_back():
+    player, edges = _tracked()
+    player.begin_reply("r1")
+    player.enqueue(b"\x01\x00" * 3)
+    player.end_reply("r1")
+    player.begin_reply("r2")
+    player.enqueue(b"\x02\x00" * 3)
+    _play(player, 8, 5.0)
+    assert [(e.event, e.request_id) for e in edges] == [
+        ("start", "r1"), ("stop", "r1"), ("start", "r2")]
+    assert edges[1].reply_sample == 3
+    assert edges[1].dac_time == pytest.approx(5.0 + 3 / 16000)
+    assert edges[2].dac_time == pytest.approx(5.0 + 3 / 16000)
+
+
+def test_tracked_player_without_replies_plays_like_the_plain_player():
+    player, edges = _tracked()
+    player.enqueue(b"\x01\x02\x03\x04")
+    assert player.pull(6) == b"\x01\x02\x03\x04\x00\x00"
+    assert bytes(player.played) == b"\x01\x02\x03\x04" and edges == []
+
+
+# --- the classic session with the turn engine -----------------------------------------
+
+def test_with_the_turn_engine_finals_do_not_end_the_turn_but_turn_end_does():
+    factory = ChatFactory(FakeChat(["Paris", "."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+    said: list[str] = []
+    session.say = said.append
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("what is the capital", endpoint=True), 100.5)
+        await session.on_transcript(_frame("what is the capital", final=True), 100.6)
+        await session.on_transcript(_frame("of France", seg=1, final=True), 101.4)
+        await _settle()
+        assert duplex.requests == []  # the endpoint and the finals end no turn
+        await session.on_turn_end(_turn_end("what is the capital of France"), 101.6)
+        await _settle()
+    asyncio.run(run())
+    assert len(duplex.requests) == 1
+    assert duplex.requests[0].sent == ["Paris", "."]
+    assert factory.messages[0][-1] == {"role": "user",
+                                       "content": "what is the capital of France"}
+    assert "... what is the capital" in said and "> what is the capital of France" in said
+    turn_ends = [line for line in _lines(log) if line["type"] == "turn_end"]
+    assert turn_ends[0]["text"] == "what is the capital of France"
+    assert turn_ends[0]["by"] == "model" and turn_ends[0]["mic_sample"] == 32000
+
+
+def test_a_turn_end_without_words_dispatches_nothing():
+    factory = ChatFactory()
+    session, duplex, player, log, clock = _turn_session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_turn_end(_turn_end("  "), 101.0)
+    asyncio.run(run())
+    assert duplex.requests == []
+
+
+def test_audio_events_tag_the_player_with_the_reply():
+    factory = ChatFactory(FakeChat(["Hi."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_turn_end(_turn_end("hello"), 100.9)
+        await _settle()
+        await _finish_reply(session, duplex, duplex.requests[0], clock)
+    asyncio.run(run())
+    assert player.begun == ["r1"] and player.ended == ["r1"]
+    assert player.chunks == [b"\x01\x00"] and duplex.turns == 2
+
+
+def test_without_the_turn_engine_the_player_is_not_tagged():
+    factory = ChatFactory(FakeChat(["Hi."]))
+    duplex, player, log = FakeDuplex(), TurnPlayer(), io.StringIO()
+    session = va.ClassicSession(duplex, factory, player, log, clock=lambda: 100.0)
+
+    async def run():
+        await session.open_turn()
+        await session.on_transcript(_frame("hello", endpoint=True), 100.9)
+        await _settle()
+        await _finish_reply(session, duplex, duplex.requests[0], {"t": 101.0})
+        assert await session.on_turn_end(_turn_end("ignored"), 101.5) is None
+    asyncio.run(run())
+    assert player.begun == [] and player.ended == [] and len(duplex.requests) == 1
+
+
+def test_a_barge_clears_the_player_and_the_next_turn_end_dispatches():
+    factory = ChatFactory(FakeChat(["Long", " answer"], hold=True), FakeChat(["Okay."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_turn_end(_turn_end("tell me a story"), 100.9)
+        await _settle()
+        first = duplex.requests[0]
+        await session.on_event(("audio_start", {"type": "audio_start", "request_id": "r1",
+                                                "sample_rate": 24000}), 101.3)
+        await session.on_event(("pcm", b"\x01\x00", "r1"), 101.3)
+        await session.on_event(("barge", {"type": "barge", "request_id": "r1",
+                                          "onset_mic_sample": 40000, "mic_sample": 44800}),
+                               102.0)
+        await _settle()
+        assert player.cleared == 1
+        # The server cancelled the request itself: no tts_cancel goes back.
+        assert not first.cancelled and ("cancel", "r1") not in duplex.events
+        # Its audio_end (interrupted) is the ack of the barge: the turn stays open.
+        await session.on_event(("audio_end", {"type": "audio_end", "request_id": "r1",
+                                              "reason": "interrupted"}), 102.1)
+        assert duplex.turns == 1
+        await session.on_turn_end(_turn_end("wait stop that", mic_sample=60000), 103.0)
+        await _settle()
+    asyncio.run(run())
+    assert len(duplex.requests) == 2
+    assert [m["content"] for m in factory.messages[1][1:]] == [
+        "tell me a story", "Long answer", "wait stop that"]
+    lines = _lines(log)
+    barges = [line for line in lines if line["type"] == "barge"]
+    assert barges[0]["request_id"] == "r1" and barges[0]["onset_mic_sample"] == 40000
+    utterances = [line for line in lines if line["type"] == "utterance"]
+    assert utterances[0]["cancelled"] is True and utterances[0]["reason"] == "barge"
+
+
+def test_a_barge_of_an_ended_reply_still_playing_clears_the_speaker():
+    factory = ChatFactory(FakeChat(["Hi."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_turn_end(_turn_end("hello"), 100.9)
+        await _settle()
+        await _finish_reply(session, duplex, duplex.requests[0], clock)
+        await session.on_event(("barge", {"type": "barge", "request_id": "r1",
+                                          "onset_mic_sample": 1, "mic_sample": 2}), 101.5)
+        await session.on_event(("barge", {"type": "barge", "request_id": "zz",
+                                          "onset_mic_sample": 1, "mic_sample": 2}), 101.6)
+    asyncio.run(run())
+    assert player.cleared == 1
+
+
+def test_a_turn_end_over_a_reply_with_no_words_yet_joins_the_two():
+    factory = ChatFactory(FakeChat([], hold=True), FakeChat(["Sure."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_turn_end(_turn_end("book a table"), 100.9)
+        await _settle()
+        await session.on_turn_end(_turn_end("for two"), 101.4)
+        await _settle()
+    asyncio.run(run())
+    assert len(duplex.requests) == 2 and duplex.requests[0].cancelled
+    assert factory.messages[1][1:] == [{"role": "user", "content": "book a table for two"}]
+
+
+def test_a_turn_end_over_a_reply_that_spoke_keeps_the_exchange():
+    factory = ChatFactory(FakeChat(["Which", " day?"], hold=True), FakeChat(["Done."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+
+    async def run():
+        await session.open_turn()
+        await session.on_turn_end(_turn_end("book a table"), 100.9)
+        await _settle()
+        await session.on_turn_end(_turn_end("on friday"), 101.4)
+        await _settle()
+    asyncio.run(run())
+    assert duplex.requests[0].cancelled
+    assert [m["content"] for m in factory.messages[1][1:]] == [
+        "book a table", "Which day?", "on friday"]
+
+
+def test_playback_edges_go_out_on_the_mic_clock():
+    factory = ChatFactory()
+    session, duplex, player, log, clock = _turn_session(factory, mic=_mic(adc=10.0))
+
+    async def run():
+        await session.on_playback_edge(va.PlaybackEdge("start", "r1", 10.5, 900.0, None))
+        await session.on_playback_edge(va.PlaybackEdge("stop", "r1", 12.0, 901.0, 36000))
+    asyncio.run(run())
+    assert duplex.playback == [("start", "r1", 8000), ("stop", "r1", 32000, 36000)]
+    lines = [line for line in _lines(log) if line["type"] == "playback"]
+    assert [(line["event"], line["mic_sample"]) for line in lines] == [
+        ("start", 8000), ("stop", 32000)]
+    assert lines[1]["reply_sample"] == 36000
+
+
+def test_tracked_player_edges_reach_the_server_through_the_session():
+    """The whole path: queued reply audio, the output callback, the playback frames."""
+    factory = ChatFactory()
+    session, duplex, _, log, clock = _turn_session(factory, mic=_mic(adc=10.0))
+    player, edges = _tracked(rate=16000)
+
+    async def run():
+        player.begin_reply("r1")
+        player.enqueue(b"\x01\x00" * 1600)
+        player.end_reply("r1")
+        _play(player, 1600, 10.5)
+        _play(player, 1600, 10.6)
+        for edge in edges:
+            await session.on_playback_edge(edge)
+    asyncio.run(run())
+    assert duplex.playback == [("start", "r1", 8000), ("stop", "r1", 9600, 1600)]
+
+
+def test_playback_edges_are_not_sent_without_the_turn_engine():
+    duplex = TurnDuplex()
+    session = va.ClassicSession(duplex, ChatFactory(), FakePlayer(), io.StringIO(),
+                                mic_clock=_mic())
+    asyncio.run(session.on_playback_edge(va.PlaybackEdge("start", "r1", 10.5, 900.0, None)))
+    assert duplex.playback == []
+
+
+def test_a_lost_turn_engine_goes_back_to_the_endpoint_frames():
+    factory = ChatFactory(FakeChat(["Hi."]))
+    session, duplex, player, log, clock = _turn_session(factory)
+    said: list[str] = []
+    session.say = said.append
+
+    async def run():
+        await session.open_turn()
+        session.on_error_frame({"type": "error", "error_type": "invalid_request"})
+        assert session.turn_engine == "tyger"
+        session.on_error_frame({"type": "error", "error_type": "turn_engine_lost",
+                                "message": "sidecar exited"})
+        assert session.turn_engine is None
+        await session.on_transcript(_frame("hello", endpoint=True), 101.0)
+        await _settle()
+        await session.on_playback_edge(va.PlaybackEdge("start", "r1", 10.5, 900.0, None))
+    asyncio.run(run())
+    assert len(duplex.requests) == 1 and duplex.playback == []
+    assert any("turn engine lost" in line for line in said)
+
+
+def test_drain_errors_hands_each_frame_on():
+    class _Duplex:
+        async def errors(self):
+            yield {"type": "error", "error_type": "turn_engine_lost", "message": "gone"}
+
+    seen: list[dict] = []
+    asyncio.run(va.drain_errors(_Duplex(), lambda line: None, on_frame=seen.append))
+    assert seen[0]["error_type"] == "turn_engine_lost"
+
+
+# --- the classic run, end to end over fakes -------------------------------------------
+
+class _LiveRequest:
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.sent: list[str] = []
+
+    async def send(self, text: str, flush: bool = False) -> None:
+        self.sent.append(text)
+
+    async def done(self) -> None:
+        pass
+
+    async def cancel(self) -> None:
+        pass
+
+
+class _LiveDuplex:
+    def __init__(self, refuse: bool = False):
+        self.calls: list = []
+        self.refuse = refuse
+        self.requests: list[_LiveRequest] = []
+        self.ready = asyncio.Event()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def enable_turn_engine(self, engine: str = "tyger", timeout: float = 10.0) -> str:
+        self.calls.append(("enable_turn_engine", engine))
+        if self.refuse:
+            from voicemanager.client import TurnEngineError
+            raise TurnEngineError("not on this engine", error_type="turn_engine_unsupported")
+        return engine
+
+    async def turn_start(self) -> int:
+        self.calls.append(("turn_start",))
+        return 1
+
+    async def send_audio(self, pcm: bytes) -> None:
+        self.calls.append(("send_audio", len(pcm)))
+
+    def tts_request(self, voice=None, chunking=None, request_id=None):
+        req = _LiveRequest(f"r{len(self.requests) + 1}")
+        self.requests.append(req)
+        return req
+
+    async def transcripts(self):
+        await asyncio.Event().wait()
+        yield {}
+
+    async def audio(self):
+        await asyncio.Event().wait()
+        yield ()
+
+    async def turn_ends(self):
+        yield _turn_end("hello there")
+        await asyncio.Event().wait()
+
+    async def errors(self):
+        await asyncio.Event().wait()
+        yield {}
+
+    async def playback_start(self, request, mic_sample=None) -> None:
+        pass
+
+    async def playback_stop(self, request, mic_sample=None, *, reply_sample) -> None:
+        pass
+
+
+def _run_classic(monkeypatch, tmp_path, argv: list[str], duplex: _LiveDuplex):
+    import voicemanager.client as vmc
+
+    class FakeClient:
+        stt_engine, tts_engine, last_tts_sample_rate = "audiocpp", "vibevoice", 24000
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def duplex(self):
+            return duplex
+
+    async def fake_mic(dx, capture=None):
+        for i in range(2):
+            block = b"\x03\x00" * 1600
+            if capture is not None:
+                capture.add(block, types.SimpleNamespace(inputBufferAdcTime=20.0 + 0.1 * i))
+            await dx.send_audio(block)
+        await asyncio.Event().wait()
+
+    async def ready(*args, **kwargs):
+        return True
+
+    def fake_start(self, rate):
+        self.sample_rate = rate
+
+    monkeypatch.setenv("VOICEMANAGER_TOKEN", "vmp_test")
+    monkeypatch.setattr(vmc, "VoiceManagerClient", FakeClient)
+    monkeypatch.setattr(va, "warm_up_chat", ready)
+    monkeypatch.setattr(va.microturn_client, "_mic_task", fake_mic)
+    monkeypatch.setattr(va.microturn_client.AudioPlayer, "start", fake_start)
+    monkeypatch.setattr(va, "ChatStream", lambda *a, **k: FakeChat(["Hi."]))
+    wav = tmp_path / "call.wav"
+    args = va.build_parser().parse_args(
+        ["classic", "--log", str(tmp_path / "call.jsonl"), "--wav", str(wav),
+         "--duration", "0.3", *argv])
+    asyncio.run(va.classic(args))
+    return wav
+
+
+def test_classic_run_opts_in_before_the_mic_and_dispatches_on_turn_end(monkeypatch, tmp_path):
+    duplex = _LiveDuplex()
+    _run_classic(monkeypatch, tmp_path, ["--turn-engine", "tyger"], duplex)
+    names = [c[0] for c in duplex.calls]
+    assert names[0] == "enable_turn_engine" and duplex.calls[0][1] == "tyger"
+    assert names.index("enable_turn_engine") < names.index("send_audio")
+    assert len(duplex.requests) == 1 and duplex.requests[0].sent == ["Hi."]
+
+
+def test_classic_run_exits_when_the_server_refuses_the_turn_engine(monkeypatch, tmp_path):
+    duplex = _LiveDuplex(refuse=True)
+    with pytest.raises(SystemExit) as info:
+        _run_classic(monkeypatch, tmp_path, ["--turn-engine", "tyger"], duplex)
+    assert "turn_engine_unsupported" in str(info.value)
+    assert ("send_audio", 3200) not in duplex.calls
+
+
+def test_classic_run_without_the_flag_does_not_opt_in(monkeypatch, tmp_path):
+    duplex = _LiveDuplex()
+    wav = _run_classic(monkeypatch, tmp_path, [], duplex)
+    assert all(c[0] != "enable_turn_engine" for c in duplex.calls)
+    assert duplex.requests == []  # turn_end is not read without the opt-in
+    assert not pathlib.Path(va.microturn_client.capture_paths(wav)[2]).exists()
+
+
+def test_classic_capture_writes_the_mic_the_output_timeline_and_the_times(monkeypatch,
+                                                                         tmp_path):
+    import wave
+
+    duplex = _LiveDuplex()
+    wav = _run_classic(monkeypatch, tmp_path, ["--capture"], duplex)
+    mic_path, out_path, json_path = va.microturn_client.capture_paths(wav)
+    with wave.open(mic_path, "rb") as wf:
+        assert wf.getframerate() == 16000 and wf.getnframes() == 3200
+    assert pathlib.Path(out_path).exists()
+    meta = json.loads(pathlib.Path(json_path).read_text())
+    assert meta["mic"]["first_adc_time"] == 20.0 and meta["mic"]["samples"] == 3200
+    assert meta["log"]["t0_monotonic"] is not None

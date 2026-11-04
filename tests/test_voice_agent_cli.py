@@ -73,3 +73,12 @@ def test_microturn_module_run_directly_points_at_the_command():
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 2
     assert "voice_agent.py" in result.stderr
+
+
+def test_classic_turn_engine_and_capture_options():
+    args = va.build_parser().parse_args(["classic"])
+    assert args.turn_engine is None and args.capture is False
+    args = va.build_parser().parse_args(["classic", "--turn-engine", "tyger", "--capture"])
+    assert args.turn_engine == "tyger" and args.capture is True
+    with pytest.raises(SystemExit):
+        va.build_parser().parse_args(["classic", "--turn-engine", "maai"])

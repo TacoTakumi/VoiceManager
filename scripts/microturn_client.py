@@ -587,10 +587,17 @@ class AudioPlayer:
             chunk = bytes(self._buf[:n])
             del self._buf[:n]
             self.played += chunk
+            self._on_pulled(len(chunk))
         out = chunk + b"\x00" * (n - len(chunk))
         if self.timeline is not None:
             self.timeline += out
         return out
+
+    def _on_pulled(self, n: int) -> None:
+        """Called under the lock with how many queued bytes one pull took.
+
+        Does nothing here; a subclass uses it to follow which audio played when.
+        """
 
     def is_playing(self) -> bool:
         """True while queued audio remains."""
