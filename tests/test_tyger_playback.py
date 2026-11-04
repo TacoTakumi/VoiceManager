@@ -139,6 +139,10 @@ def test_an_unknown_request_id_is_invalid(client, event):
         speak(ws, "r1")
         ws.send_json(_start("nope") if event == "start" else _stop("nope"))
         _assert_one_invalid(barrier(ws))
+        # r1 played and stopped, so the mic is not held for it.
+        ws.send_json(_start())
+        ws.send_json(_stop())
+        assert errors(barrier(ws)) == []
         _assert_session_goes_on(ws)
 
 

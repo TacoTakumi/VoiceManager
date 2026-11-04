@@ -43,6 +43,10 @@ client's mic stream, built by ``HopFeed``:
 * A playback start places reply sample 0 at its ``mic_sample``. The played span ends
   at the stop's ``reply_sample`` (counted at the reply's own rate, so scaled by
   16000 / rate), or at the end of the PCM sent so far when there is no stop yet.
+* A reply's sending ends at its audio_end. The tap does not see an audio_end sent from
+  the TTS session's cancel path, so a client's tts_cancel ends it through
+  ``on_tts_cancel``, and a new reply's audio_start ends every earlier one (one TTS
+  request is in flight per connection).
 * The agent channel of a hop is the reply resampled to 16 kHz over the part of the
   played span inside the hop, and silence elsewhere. The resampling is scipy's
   ``resample_poly`` over a slice with a margin wider than its filter, which gives
@@ -54,8 +58,9 @@ A start frame reports an edge after the fact, so it can come in after the mic au
 it points into. While a reply the server sent has no start yet, each hop waits for
 ``START_LOOKAHEAD_SAMPLES`` more mic audio before it goes out, so a start that is
 late by up to that much still places its hop. The wait ends when the start comes,
-or ``START_WAIT_SAMPLES`` of mic audio after the reply's audio_start went out (a
-client that never reports playback costs only that window). A hop already sent stays
+or the start wait (VM_TYGER_START_WAIT_MS, ``START_WAIT_SAMPLES`` by default) of mic
+audio after the reply's audio_start went out (a client that never reports playback
+costs only that window). A hop already sent stays
 as it was: a start later than the lookahead leaves the earlier hops in listening
 mode, and a late stop leaves the hops already sent with the reply past the cut.
 
@@ -94,6 +99,56 @@ finished, and still plays at the client) gets the barge frame alone, so the clie
 clears its speaker: there is nothing left to cancel and no second audio_end. The
 client's playback stop for the reply is still taken after the cancel, as it carries
 how much really played.
+
+The mic hold
+------------
+
+While a reply plays at the client, the mic picks it up, and the STT would transcribe
+the agent's own voice. So for an opted-in session the handler sends mic audio to the
+STT through ``MicHold`` (the hop feed still gets every frame at once, unchanged, as
+the sidecar needs the user channel during playback to hear a barge). The hold reads
+each reply's playback state from the ``HopFeed``; positions are mic samples:
+
+* A reply holds the mic from its ``seen_at`` (the mic samples in when its audio_start
+  went out).
+* Its playback start frees the audio before its ``mic_sample``, which goes to the STT
+  in order. From the start on the reply is in play.
+* A stop ends the play at its ``mic_sample`` plus the hold tail (VM_TYGER_HOLD_TAIL_MS).
+  In-play audio up to there is dropped: no barge can come for a stopped reply.
+* A barge the session acts on (it picked a played reply) feeds the held audio from
+  ``max(onset_mic_sample, mic_sample - BARGE_LOOKBACK_SAMPLES)``: every reply whose
+  audio_start went out by the barge's mic_sample stops holding there (one with no
+  start yet holds nothing more), as the barge frame clears the client's speaker. A
+  reply whose audio_start goes out after it holds as usual. A barge the session
+  ignores changes nothing.
+* A reply with no start by the start wait (VM_TYGER_START_WAIT_MS, wall clock) after
+  its audio_end ends its hold: its held audio goes to the STT in order, as if it never
+  played, and a later start for it holds nothing. A reply that ended with no PCM
+  never plays and holds nothing.
+
+Several replies may be kept at once. Each holds as above, and the hold is their
+union: a sample is held while any reply still holds it (a reply with no start yet, or
+one in play with no stop), else dropped while any reply's played span covers it,
+else fed. The STT gets audio strictly in mic order: the oldest held sample blocks
+everything after it, so audio released late still goes before any later audio.
+
+Memory is bounded. In-play audio is kept for ``BARGE_LOOKBACK_SAMPLES`` plus
+``HOLD_MARGIN_SAMPLES`` (4 s and 1 s): older audio of a reply still in play is dropped,
+as no barge can reach it. Audio waiting for a start is kept for the start wait plus
+``HOLD_MARGIN_SAMPLES``; older audio is fed, as if that reply had not played. A reply
+that ended with no stop yet is in play for at most its length plus the start wait, so
+a client that never reports its stop costs only that.
+
+Every STT drive happens under the handler's STT lock. The handler routes each mic
+frame through ``take_stt_audio`` under it; when the hold may let audio go without a
+new frame (a playback frame, a barge, the start wait), the session calls the
+handler's ``release_held``, which takes the lock and feeds what ``take_stt_audio``
+gives. As each taker removes audio from the front of the hold under the lock, no
+release reorders with a live frame. A barge's release runs before the reader handles
+the next event, so a turn end that follows it flushes the user's words. A turn end
+feeds whatever the hold has let go and then flushes; audio still held stays held and
+reaches the STT after that turn_end. A held first frame is fed without its WAV
+header. When the connection ends, audio still held is dropped.
 
 The turn end
 ------------
@@ -148,6 +203,7 @@ CLOSE_TIMEOUT_S = 2.0
 SendText = Callable[[str], Awaitable[None]]
 EventHandler = Callable[[wire.Event], Awaitable[None]]
 EndTurn = Callable[[wire.EndpointEvent], Awaitable[None]]
+ReleaseHeld = Callable[[], Awaitable[None]]
 
 #: How much more mic audio a hop waits for while a sent reply has no playback start.
 START_LOOKAHEAD_SAMPLES = wire.HOP_SAMPLES
@@ -159,6 +215,10 @@ MAX_KEPT_REPLIES = 4
 MAX_REPLY_SECONDS = 120
 #: How many packed hops may wait for the sidecar link.
 MAX_QUEUED_HOPS = 32
+#: How far back from a barge's mic_sample the held audio is fed from, at most.
+BARGE_LOOKBACK_SAMPLES = 4 * wire.SAMPLE_RATE
+#: Held audio kept past the barge lookback and the start wait, for events that lag.
+HOLD_MARGIN_SAMPLES = wire.SAMPLE_RATE
 
 
 # --- the agent channel ----------------------------------------------------------
@@ -176,6 +236,9 @@ class _Reply:
     start: int | None = None          # the start frame's mic_sample
     stop_mic: int | None = None       # the stop frame's mic_sample
     cut16: int | None = None          # the stop frame's reply_sample, at 16 kHz
+    # The mic hold's own marks (see "The mic hold" in the module docstring).
+    start_wait_over: bool = False     # no start came by the start wait: never held again
+    barge_at: int | None = None       # a barge ended its hold here
 
     @property
     def length16(self) -> int:
@@ -272,8 +335,9 @@ class HopFeed:
     Plain state, no I/O: the session feeds it and sends what ``due_hops`` returns.
     """
 
-    def __init__(self, label: str = "") -> None:
+    def __init__(self, label: str = "", start_wait_samples: int = START_WAIT_SAMPLES) -> None:
         self._label = label
+        self._start_wait = start_wait_samples
         self._replies: collections.OrderedDict[str, _Reply] = collections.OrderedDict()
         self._mic = bytearray()       # mic PCM not yet in a hop
         self._mic_bytes = 0           # mic PCM bytes in, ever
@@ -287,6 +351,10 @@ class HopFeed:
 
     def reply(self, request_id: str) -> _Reply | None:
         return self._replies.get(request_id)
+
+    def replies(self) -> list[_Reply]:
+        """The kept replies, oldest first."""
+        return list(self._replies.values())
 
     def played_reply(self, mic_sample: int) -> _Reply | None:
         """The reply playing at ``mic_sample``: see "A barge" in the module docstring."""
@@ -306,27 +374,45 @@ class HopFeed:
 
     # --- the TTS side ---------------------------------------------------------------
 
-    def on_tts_text(self, request_id: str, text: str) -> None:
-        """A text frame a synthesis task sent: note audio_start and audio_end."""
+    def on_tts_text(self, request_id: str, text: str) -> list[_Reply]:
+        """A text frame a synthesis task sent: note audio_start and audio_end.
+
+        Returns the replies whose sending this frame ended. A connection has one TTS
+        request in flight at a time, so a new audio_start also ends every earlier
+        reply: one that was superseded got its audio_end from the cancel path, which
+        the tap does not see.
+        """
         if '"audio_start"' not in text and '"audio_end"' not in text:
-            return
+            return []
         try:
             frame = json.loads(text)
         except json.JSONDecodeError:
-            return
+            return []
         kind = frame.get("type")
         if kind == "audio_start":
             rate = frame.get("sample_rate")
             if request_id in self._replies or type(rate) is not int or rate <= 0:
-                return
+                return []
+            ended = [r for r in self._replies.values() if not r.done]
+            for reply in ended:
+                reply.done = True
             self._replies[request_id] = _Reply(request_id=request_id, rate=rate,
                                                seen_at=self.mic_samples)
             while len(self._replies) > MAX_KEPT_REPLIES:
                 self._replies.popitem(last=False)
-        elif kind == "audio_end":
-            reply = self._replies.get(request_id)
-            if reply is not None:
-                reply.done = True
+            return ended
+        if kind == "audio_end":
+            reply = self.end_reply(request_id)
+            return [reply] if reply is not None else []
+        return []
+
+    def end_reply(self, request_id: str) -> _Reply | None:
+        """The reply's audio_end went out; the reply, when this ended its sending."""
+        reply = self._replies.get(request_id)
+        if reply is None or reply.done:
+            return None
+        reply.done = True
+        return reply
 
     def on_tts_pcm(self, request_id: str, pcm: bytes) -> None:
         """PCM a synthesis task sent for request_id: keep a copy, up to the cap."""
@@ -376,8 +462,8 @@ class HopFeed:
 
     # --- the mic side ---------------------------------------------------------------
 
-    def feed_mic(self, data: bytes) -> None:
-        """One binary frame of the client's mic stream."""
+    def feed_mic(self, data: bytes) -> bytes:
+        """One binary frame of the client's mic stream; its PCM (past any WAV header)."""
         if self._mic_frames == 0:
             offset = _wav_payload_offset(data)
             if offset is not None:
@@ -385,6 +471,7 @@ class HopFeed:
         self._mic_frames += 1
         self._mic += data
         self._mic_bytes += len(data)
+        return data
 
     def due_hops(self) -> list[_HopJob]:
         """Cut every hop whose mic audio is in and that need not wait any longer."""
@@ -401,7 +488,7 @@ class HopFeed:
         for reply in self._replies.values():
             if reply.start is not None or (reply.done and reply.n_samples == 0):
                 continue
-            if self.mic_samples - reply.seen_at < START_WAIT_SAMPLES:
+            if self.mic_samples - reply.seen_at < self._start_wait:
                 return True
         return False
 
@@ -454,31 +541,148 @@ class HopFeed:
                       pcm=bytes(reply.pcm[2 * s:2 * e]), rate=reply.rate, first=first)
 
 
+# --- the mic hold -----------------------------------------------------------------
+
+_FEED, _DROP, _HOLD = "feed", "drop", "hold"
+
+
+@dataclass
+class _Held:
+    """A run of mic audio waiting in the hold."""
+    start: int            # the mic sample of its first sample
+    pcm: bytes
+    raw: bytes | None     # the frame as received, while the run is still a whole frame
+
+
+class MicHold:
+    """The mic audio between the client and the STT of one opted-in connection.
+
+    Plain state, no I/O, read from the ``HopFeed`` it is given: ``push`` takes each
+    mic frame in order, and ``take`` gives back, in order, the audio the STT may have
+    now. See "The mic hold" in the module docstring for what is fed, dropped or held.
+    """
+
+    def __init__(self, feed: HopFeed, *, tail_samples: int, start_wait_samples: int) -> None:
+        self._feed = feed
+        self._tail = tail_samples
+        self._start_wait = start_wait_samples
+        self._pending_keep = start_wait_samples + HOLD_MARGIN_SAMPLES
+        self._play_keep = BARGE_LOOKBACK_SAMPLES + HOLD_MARGIN_SAMPLES
+        self._runs: collections.deque[_Held] = collections.deque()
+
+    @property
+    def held_samples(self) -> int:
+        """Mic samples in the hold now."""
+        return sum(len(run.pcm) for run in self._runs) // 2
+
+    def push(self, start: int, raw: bytes, pcm: bytes) -> None:
+        """One mic frame: ``raw`` as received, ``pcm`` its samples from mic sample start."""
+        self._runs.append(_Held(start=start, pcm=pcm, raw=raw))
+
+    def take(self) -> list[bytes]:
+        """The audio the STT gets now, in order: whole frames where they were not cut."""
+        rules = self._rules(self._feed.mic_samples)
+        out = []
+        while self._runs:
+            run = self._runs[0]
+            kind, until = self._kind(run.start, rules)
+            if kind == _HOLD:
+                break
+            n = len(run.pcm) // 2
+            cut = n if until - run.start >= n else int(until - run.start)
+            if cut >= n:
+                self._runs.popleft()
+                if kind == _FEED:
+                    out.append(run.raw if run.raw is not None else run.pcm)
+                continue
+            head = run.pcm[:2 * cut]
+            self._runs[0] = _Held(start=run.start + cut, pcm=run.pcm[2 * cut:], raw=None)
+            if kind == _FEED:
+                out.append(head)
+        return out
+
+    def _rules(self, now: int) -> list[tuple[int, float, str]]:
+        """(from, to, kind) spans of the mic stream every kept reply holds or drops."""
+        rules: list[tuple[int, float, str]] = []
+        for reply in self._feed.replies():
+            if reply.start_wait_over:
+                continue
+            if reply.start is None:
+                if reply.barge_at is not None or (reply.done and reply.n_samples == 0):
+                    continue  # it never plays
+                rules.append((max(reply.seen_at, now - self._pending_keep), math.inf, _HOLD))
+                continue
+            start = reply.start
+            end = None if reply.stop_mic is None else reply.stop_mic + self._tail
+            if reply.barge_at is not None:
+                end = reply.barge_at if end is None else min(end, reply.barge_at)
+            if end is not None:
+                if end > start:
+                    rules.append((start, end, _DROP))
+                continue
+            # Still playing: a barge may yet come for the last BARGE_LOOKBACK of it.
+            # A reply that ended with no stop yet plays at most its length plus the
+            # start wait, so a client that never reports its stop costs only that.
+            open_end = (start + reply.length16 + self._start_wait) if reply.done else math.inf
+            keep_from = max(start, now - self._play_keep)
+            if keep_from > start:
+                rules.append((start, min(keep_from, open_end), _DROP))
+            if open_end > keep_from:
+                rules.append((keep_from, open_end, _HOLD))
+        return rules
+
+    @staticmethod
+    def _kind(at: int, rules: list[tuple[int, float, str]]) -> tuple[str, float]:
+        """What mic sample ``at`` is (hold over drop over feed), and up to where."""
+        kind, until = _FEED, math.inf
+        for lo, hi, what in rules:
+            if lo <= at < hi:
+                if what == _HOLD or (what == _DROP and kind == _FEED):
+                    kind = what
+                until = min(until, hi)
+            elif lo > at:
+                until = min(until, lo)
+        return kind, until
+
+
 class TurnEngineSession:
     """One connection's turn engine: opt-in checks, sidecar link and event reader."""
 
     def __init__(self, *, sidecar, stt_engine_type: str, label: str,
                  send_text: SendText, on_event: EventHandler | None = None,
-                 end_turn: EndTurn | None = None) -> None:
+                 end_turn: EndTurn | None = None, release_held: ReleaseHeld | None = None,
+                 hold_tail_ms: int = 150, start_wait_ms: int = 2000) -> None:
         """``sidecar`` is app.state.turn_engine_sidecar (None when the setting is off):
         anything with ``up`` and ``session_url(label)``. ``label`` names this
         connection's session on the sidecar (the connection's session id).
         ``send_text`` sends one text frame to the client. ``on_event`` gets each
         event the sidecar sends; without one, events are only logged. ``end_turn``
         acts on an endpoint event: it flushes the open STT utterance and then calls
-        ``send_turn_end``, both serialized with the handler's STT work."""
+        ``send_turn_end``, both serialized with the handler's STT work.
+        ``release_held`` feeds the STT what ``take_stt_audio`` gives, under the
+        handler's STT lock; it is called when the hold may have let audio go
+        without a new mic frame (a playback frame, a barge, the start wait). The
+        hold keeps ``hold_tail_ms`` past a stop and waits ``start_wait_ms`` after
+        a reply's audio_end for its playback start."""
         self._sidecar = sidecar
         self._stt_engine_type = stt_engine_type
         self._label = label
         self._send_text = send_text
         self._on_event = on_event
         self._end_turn = end_turn
+        self._release_held = release_held
+        self._start_wait_s = start_wait_ms / 1000.0
         self._finals: list[tuple[str, int]] = []  # (text, turn_id) since the last turn_end
         self.engine: str | None = None
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._closed = False
-        self._feed = HopFeed(label)
+        start_wait_samples = start_wait_ms * wire.SAMPLE_RATE // 1000
+        self._feed = HopFeed(label, start_wait_samples=start_wait_samples)
+        self._hold = MicHold(self._feed, tail_samples=hold_tail_ms * wire.SAMPLE_RATE // 1000,
+                             start_wait_samples=start_wait_samples)
+        self._timers: set[asyncio.TimerHandle] = set()
+        self._releases: set[asyncio.Task] = set()
         self._hop_queue: asyncio.Queue | None = None
         self._sender: asyncio.Task | None = None
         self._dropping = False        # hops are being dropped on a full queue
@@ -554,6 +758,7 @@ class TurnEngineSession:
         logger.debug("Playback: session=%s %s %s at mic_sample=%s", self._label,
                      frame.get("request_id"), frame.get("event"), frame.get("mic_sample"))
         self._queue_due_hops()
+        await self._release()  # a start frees audio before it; a stop, audio past its tail
 
     def attach_tts_session(self, session) -> None:
         """The TTS session this object taps; called when it is set as the audio tap."""
@@ -562,7 +767,62 @@ class TurnEngineSession:
     def on_tts_text(self, request_id: str, text: str) -> None:
         """The TTS session's audio tap: a text frame a reply sent."""
         if self.active:
-            self._feed.on_tts_text(request_id, text)
+            for reply in self._feed.on_tts_text(request_id, text):
+                self._reply_ended(reply)
+
+    def on_tts_cancel(self, request_id: str) -> None:
+        """The client cancelled request_id: its audio_end went out from the cancel path."""
+        if self.active:
+            reply = self._feed.end_reply(request_id)
+            if reply is not None:
+                self._reply_ended(reply)
+
+    def _reply_ended(self, reply: _Reply) -> None:
+        """No more of reply goes out: start its start wait, if it has no start yet."""
+        if reply.start is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if reply.n_samples == 0:
+            self._schedule_release()  # it never plays, so it holds nothing now
+            return
+        handle = None
+
+        def over() -> None:
+            self._timers.discard(handle)
+            self._start_wait_over(reply)
+
+        handle = loop.call_later(self._start_wait_s, over)
+        self._timers.add(handle)
+
+    def _start_wait_over(self, reply: _Reply) -> None:
+        if self._closed or reply.start is not None or reply.start_wait_over:
+            return
+        reply.start_wait_over = True
+        logger.info("No playback start for request_id=%s within the start wait; its held "
+                    "audio goes to the STT: session=%s", reply.request_id, self._label)
+        self._schedule_release()
+
+    def _schedule_release(self) -> None:
+        task = asyncio.get_running_loop().create_task(self._release())
+        self._releases.add(task)
+        task.add_done_callback(self._releases.discard)
+
+    async def _release(self) -> None:
+        """Have the handler feed the STT whatever the hold lets go now."""
+        if self._release_held is None or not self.active:
+            return
+        try:
+            await self._release_held()
+        except Exception:
+            logger.exception("Feeding held mic audio to the STT failed: session=%s",
+                             self._label)
+
+    def take_stt_audio(self) -> list[bytes]:
+        """The mic audio the STT gets now, in order. Call it under the STT lock."""
+        return self._hold.take()
 
     def on_tts_pcm(self, request_id: str, pcm: bytes) -> None:
         """The TTS session's audio tap: PCM a reply sent."""
@@ -570,8 +830,12 @@ class TurnEngineSession:
             self._feed.on_tts_pcm(request_id, pcm)
 
     def feed_mic(self, data: bytes) -> None:
-        """One binary frame of the client's mic stream. Never waits on the sidecar."""
-        self._feed.feed_mic(data)
+        """One binary frame of the client's mic stream. Never waits on the sidecar.
+
+        The hop feed gets it at once; the STT gets it through ``take_stt_audio``.
+        """
+        at = self._feed.mic_samples
+        self._hold.push(at, data, self._feed.feed_mic(data))
         self._queue_due_hops()
 
     def _queue_due_hops(self) -> None:
@@ -707,14 +971,22 @@ class TurnEngineSession:
                               mic_sample=event.mic_sample).model_dump_json()
         logger.info("Barge: session=%s request_id=%s onset_mic_sample=%s mic_sample=%s",
                     self._label, reply.request_id, event.onset_mic_sample, event.mic_sample)
+        # The user talks from the onset: no reply sent by now holds the mic from there.
+        # Marked before any await, so the next mic frame already sees it.
+        feed_from = max(event.onset_mic_sample, event.mic_sample - BARGE_LOOKBACK_SAMPLES)
+        for kept in self._feed.replies():
+            if kept.seen_at <= event.mic_sample and kept.barge_at is None:
+                kept.barge_at = feed_from
         tts = self._tts_session
         if reply.done or tts is None:
             # Its audio_end already went out: the frame alone clears the speaker.
             await self._send_text(notice)
-            return
-        # No more of it goes out; its audio_end goes on the real socket, unseen by the tap.
-        reply.done = True
-        await tts.cancel(reply.request_id, reason="interrupted", notice=notice)
+        else:
+            # No more of it goes out; its audio_end goes on the real socket, unseen by
+            # the tap.
+            reply.done = True
+            await tts.cancel(reply.request_id, reason="interrupted", notice=notice)
+        await self._release()
 
     # --- teardown -------------------------------------------------------------------
 
@@ -728,6 +1000,11 @@ class TurnEngineSession:
         if self._closed:
             return
         self._closed = True
+        for handle in self._timers:
+            handle.cancel()
+        self._timers.clear()
+        for task in self._releases:
+            task.cancel()
         reader, self._reader = self._reader, None
         sender, self._sender = self._sender, None
         self._hop_queue = None

@@ -568,51 +568,84 @@ async def websocket_endpoint(websocket: WebSocket):
     # flushes) holds stt_lock. An uncontended asyncio.Lock is taken without
     # suspending, so a connection that never opts in runs exactly as before.
     stt_lock = asyncio.Lock()
-    turn_end_tasks: set[asyncio.Task] = set()
+    # The STT work the turn engine starts beside the handler (a turn end, a release of
+    # held mic audio); the teardown waits for it.
+    engine_stt_tasks: set[asyncio.Task] = set()
+
+    async def _feed_audiocpp_stt(chunks) -> None:
+        """Run each chunk through the audio.cpp STT path, in order. Hold stt_lock."""
+        for chunk in chunks:
+            await _audiocpp_stt_frame(chunk)
+
+    async def _engine_stt_fault(exc: SidecarFault) -> None:
+        """A sidecar fault met by the turn engine's STT work: the handler's own surface."""
+        logger.warning("audio.cpp sidecar fault, closing session %s: %s", session_id, exc)
+        try:
+            await websocket.send_text(
+                ErrorMessage(
+                    error_type="stt_backend_fault",
+                    message="Speech backend faulted; this session was closed.",
+                ).model_dump_json()
+            )
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
     async def _end_turn_locked(event) -> None:
         """FLUSH the open utterance, if there is one, then send the turn_end.
 
         Both under stt_lock, so the flushed final goes out before the turn_end and is
-        in its text, and no other final can come between them. The speculative
+        in its text, and no other final can come between them. Mic audio the hold has
+        already let go is fed first; audio it still holds (a reply plays, or its start
+        is not in) stays held and reaches the STT after this turn end. The speculative
         endpoint-hold is nemotron-only (hold_machine is None on audiocpp, the one engine
         a turn engine runs on), so a turn end never meets a held final.
         """
         nonlocal audiocpp_last_audio
         try:
             async with stt_lock:
+                await _feed_audiocpp_stt(turn_engine.take_stt_audio())
                 if audiocpp_last_audio is not None:
                     await _finalize_audiocpp_utterance(pipeline, _emit, session_id=session_id)
                     audiocpp_last_audio = None
                 await turn_engine.send_turn_end(event)
         except SidecarFault as exc:
-            # The same defined surface as a fault met by the handler itself.
-            logger.warning("audio.cpp sidecar fault, closing session %s: %s", session_id, exc)
-            try:
-                await websocket.send_text(
-                    ErrorMessage(
-                        error_type="stt_backend_fault",
-                        message="Speech backend faulted; this session was closed.",
-                    ).model_dump_json()
-                )
-                await websocket.close(code=1011)
-            except Exception:
-                pass
+            await _engine_stt_fault(exc)
         except Exception as exc:
             logger.warning("Turn end failed for session %s: %s", session_id, exc)
             logger.debug("Turn end failure detail", exc_info=True)
 
-    async def _end_turn(event) -> None:
-        """The turn engine's end_turn callback: run the turn end as its own task.
+    async def _release_held_locked() -> None:
+        """Feed the STT the mic audio the hold lets go now, under stt_lock, in order."""
+        try:
+            async with stt_lock:
+                await _feed_audiocpp_stt(turn_engine.take_stt_audio())
+        except SidecarFault as exc:
+            await _engine_stt_fault(exc)
+        except Exception as exc:
+            logger.warning("Feeding held mic audio failed for session %s: %s",
+                           session_id, exc)
+            logger.debug("Held mic audio failure detail", exc_info=True)
 
-        Shielded, so a reader cancelled at teardown does not abandon a flush halfway
-        (its worker thread would still be talking to the pipeline): the task runs to
-        its end and the teardown below waits for it.
+    async def _shielded(coro) -> None:
+        """Run the turn engine's STT work as its own task, shielded.
+
+        A reader cancelled at teardown must not abandon a flush or a feed halfway (its
+        worker thread would still be talking to the pipeline): the task runs to its end
+        and the teardown below waits for it.
         """
-        task = asyncio.create_task(_end_turn_locked(event))
-        turn_end_tasks.add(task)
-        task.add_done_callback(turn_end_tasks.discard)
+        task = asyncio.create_task(coro)
+        engine_stt_tasks.add(task)
+        task.add_done_callback(engine_stt_tasks.discard)
         await asyncio.shield(task)
+
+    async def _end_turn(event) -> None:
+        """The turn engine's end_turn callback."""
+        await _shielded(_end_turn_locked(event))
+
+    async def _release_held() -> None:
+        """The turn engine's release_held callback."""
+        await _shielded(_release_held_locked())
 
     # The connection's turn engine. It does nothing (no I/O, no task) until a
     # turn_engine frame opts in, so a connection that never opts in runs exactly the
@@ -623,6 +656,9 @@ async def websocket_endpoint(websocket: WebSocket):
         label=session_id,
         send_text=websocket.send_text,
         end_turn=_end_turn,
+        release_held=_release_held,
+        hold_tail_ms=settings.tyger_hold_tail_ms,
+        start_wait_ms=settings.tyger_start_wait_ms,
     )
 
     # Track last streaming STT text update for silence-triggered finalization (qwen)
@@ -655,6 +691,66 @@ async def websocket_endpoint(websocket: WebSocket):
         if msg.is_final:
             # An opted-in session's turn_end joins the finals sent since the last one.
             turn_engine.note_final(msg.text, msg.turn_id)
+
+    async def _audiocpp_stt_frame(data: bytes) -> None:
+        """One chunk of mic audio through the audio.cpp STT path. Hold stt_lock.
+
+        The silero endpointer, the idle gate and its onset pre-roll, the pipeline feed,
+        and the finals it volunteers or the acoustic endpoint flushes. The handler runs
+        each received frame through here; an opted-in session's held audio comes
+        through here too when the hold lets it go.
+        """
+        nonlocal audiocpp_last_audio
+        was_speaking = audiocpp_endpointer.speech_active
+        acoustic_endpoint = await asyncio.to_thread(audiocpp_endpointer.feed, data)
+        # In-utterance = inside silero's start..end span before or after this
+        # frame, or carrying the end event itself (its tail belongs to the
+        # utterance). Everything else is inter-utterance audio.
+        in_utterance = (was_speaking or audiocpp_endpointer.speech_active
+                        or acoustic_endpoint)
+        if audiocpp_idle_gate and not in_utterance:
+            # Inter-utterance silence is NOT billed to the
+            # decoder -- not fed, and (fed nothing) it cannot arm the frame-gap
+            # trigger either, so no empty inter-utterance flush ever consumes a
+            # segment index. Keep the tail in the rolling onset pre-roll.
+            audiocpp_preroll.extend(data)
+            if len(audiocpp_preroll) > audiocpp_preroll_max:
+                del audiocpp_preroll[:len(audiocpp_preroll) - audiocpp_preroll_max]
+            return
+        if audiocpp_idle_gate and not was_speaking and audiocpp_preroll:
+            # Speech onset: replay the gated tail ahead of this frame so the
+            # attack silero took a chunk to confirm is not clipped.
+            await pipeline.feed(bytes(audiocpp_preroll))
+            audiocpp_preroll.clear()
+        # Feed the chunk off-loop and mark the utterance un-flushed.
+        has_update = await pipeline.feed(data)
+        audiocpp_last_audio = time.monotonic()
+        # Interim deltas the model volunteers mid-AUDIO (generic forwarding)
+        # surface live here; the shipping Nemotron-3.5 streams its growing
+        # partials through this branch while the speaker talks.
+        if has_update:
+            text, language, seg_idx = pipeline.get_current_text()
+            if text.strip():
+                await _emit(TranscriptionMessage(
+                    text=text, is_final=False, segment_index=seg_idx, language=language))
+        # A volunteered mid-stream FINAL commits immediately and ends
+        # the utterance, exactly like nemotron's legacy path.
+        committed = False
+        while (final := pipeline.take_final()) is not None:
+            committed = True
+            f_text, f_lang, f_seg = final
+            if f_text.strip():
+                await _emit(TranscriptionMessage(
+                    text=f_text, is_final=True, segment_index=f_seg, language=f_lang))
+            pipeline.reset()
+            audiocpp_last_audio = None  # committed; nothing pending until next audio
+        # Acoustic FLUSH: same finalize + emit + reset as the frame-gap
+        # path, fired inline because frames are still arriving (the receive
+        # timeout that hosts the gap trigger never elapses for this client).
+        # Skipped when a volunteered FINAL just committed this utterance.
+        if acoustic_endpoint and not committed:
+            await _finalize_audiocpp_utterance(pipeline, _emit, session_id=session_id)
+            audiocpp_last_audio = None
 
     try:
         loop = asyncio.get_event_loop()
@@ -889,57 +985,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     # off-loop rule binds only this engine, and the blast radius stays additive.)
                     # Under stt_lock: a turn end from the turn engine flushes this
                     # pipeline from its reader task, and the two must not interleave.
+                    # An opted-in session's frame goes through the mic hold, which
+                    # gives back, in order, whatever the STT gets now (this frame as
+                    # it is when nothing is held); any other session's frame goes
+                    # straight on.
                     async with stt_lock:
-                        was_speaking = audiocpp_endpointer.speech_active
-                        acoustic_endpoint = await asyncio.to_thread(audiocpp_endpointer.feed, data)
-                        # In-utterance = inside silero's start..end span before or after this
-                        # frame, or carrying the end event itself (its tail belongs to the
-                        # utterance). Everything else is inter-utterance audio.
-                        in_utterance = (was_speaking or audiocpp_endpointer.speech_active
-                                        or acoustic_endpoint)
-                        if audiocpp_idle_gate and not in_utterance:
-                            # Inter-utterance silence is NOT billed to the
-                            # decoder -- not fed, and (fed nothing) it cannot arm the frame-gap
-                            # trigger either, so no empty inter-utterance flush ever consumes a
-                            # segment index. Keep the tail in the rolling onset pre-roll.
-                            audiocpp_preroll.extend(data)
-                            if len(audiocpp_preroll) > audiocpp_preroll_max:
-                                del audiocpp_preroll[:len(audiocpp_preroll) - audiocpp_preroll_max]
-                            continue
-                        if audiocpp_idle_gate and not was_speaking and audiocpp_preroll:
-                            # Speech onset: replay the gated tail ahead of this frame so the
-                            # attack silero took a chunk to confirm is not clipped.
-                            await pipeline.feed(bytes(audiocpp_preroll))
-                            audiocpp_preroll.clear()
-                        # Feed the chunk off-loop and mark the utterance un-flushed.
-                        has_update = await pipeline.feed(data)
-                        audiocpp_last_audio = time.monotonic()
-                        # Interim deltas the model volunteers mid-AUDIO (generic forwarding)
-                        # surface live here; the shipping Nemotron-3.5 streams its growing
-                        # partials through this branch while the speaker talks.
-                        if has_update:
-                            text, language, seg_idx = pipeline.get_current_text()
-                            if text.strip():
-                                await _emit(TranscriptionMessage(
-                                    text=text, is_final=False, segment_index=seg_idx, language=language))
-                        # A volunteered mid-stream FINAL commits immediately and ends
-                        # the utterance, exactly like nemotron's legacy path.
-                        committed = False
-                        while (final := pipeline.take_final()) is not None:
-                            committed = True
-                            f_text, f_lang, f_seg = final
-                            if f_text.strip():
-                                await _emit(TranscriptionMessage(
-                                    text=f_text, is_final=True, segment_index=f_seg, language=f_lang))
-                            pipeline.reset()
-                            audiocpp_last_audio = None  # committed; nothing pending until next audio
-                        # Acoustic FLUSH: same finalize + emit + reset as the frame-gap
-                        # path, fired inline because frames are still arriving (the receive
-                        # timeout that hosts the gap trigger never elapses for this client).
-                        # Skipped when a volunteered FINAL just committed this utterance.
-                        if acoustic_endpoint and not committed:
-                            await _finalize_audiocpp_utterance(pipeline, _emit, session_id=session_id)
-                            audiocpp_last_audio = None
+                        if turn_engine.active:
+                            await _feed_audiocpp_stt(turn_engine.take_stt_audio())
+                        else:
+                            await _audiocpp_stt_frame(data)
                 elif stt_engine_type == "qwen":
                     # Streaming path: qwen interim result protocol
                     has_update = await pipeline.feed(data)
@@ -1064,6 +1118,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     # A thin delegation. The cancellation logic lives on the
                     # session so the STT path can reach it too.
                     await tts_session.cancel(cancel_req.request_id)
+                    # Its audio_end went out from the cancel path, which the turn
+                    # engine's audio tap does not see. No-op without an opt-in.
+                    turn_engine.on_tts_cancel(cancel_req.request_id)
 
                 elif msg_type == "turn_start":
                     # A thin delegation to the server-owned turn counter.
@@ -1181,11 +1238,12 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
         except Exception:
             logger.exception("Turn engine teardown failed for session %s", session_id)
-        # A turn end already under way finishes first (it holds the STT lock and may
-        # be mid-flush); it never raises.
-        if turn_end_tasks:
+        # A turn end or a feed of held audio already under way finishes first (it
+        # holds the STT lock and may be mid-flush); it never raises. Mic audio the
+        # hold still keeps is dropped with the connection.
+        if engine_stt_tasks:
             try:
-                await asyncio.gather(*turn_end_tasks, return_exceptions=True)
+                await asyncio.gather(*engine_stt_tasks, return_exceptions=True)
             except asyncio.CancelledError:
                 pass
         # Stop whatever TTS is in flight before general cleanup
