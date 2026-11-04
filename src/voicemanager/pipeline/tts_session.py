@@ -36,6 +36,14 @@ HermesConsole carries a `@Synchronized` monitor built solely to work around it. 
 live in `_dead_ids`, a fixed-capacity ring: a long-lived socket cancels indefinitely, so
 the store must not grow without bound, and the recent window is the only one where a stale
 token can still be in flight.
+
+A session may also carry an ``audio_tap``: an object that sees every frame a synthesis
+task actually sent, with its request_id, right after the send. The turn engine uses it
+to keep the PCM it must rebuild the client's playback from. The tap has two methods,
+``on_tts_text(request_id, text)`` and ``on_tts_pcm(request_id, pcm)``; both are plain
+calls that must not block. Frames a cancelled request drops never reach it. Without a
+tap (the default) the guarded socket does one attribute check per frame and nothing
+else, and a failing tap is logged and never stops the reply.
 """
 import asyncio
 import collections
@@ -63,16 +71,22 @@ class _GuardedSocket:
     the frames are dropped at the door rather than raced against.
     """
 
-    def __init__(self, websocket, request_id: str, is_cancelled):
+    def __init__(self, websocket, request_id: str, is_cancelled, tap=None):
         self._websocket = websocket
         self._request_id = request_id
         self._is_cancelled = is_cancelled  # callable: (request_id) -> bool
+        # callable: () -> the session's audio tap or None. Read per frame, so a tap
+        # set after this request began still sees the rest of it.
+        self._tap = tap
 
     async def send_text(self, data: str) -> None:
         if self._is_cancelled(self._request_id):
             logger.debug("Dropped text frame from cancelled request_id=%s", self._request_id)
             return
         await self._websocket.send_text(data)
+        tap = self._tap() if self._tap is not None else None
+        if tap is not None:
+            _call_tap(tap.on_tts_text, self._request_id, data)
 
     async def send_bytes(self, data: bytes) -> None:
         if self._is_cancelled(self._request_id):
@@ -80,6 +94,17 @@ class _GuardedSocket:
                          len(data), self._request_id)
             return
         await self._websocket.send_bytes(data)
+        tap = self._tap() if self._tap is not None else None
+        if tap is not None:
+            _call_tap(tap.on_tts_pcm, self._request_id, data)
+
+
+def _call_tap(method, request_id: str, data) -> None:
+    """Hand one sent frame to the audio tap. A failing tap never stops the reply."""
+    try:
+        method(request_id, data)
+    except Exception:
+        logger.exception("TTS audio tap failed for request_id=%s", request_id)
 
 
 class TTSSession:
@@ -106,6 +131,9 @@ class TTSSession:
         # second audio_end. Same bounded ring shape as _dead_ids, and for the same reason -
         # a long-lived socket completes indefinitely, so it must not grow without bound.
         self._completed_ids: collections.deque[str] = collections.deque(maxlen=DEAD_ID_CAPACITY)
+        # Sees every frame a synthesis task sent (see the module docstring). None
+        # unless the connection opted in to a turn engine.
+        self.audio_tap = None
 
     # --- introspection --------------------------------------------------
 
@@ -187,7 +215,11 @@ class TTSSession:
 
     def _socket_for(self, request_id: str) -> _GuardedSocket:
         """The socket this request's synthesis task speaks through - silenced if cancelled."""
-        return _GuardedSocket(self._websocket, request_id, self._is_cancelled)
+        return _GuardedSocket(self._websocket, request_id, self._is_cancelled,
+                              tap=self._current_tap)
+
+    def _current_tap(self):
+        return self.audio_tap
 
     # --- dispatch -------------------------------------------------------
 

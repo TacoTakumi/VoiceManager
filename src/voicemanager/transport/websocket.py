@@ -786,6 +786,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     first_frame_validated = True
                     logger.debug("First audio frame validated for session %s (%d bytes)", session_id, len(data))
 
+                # An opted-in session copies every mic frame to its turn engine, ahead
+                # of the STT routing (whose idle gate may skip the frame). This only
+                # buffers and queues hops; it never waits on the sidecar.
+                if turn_engine.active:
+                    turn_engine.feed_mic(data)
+
                 # Snapshot the open turn as this audio's turn BEFORE transcribing
                 # it, so frames it produces are tagged with the turn open at receive time
                 # (not the turn that may open while its inference is still in flight).
@@ -1012,6 +1018,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     # answer frame all live on the connection's turn-engine session.
                     await turn_engine.handle_opt_in(
                         parsed, audio_started=first_frame_validated)
+                    # From now on the turn engine sees the PCM each reply sends, so it
+                    # can rebuild the client's playback from the playback frames.
+                    if turn_engine.active and tts_session is not None:
+                        tts_session.audio_tap = turn_engine
+
+                elif msg_type == "playback" and turn_engine.active:
+                    # Only an opted-in session handles playback frames; on any other
+                    # connection the frame is dropped unanswered, as it always was.
+                    await turn_engine.handle_playback(parsed)
 
     except WebSocketDisconnect:
         logger.info("Client disconnected: session_id=%s", session_id)
