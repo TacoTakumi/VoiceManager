@@ -94,6 +94,25 @@ finished, and still plays at the client) gets the barge frame alone, so the clie
 clears its speaker: there is nothing left to cancel and no second audio_end. The
 client's playback stop for the reply is still taken after the cancel, as it carries
 how much really played.
+
+The turn end
+------------
+
+An endpoint event (``wire.EndpointEvent``, by the model's endpoint head or by its
+silence fallback) ends the user's turn. The session collects the text of every final
+the connection sends (``note_final``, called by the handler's transcription sink once
+the frame is out), and ``send_turn_end`` sends {"type": "turn_end", "turn_id", "text",
+"mic_sample", "by"}: text is those finals since the previous turn_end, each stripped,
+empty ones skipped, joined with one space, and turn_id is the turn the last of them
+carries. With no final text since the previous turn_end, no frame goes out.
+
+The event comes in on the reader task, concurrent with the handler. The handler owns
+the STT pipeline, so it passes ``end_turn``: a callback that FLUSHes the open
+utterance under the same lock the handler drives the pipeline with, and then calls
+``send_turn_end`` under that lock too, so the flushed final goes out first and is in
+the turn_end's text, and no other final can slip in between. Without ``end_turn`` the
+session calls ``send_turn_end`` directly. Silero still ends utterances and their finals
+still go out at once; for an opted-in session only turn_end ends the turn.
 """
 import asyncio
 import collections
@@ -112,7 +131,8 @@ from websockets.protocol import State
 
 from voicemanager.pipeline.tyger import wire
 from voicemanager.protocol import (
-    BargeMessage, ErrorMessage, PlaybackMessage, TurnEngineMessage, TurnEngineReadyMessage,
+    BargeMessage, ErrorMessage, PlaybackMessage, TurnEndMessage, TurnEngineMessage,
+    TurnEngineReadyMessage,
     INVALID_REQUEST, TURN_ENGINES, TURN_ENGINE_UNAVAILABLE, TURN_ENGINE_UNSUPPORTED,
 )
 
@@ -127,6 +147,7 @@ CLOSE_TIMEOUT_S = 2.0
 
 SendText = Callable[[str], Awaitable[None]]
 EventHandler = Callable[[wire.Event], Awaitable[None]]
+EndTurn = Callable[[wire.EndpointEvent], Awaitable[None]]
 
 #: How much more mic audio a hop waits for while a sent reply has no playback start.
 START_LOOKAHEAD_SAMPLES = wire.HOP_SAMPLES
@@ -437,17 +458,22 @@ class TurnEngineSession:
     """One connection's turn engine: opt-in checks, sidecar link and event reader."""
 
     def __init__(self, *, sidecar, stt_engine_type: str, label: str,
-                 send_text: SendText, on_event: EventHandler | None = None) -> None:
+                 send_text: SendText, on_event: EventHandler | None = None,
+                 end_turn: EndTurn | None = None) -> None:
         """``sidecar`` is app.state.turn_engine_sidecar (None when the setting is off):
         anything with ``up`` and ``session_url(label)``. ``label`` names this
         connection's session on the sidecar (the connection's session id).
         ``send_text`` sends one text frame to the client. ``on_event`` gets each
-        event the sidecar sends; without one, events are only logged."""
+        event the sidecar sends; without one, events are only logged. ``end_turn``
+        acts on an endpoint event: it flushes the open STT utterance and then calls
+        ``send_turn_end``, both serialized with the handler's STT work."""
         self._sidecar = sidecar
         self._stt_engine_type = stt_engine_type
         self._label = label
         self._send_text = send_text
         self._on_event = on_event
+        self._end_turn = end_turn
+        self._finals: list[tuple[str, int]] = []  # (text, turn_id) since the last turn_end
         self.engine: str | None = None
         self._ws = None
         self._reader: asyncio.Task | None = None
@@ -586,6 +612,38 @@ class TurnEngineSession:
         await self._send_text(
             ErrorMessage(error_type=error_type, message=message).model_dump_json())
 
+    # --- the turn end ---------------------------------------------------------------
+
+    def note_final(self, text: str, turn_id: int) -> None:
+        """A final transcription the connection sent, with its turn_id."""
+        text = text.strip()
+        if self.active and text:
+            self._finals.append((text, turn_id))
+
+    async def send_turn_end(self, event: wire.EndpointEvent) -> bool:
+        """Send the turn_end for every final since the previous one; False when none."""
+        finals, self._finals = self._finals, []
+        if not finals:
+            logger.debug("Turn end with no final text, nothing sent: session=%s by=%s "
+                         "mic_sample=%s", self._label, event.by, event.mic_sample)
+            return False
+        msg = TurnEndMessage(turn_id=finals[-1][1], text=" ".join(t for t, _ in finals),
+                             mic_sample=event.mic_sample, by=event.by)
+        logger.info("Turn end: session=%s turn_id=%s by=%s mic_sample=%s finals=%d",
+                    self._label, msg.turn_id, msg.by, msg.mic_sample, len(finals))
+        await self._send_text(msg.model_dump_json())
+        return True
+
+    async def _handle_endpoint(self, event: wire.EndpointEvent) -> None:
+        """End the turn. A failure is logged and the reader goes on."""
+        try:
+            if self._end_turn is not None:
+                await self._end_turn(event)
+            else:
+                await self.send_turn_end(event)
+        except Exception:
+            logger.exception("Handling a turn end failed: session=%s", self._label)
+
     # --- the sidecar link -----------------------------------------------------------
 
     async def _connect(self) -> bool:
@@ -632,6 +690,8 @@ class TurnEngineSession:
         logger.debug("Turn engine event: session=%s %s", self._label, event)
         if isinstance(event, wire.BargeEvent):
             await self._on_barge(event)
+        elif isinstance(event, wire.EndpointEvent):
+            await self._handle_endpoint(event)
         if self._on_event is not None:
             await self._on_event(event)
 
