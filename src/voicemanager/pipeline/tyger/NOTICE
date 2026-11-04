@@ -1,0 +1,21 @@
+VoiceManager - Tyger turn rules
+
+rules.py in this directory is adapted from tyger-s2s by NineNineSix
+(https://github.com/nineninesix-ai/tyger-s2s), commit 97d011d, which is
+licensed under the Apache License, Version 2.0. A copy of that licence is in
+the LICENSE file next to this notice.
+
+Files adapted from tyger-s2s at that commit:
+
+  app/plugins/ears/tyger/rules.py       the turn rules (endpoint, barge, onset)
+  app/plugins/ears/tyger/session.py     the per-session state and thresholds
+  app/plugins/ears/tyger/constants.py   the frame grid and the rule constants
+
+These files were modified for VoiceManager. The rules were rewritten as one
+standard-library-only class per session that takes its thresholds from a
+settings object and is fed per-frame scores, energy and mode instead of audio
+and model outputs. Changes include: a silence fallback that ends a spoken turn
+when the endpoint head has not; events carry mic-stream sample positions in
+VoiceManager's wire format instead of seconds; a barge latches until the mode
+returns to listening; the backchannel, partial-transcript, frame-display and
+turn-audio bookkeeping were removed.
