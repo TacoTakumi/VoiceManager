@@ -4,6 +4,13 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1]
+
+### Changed
+
+- The README's Tyger section and the client guide's Turn engine overview point to
+  `scripts/voice_agent.py classic --turn-engine tyger` as an example client.
+
 ## [0.5.0]
 
 ### Added
