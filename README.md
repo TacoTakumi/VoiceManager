@@ -206,7 +206,7 @@ The GPU is the one `VM_DEVICE` resolves to. The model needs about 2.2 GB of VRAM
 
 ### Tyger
 
-Tyger (https://huggingface.co/nineninesix/tyger) is a turn-taking model by NineNineSix. It hears the user's mic and the agent's reply as it plays at the client, and decides when the user's turn ended and when the user cut in over the reply. With it on, a client that opts in gets `turn_end` and `barge` frames, and the server ends a barged reply itself and keeps the reply's echo out of the STT. A client that does not opt in sees no change. The frames are in [Turn engine](docs/client-integration.md#turn-engine). It works only with the audiocpp STT engine (`VM_STT_ENGINE=audiocpp`); on another STT engine every opt-in is refused with `turn_engine_unsupported`.
+Tyger (https://huggingface.co/nineninesix/tyger) is a turn-taking model by NineNineSix. It hears the user's mic and the agent's reply as it plays at the client, and decides when the user's turn ended and when the user cut in over the reply. With it on, a client that opts in gets `turn_end` and `barge` frames, and the server ends a barged reply itself and keeps the reply's echo out of the STT. A client that does not opt in sees no change. The frames are in [Turn engine](docs/client-integration.md#turn-engine), and `scripts/voice_agent.py classic --turn-engine tyger` is a client that uses them. It works only with the audiocpp STT engine (`VM_STT_ENGINE=audiocpp`); on another STT engine every opt-in is refused with `turn_engine_unsupported`.
 
 Tyger pins its own PyTorch and transformers 5.x, so it runs as one separate process from its own virtual environment, which VoiceManager starts and stops with the server. All sessions share that one process.
 

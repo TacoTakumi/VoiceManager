@@ -933,6 +933,8 @@ client -> clears its playback, then { "type": "playback", "event": "stop", ... }
                                  server -> { "type": "turn_end", ... }
 ```
 
+For a complete client, see `scripts/voice_agent.py classic --turn-engine tyger`. It opts in, sends the `playback` frames, ends a turn on `turn_end` and clears its playback on a `barge`.
+
 ### Opting in
 
 Send one `turn_engine` frame after the `ready` handshake and **before the first audio frame** of the connection. The server answers with `turn_engine_ready`, or with one `error` frame. No answer closes the socket. The server checks the opt-in in this order and the first check that fails gives the answer:
