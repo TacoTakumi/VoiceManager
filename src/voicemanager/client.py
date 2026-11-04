@@ -32,6 +32,16 @@ logger = logging.getLogger("voicemanager.client")
 # The tts_stream chunking modes the server accepts.
 CHUNKING_MODES = ("sentence", "clause")
 
+# The error_types the server answers a turn_engine opt-in with when it refuses it:
+# a bad or late opt-in, the turn engine off on the server, or an STT engine the turn
+# engine does not support. This module stands alone, so these mirror the server's
+# protocol constants rather than import them.
+_TURN_ENGINE_REFUSALS = ("invalid_request", "turn_engine_unavailable",
+                         "turn_engine_unsupported")
+# The error_type the server sends once when the turn engine's process exits; the
+# session then goes on as one that never opted in.
+_TURN_ENGINE_LOST = "turn_engine_lost"
+
 
 def _check_chunking(chunking: str | None) -> None:
     """Refuse an unknown chunking mode before a request opens.
@@ -67,6 +77,27 @@ class STTError(VoiceManagerError):
 
 class TTSError(VoiceManagerError):
     """Raised when an error occurs during TTS synthesis."""
+
+
+class TurnEngineError(VoiceManagerError):
+    """Raised when a turn_engine opt-in fails.
+
+    ``error_type`` is the server's error_type when it refused the opt-in (for
+    example ``turn_engine_unavailable``), and None when no answer came (a timeout or
+    a lost connection).
+    """
+
+    def __init__(self, message: str, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
+
+def _check_sample(name: str, value) -> None:
+    """Refuse a sample index the server would reject as a malformed playback frame."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +181,15 @@ class DuplexSession:
     ``("audio_end", frame)`` in arrival order. The pcm of a cancelled request is
     dropped until its audio_end, which is still yielded. Each iterator ends when
     the connection closes.
+
+    Turn engine: ``await session.enable_turn_engine("tyger")`` before the first
+    ``send_audio`` opts the connection in. The session then reports each reply's
+    playback edges with ``playback_start`` and ``playback_stop``, reads the turn_end
+    frames from ``turn_ends()``, and sees ``("barge", frame)`` in ``audio()`` when
+    the user cut in over a reply; that request's audio_end (reason ``interrupted``)
+    follows. A turn_engine_lost error frame on ``errors()`` means the opt-in is
+    gone and the session goes on as one that never opted in. A reconnect starts a
+    new connection that has not opted in, with ``mic_sample`` back at 0.
     """
 
     def __init__(self, client: "VoiceManagerClient") -> None:
@@ -171,6 +211,91 @@ class DuplexSession:
     async def send_audio(self, pcm: bytes) -> None:
         """Send one binary frame of 16 kHz mono 16-bit PCM to STT."""
         await self._client._send_or_raise(pcm, STTError)
+        self._client._mic_bytes += len(pcm)
+
+    @property
+    def mic_sample(self) -> int:
+        """Samples of mic audio sent on this connection since its first audio frame.
+
+        Read it when a playback edge reaches the speaker to get that edge's
+        ``mic_sample``, the index on this outgoing 16 kHz mic stream.
+        """
+        return self._client._mic_bytes // 2
+
+    @property
+    def turn_engine(self) -> str | None:
+        """The turn engine this connection opted in to, or None."""
+        return self._client.turn_engine
+
+    async def enable_turn_engine(self, engine: str = "tyger", timeout: float = 10.0) -> str:
+        """Opt this connection in to a turn engine and return the engine the server named.
+
+        Sends the turn_engine frame and waits for turn_engine_ready. It must come
+        before the first audio frame, and a connection opts in once.
+
+        Raises:
+            VoiceManagerError: The session is closed, audio was already sent, or an
+                opt-in was already sent on this connection; nothing is sent.
+            TurnEngineError: The server refused the opt-in (``error_type`` holds its
+                error_type), or no answer came within ``timeout`` or before the
+                connection closed (``error_type`` is None).
+        """
+        client = self._client
+        if self.closed:
+            raise VoiceManagerError("the duplex session is closed")
+        if client._mic_bytes:
+            raise VoiceManagerError(
+                "enable_turn_engine must come before the first audio frame")
+        if client._turn_engine_sent is not None:
+            raise VoiceManagerError(
+                "a turn_engine opt-in was already sent on this connection")
+        waiter = asyncio.get_running_loop().create_future()
+        client._turn_engine_waiter = waiter
+        client._turn_engine_sent = engine
+        try:
+            await client._send_or_raise(
+                json.dumps({"type": "turn_engine", "engine": engine}), TurnEngineError)
+            try:
+                async with asyncio.timeout(timeout):
+                    return await waiter
+            except TimeoutError:
+                raise TurnEngineError("Timed out waiting for turn_engine_ready") from None
+        finally:
+            if client._turn_engine_waiter is waiter:
+                client._turn_engine_waiter = None
+
+    async def playback_start(self, request, mic_sample: int | None = None) -> None:
+        """Report that a reply's playback started at the speaker.
+
+        ``request`` is a TTSRequest or its request_id. ``mic_sample`` is where on
+        the outgoing mic stream the first sample reached the speaker; it defaults
+        to ``self.mic_sample`` now.
+        """
+        await self._playback(request, "start", mic_sample, None)
+
+    async def playback_stop(self, request, mic_sample: int | None = None, *,
+                            reply_sample: int) -> None:
+        """Report that a reply's playback stopped at the speaker.
+
+        ``reply_sample`` is how many of the reply's samples played. ``request`` and
+        ``mic_sample`` are as in ``playback_start``.
+        """
+        await self._playback(request, "stop", mic_sample, reply_sample)
+
+    async def _playback(self, request, event: str, mic_sample: int | None,
+                        reply_sample: int | None) -> None:
+        request_id = request.request_id if isinstance(request, TTSRequest) else request
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("a playback frame needs a non-empty request_id")
+        if mic_sample is None:
+            mic_sample = self.mic_sample
+        _check_sample("mic_sample", mic_sample)
+        payload = {"type": "playback", "request_id": request_id, "event": event,
+                   "mic_sample": mic_sample}
+        if event == "stop":
+            _check_sample("reply_sample", reply_sample)
+            payload["reply_sample"] = reply_sample
+        await self._client._send_or_raise(json.dumps(payload), VoiceManagerError)
 
     async def turn_start(self, timeout: float = 5.0) -> int:
         """Open a conversation turn and return the server's turn_id."""
@@ -190,7 +315,7 @@ class DuplexSession:
             yield self._client._stamp_turn_id(frame)
 
     async def audio(self) -> AsyncIterator[tuple]:
-        """Yield audio_start, pcm and audio_end events in arrival order."""
+        """Yield audio_start, pcm, barge and audio_end events in arrival order."""
         client = self._client
         current: str | None = None
         while (item := await client._tts_queue.get()) is not None:
@@ -208,6 +333,16 @@ class DuplexSession:
                 if rid == current:
                     current = None
                 yield ("audio_end", item)
+            elif kind == "barge":
+                # The server sends no more pcm for a barged request; drop any that
+                # was already in flight, as for a cancel, until its audio_end.
+                client._cancelled_tts.add(rid)
+                yield ("barge", item)
+
+    async def turn_ends(self) -> AsyncIterator[dict]:
+        """Yield every turn_end frame as it arrives (opted-in connections only)."""
+        while (frame := await self._client._turn_end_queue.get()) is not None:
+            yield frame
 
     async def errors(self) -> AsyncIterator[dict]:
         """Yield the server's error frames (timeout warnings, invalid requests)."""
@@ -253,6 +388,19 @@ class VoiceManagerClient:
         # turn_started acks. turn_start() sends the control frame then
         # awaits its server-owned turn_id here, off the single reader.
         self._turn_queue: asyncio.Queue = asyncio.Queue()
+        # turn_end frames, for a connection that opted in to a turn engine.
+        self._turn_end_queue: asyncio.Queue = asyncio.Queue()
+
+        # Turn engine state for this connection: the engine named in the opt-in
+        # sent (at most one per connection), the waiter for its answer, and the
+        # engine the server confirmed (None until turn_engine_ready, and again
+        # after turn_engine_lost).
+        self._turn_engine_sent: str | None = None
+        self._turn_engine_waiter: asyncio.Future | None = None
+        self.turn_engine: str | None = None
+        # Bytes of mic audio sent on this connection. Half of it is the mic_sample
+        # a playback frame reports, and any of it bars a later opt-in.
+        self._mic_bytes: int = 0
 
         self.session_id: str | None = None
         self._audio_format: dict = {}
@@ -356,7 +504,8 @@ class VoiceManagerClient:
         self._reader = None
 
         # Drain all queues - put sentinel None to unblock any waiters
-        for q in (self._stt_queue, self._tts_queue, self._error_queue, self._turn_queue):
+        for q in (self._stt_queue, self._tts_queue, self._error_queue, self._turn_queue,
+                  self._turn_end_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -378,8 +527,13 @@ class VoiceManagerClient:
         self._tts_queue = asyncio.Queue()
         self._error_queue = asyncio.Queue()
         self._turn_queue = asyncio.Queue()
-        # A fresh connection carries no pending cancellations.
+        self._turn_end_queue = asyncio.Queue()
+        # A fresh connection carries no pending cancellations, has not opted in to
+        # a turn engine, and has sent no mic audio.
         self._cancelled_tts = set()
+        self._turn_engine_sent = None
+        self.turn_engine = None
+        self._mic_bytes = 0
 
         delays = [1, 2, 4]
         for attempt, delay in enumerate(delays):
@@ -430,12 +584,32 @@ class VoiceManagerClient:
                         # Server-owned ack for a turn_start - routed to
                         # its own queue so turn_start() awaits it independently.
                         await self._turn_queue.put(frame)
+                    elif ftype == "turn_end":
+                        await self._turn_end_queue.put(frame)
+                    elif ftype == "barge":
+                        # In the audio stream, so it lands in order with the pcm
+                        # and before the request's audio_end.
+                        await self._tts_queue.put(frame)
+                    elif ftype == "turn_engine_ready":
+                        self._on_turn_engine_ready(frame)
                     elif ftype == "error":
                         error_type = frame.get("error_type", "")
                         if error_type == "timeout_warning":
                             self._logger.warning(
                                 "Server timeout warning: %s", frame.get("message", "")
                             )
+                        waiter = self._turn_engine_waiter
+                        if (error_type in _TURN_ENGINE_REFUSALS and waiter is not None
+                                and not waiter.done()):
+                            # The server's answer to the pending opt-in: it goes to
+                            # enable_turn_engine, not to errors().
+                            waiter.set_exception(TurnEngineError(
+                                frame.get("message", "") or error_type, error_type))
+                            continue
+                        if error_type == _TURN_ENGINE_LOST:
+                            self._logger.warning(
+                                "Turn engine lost: %s", frame.get("message", ""))
+                            self.turn_engine = None
                         await self._error_queue.put(frame)
                     else:
                         self._logger.debug("Unhandled message type: %s", ftype)
@@ -444,10 +618,28 @@ class VoiceManagerClient:
             self.connected = False
         finally:
             # Signal all waiters that the connection is gone
+            waiter = self._turn_engine_waiter
+            if waiter is not None and not waiter.done():
+                waiter.set_exception(
+                    TurnEngineError("Connection lost waiting for turn_engine_ready"))
             await self._stt_queue.put(None)
             await self._tts_queue.put(None)
             await self._turn_queue.put(None)
+            await self._turn_end_queue.put(None)
             await self._error_queue.put(None)
+
+    def _on_turn_engine_ready(self, frame: dict) -> None:
+        """Record the server's turn_engine_ready and wake a pending opt-in."""
+        if self._turn_engine_sent is None:
+            self._logger.debug("Ignoring a turn_engine_ready that answers no opt-in")
+            return
+        engine = frame.get("engine", self._turn_engine_sent)
+        # A ready that lands after the opt-in timed out still means the server
+        # opted the connection in.
+        self.turn_engine = engine
+        waiter = self._turn_engine_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(engine)
 
     # ------------------------------------------------------------------
     # Full duplex
@@ -521,6 +713,7 @@ class VoiceManagerClient:
         try:
             async for chunk in audio_chunks:
                 await self._ws.send(chunk)
+                self._mic_bytes += len(chunk)
                 # Drain any transcriptions that arrived while sending
                 while not self._stt_queue.empty():
                     item = self._stt_queue.get_nowait()
@@ -584,6 +777,7 @@ class VoiceManagerClient:
                 try:
                     chunk = await send_iter.__anext__()
                     await self._ws.send(chunk)
+                    self._mic_bytes += len(chunk)
                 except StopAsyncIteration:
                     send_done = True
                 except websockets.exceptions.ConnectionClosed:
