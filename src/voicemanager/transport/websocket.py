@@ -23,6 +23,7 @@ from voicemanager.protocol import (
 )
 from voicemanager.session import SessionRegistry, SessionEntry
 from voicemanager.transport.endpoint_hold import EndpointHoldMachine
+from voicemanager.transport.turn_engine import TurnEngineSession
 from voicemanager.transport.turns import TurnTracker
 
 logger = logging.getLogger(__name__)
@@ -560,6 +561,16 @@ async def websocket_endpoint(websocket: WebSocket):
             tts_stream_pipeline=tts_stream_pipeline,
         )
 
+    # The connection's turn engine. It does nothing (no I/O, no task) until a
+    # turn_engine frame opts in, so a connection that never opts in runs exactly the
+    # code path below without it. The sidecar is None when the setting is off.
+    turn_engine = TurnEngineSession(
+        sidecar=getattr(websocket.app.state, "turn_engine_sidecar", None),
+        stt_engine_type=stt_engine_type,
+        label=session_id,
+        send_text=websocket.send_text,
+    )
+
     # Track last streaming STT text update for silence-triggered finalization (qwen)
     streaming_last_update: float | None = None
     # Track the last inbound audio frame for the audio.cpp mid-session endpoint trigger.
@@ -996,6 +1007,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         TurnStartedMessage(turn_id=new_turn_id).model_dump_json()
                     )
 
+                elif msg_type == "turn_engine":
+                    # A thin delegation: the opt-in checks, the sidecar link and the
+                    # answer frame all live on the connection's turn-engine session.
+                    await turn_engine.handle_opt_in(
+                        parsed, audio_started=first_frame_validated)
+
     except WebSocketDisconnect:
         logger.info("Client disconnected: session_id=%s", session_id)
     except SidecarFault as exc:
@@ -1073,6 +1090,16 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        # Close this connection's sidecar link, if it opted in, so no reader task
+        # outlives the connection. Without an opt-in this returns at once. A
+        # cancellation during the close (aclose has then dropped the link) must not
+        # skip the teardown below, which runs as for any other connection.
+        try:
+            await turn_engine.aclose()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Turn engine teardown failed for session %s", session_id)
         # Stop whatever TTS is in flight before general cleanup
         if tts_session is not None:
             await tts_session.aclose()
