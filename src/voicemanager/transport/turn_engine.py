@@ -68,6 +68,32 @@ went out, a stop came, or it reached the cap).
 Hops are packed off the event loop and sent by one sender task, in order. When the
 sidecar link is down they are dropped quietly; at most ``MAX_QUEUED_HOPS`` wait to
 be sent, and a hop past that is dropped with a warning.
+
+A barge
+-------
+
+A barge event says the user cut in over the reply playing at the client. It is about
+the reply that plays at the event's ``mic_sample``, picked from the replies whose
+playback start came and that have no stop yet (``HopFeed.played_reply``):
+
+1. the latest-started one whose played span holds ``mic_sample``, where a reply that
+   may still get PCM (no audio_end yet) has a span open at its end, since the client
+   can play what is still to come;
+2. else the latest-started one, which covers a client whose playback runs behind the
+   PCM count (a stall, a deep buffer) and so past the span the server works out.
+
+A barge with no such reply is ignored (logged at debug). For the reply it picks, the
+server sends the barge frame ({"type": "barge", "request_id", "onset_mic_sample",
+"mic_sample"}) and cancels the request through the TTS session's cancel path with
+reason 'interrupted' and the barge frame as its notice. That path silences the
+request before the barge frame goes out and sends the frame and the audio_end from
+one coroutine, so the client gets the barge frame, then audio_end reason
+'interrupted', and no PCM for the request after the barge frame, whatever the
+synthesis task is doing at the time. A reply whose audio_end already went out (it
+finished, and still plays at the client) gets the barge frame alone, so the client
+clears its speaker: there is nothing left to cancel and no second audio_end. The
+client's playback stop for the reply is still taken after the cancel, as it carries
+how much really played.
 """
 import asyncio
 import collections
@@ -86,7 +112,7 @@ from websockets.protocol import State
 
 from voicemanager.pipeline.tyger import wire
 from voicemanager.protocol import (
-    ErrorMessage, PlaybackMessage, TurnEngineMessage, TurnEngineReadyMessage,
+    BargeMessage, ErrorMessage, PlaybackMessage, TurnEngineMessage, TurnEngineReadyMessage,
     INVALID_REQUEST, TURN_ENGINES, TURN_ENGINE_UNAVAILABLE, TURN_ENGINE_UNSUPPORTED,
 )
 
@@ -240,6 +266,22 @@ class HopFeed:
 
     def reply(self, request_id: str) -> _Reply | None:
         return self._replies.get(request_id)
+
+    def played_reply(self, mic_sample: int) -> _Reply | None:
+        """The reply playing at ``mic_sample``: see "A barge" in the module docstring."""
+        playing = [r for r in self._replies.values()
+                   if r.start is not None and r.stop_mic is None]
+        if not playing:
+            return None
+
+        def holds(reply: _Reply) -> bool:
+            if mic_sample < reply.start:
+                return False
+            return not reply.complete or mic_sample < reply.start + reply.length16
+
+        holding = [r for r in playing if holds(r)]
+        # max keeps the first of equal starts; the later-kept reply wins a tie.
+        return max(reversed(holding or playing), key=lambda r: r.start)
 
     # --- the TTS side ---------------------------------------------------------------
 
@@ -414,6 +456,7 @@ class TurnEngineSession:
         self._hop_queue: asyncio.Queue | None = None
         self._sender: asyncio.Task | None = None
         self._dropping = False        # hops are being dropped on a full queue
+        self._tts_session = None      # the connection's TTS session, once attached
 
     @property
     def active(self) -> bool:
@@ -485,6 +528,10 @@ class TurnEngineSession:
         logger.debug("Playback: session=%s %s %s at mic_sample=%s", self._label,
                      frame.get("request_id"), frame.get("event"), frame.get("mic_sample"))
         self._queue_due_hops()
+
+    def attach_tts_session(self, session) -> None:
+        """The TTS session this object taps; called when it is set as the audio tap."""
+        self._tts_session = session
 
     def on_tts_text(self, request_id: str, text: str) -> None:
         """The TTS session's audio tap: a text frame a reply sent."""
@@ -583,8 +630,31 @@ class TurnEngineSession:
 
     async def _dispatch(self, event: wire.Event) -> None:
         logger.debug("Turn engine event: session=%s %s", self._label, event)
+        if isinstance(event, wire.BargeEvent):
+            await self._on_barge(event)
         if self._on_event is not None:
             await self._on_event(event)
+
+    async def _on_barge(self, event: wire.BargeEvent) -> None:
+        """Stop the reply the user cut in over: see "A barge" in the module docstring."""
+        reply = self._feed.played_reply(event.mic_sample)
+        if reply is None:
+            logger.debug("Barge with no played reply ignored: session=%s at mic_sample=%s",
+                         self._label, event.mic_sample)
+            return
+        notice = BargeMessage(request_id=reply.request_id,
+                              onset_mic_sample=event.onset_mic_sample,
+                              mic_sample=event.mic_sample).model_dump_json()
+        logger.info("Barge: session=%s request_id=%s onset_mic_sample=%s mic_sample=%s",
+                    self._label, reply.request_id, event.onset_mic_sample, event.mic_sample)
+        tts = self._tts_session
+        if reply.done or tts is None:
+            # Its audio_end already went out: the frame alone clears the speaker.
+            await self._send_text(notice)
+            return
+        # No more of it goes out; its audio_end goes on the real socket, unseen by the tap.
+        reply.done = True
+        await tts.cancel(reply.request_id, reason="interrupted", notice=notice)
 
     # --- teardown -------------------------------------------------------------------
 

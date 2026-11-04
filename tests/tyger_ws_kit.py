@@ -7,7 +7,9 @@ app.state.turn_engine_sidecar. No GPU, no model, no live server.
 
 Not a test module: pytest collects nothing here.
 """
+import asyncio
 import json
+import threading
 import urllib.parse
 
 import numpy as np
@@ -37,6 +39,30 @@ class FakeTTSEngine:
 
     async def stream_synthesize(self, text: str, **kwargs):
         for chunk in self.chunks:
+            yield chunk
+
+
+class GatedTTSEngine(FakeTTSEngine):
+    """Yields the first ``open_chunks`` chunks at once and the rest after ``release``.
+
+    It keeps a reply in flight for as long as a test needs: the gate is a
+    threading.Event set from the test thread, polled from the app's event loop.
+    ``held`` is set once the engine is waiting at the gate.
+    """
+
+    def __init__(self, chunks: list[np.ndarray], open_chunks: int = 1,
+                 rate: int = TTS_RATE) -> None:
+        super().__init__(chunks, rate)
+        self.open_chunks = open_chunks
+        self.release = threading.Event()
+        self.held = threading.Event()
+
+    async def stream_synthesize(self, text: str, **kwargs):
+        for i, chunk in enumerate(self.chunks):
+            if i == self.open_chunks:
+                self.held.set()
+                while not self.release.is_set():
+                    await asyncio.sleep(0.005)
             yield chunk
 
 

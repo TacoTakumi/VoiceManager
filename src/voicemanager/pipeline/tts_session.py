@@ -14,8 +14,8 @@ stopped the other, so a `tts` after a `tts_stream` left BOTH synthesizing onto t
 same socket. `live_tasks` is that invariant in observable form.
 
 The session is also deliberately *callable*: every method here can be driven with a
-fake WebSocket and no receive loop present. A future server-side barge-in fires from
-the STT path, not from a `tts_cancel` frame, and needs somewhere to call.
+fake WebSocket and no receive loop present. A server-side barge-in from the turn
+engine fires from its reader task, not from a `tts_cancel` frame, and calls `cancel`.
 
 Cancellation rests on one hard fact: **an executor thread cannot be
 interrupted.** `task.cancel()` does not stop a synthesis that is blocked inside
@@ -44,6 +44,16 @@ to keep the PCM it must rebuild the client's playback from. The tap has two meth
 calls that must not block. Frames a cancelled request drops never reach it. Without a
 tap (the default) the guarded socket does one attribute check per frame and nothing
 else, and a failing tap is logged and never stops the reply.
+
+A tap may also have ``attach_tts_session(session)``: setting ``audio_tap`` calls it
+with this session, so the tap can stop a reply itself. The turn engine does that on a
+barge-in, through ``cancel(request_id, reason="interrupted", notice=barge_frame)``.
+That is the same cancel path as a ``tts_cancel`` frame, with two additions: the
+reason on the ack, and a text frame (the notice) that goes out on the real socket
+after the request is silenced and right before its ``audio_end``. ``cancel`` may so
+run on another task than the receive loop; it changes all of its state before its
+first await, so a request dispatched while its frames go out is never the one it
+clears.
 """
 import asyncio
 import collections
@@ -133,7 +143,19 @@ class TTSSession:
         self._completed_ids: collections.deque[str] = collections.deque(maxlen=DEAD_ID_CAPACITY)
         # Sees every frame a synthesis task sent (see the module docstring). None
         # unless the connection opted in to a turn engine.
-        self.audio_tap = None
+        self._audio_tap = None
+
+    @property
+    def audio_tap(self):
+        """The object that sees every frame a synthesis task sent, or None."""
+        return self._audio_tap
+
+    @audio_tap.setter
+    def audio_tap(self, tap) -> None:
+        self._audio_tap = tap
+        attach = getattr(tap, "attach_tts_session", None)
+        if attach is not None:
+            attach(self)
 
     # --- introspection --------------------------------------------------
 
@@ -317,8 +339,15 @@ class TTSSession:
 
     # --- cancellation ---------------------------------------------------
 
-    async def cancel(self, request_id: str) -> None:
+    async def cancel(self, request_id: str, *, reason: str = "cancelled",
+                     notice: str | None = None) -> None:
         """Stop the in-flight request and ack it at once.
+
+        ``reason`` goes on the ack's ``audio_end``: 'cancelled' for a `tts_cancel`
+        frame or a supersede, 'interrupted' for a turn-engine barge-in. ``notice`` is
+        a text frame sent on the real socket right before that ack, once the request
+        is silenced, so no PCM of the request follows it (the barge frame). When the
+        request already reached its terminal audio_end the notice goes out alone.
 
         Callable by ANY caller - a `tts_cancel` frame today, the STT path when
         server-side barge-in arrives. It never awaits the cancelled synthesis:
@@ -351,11 +380,10 @@ class TTSSession:
         # connection. An id that already reached a terminal audio_end - cancelled earlier,
         # or finished on its own and sent audio_end('complete') - must not get a second one.
         # (A genuinely never-seen id is NOT terminal, so it still acks below.)
-        if self._is_cancelled(request_id):
-            logger.debug("TTS cancel for already-cancelled request_id=%s (no-op)", request_id)
-            return
-        if self._is_completed(request_id):
-            logger.debug("TTS cancel for already-completed request_id=%s (no-op)", request_id)
+        if self._is_cancelled(request_id) or self._is_completed(request_id):
+            logger.debug("TTS cancel for already-ended request_id=%s (no-op)", request_id)
+            if notice is not None:
+                await self._websocket.send_text(notice)
             return
 
         # Only the request whose synthesis is actually in flight may have its task
@@ -369,18 +397,29 @@ class TTSSession:
         is_active = request_id == self._active_request_id
         tasks = self.live_tasks if is_active else []
         self._mark_dead(request_id)  # from here on, that request cannot reach the client
+        # The teardown happens before the first await: a barge-in runs this on the
+        # turn engine's reader task, so the receive loop may dispatch a new request
+        # while the ack is being sent, and that request must not be the one cleared.
+        if is_active:
+            self._tear_down(tasks)
 
-        # The ack goes out on the REAL socket: the request is dead now, so a guarded
-        # socket would drop the very frame that tells the client so.
+        # The notice and the ack go out on the REAL socket: the request is dead now,
+        # so a guarded socket would drop the very frames that tell the client so.
+        if notice is not None:
+            await self._websocket.send_text(notice)
         await self._websocket.send_text(
-            AudioEndMessage(request_id=request_id, reason="cancelled").model_dump_json()
+            AudioEndMessage(request_id=request_id, reason=reason).model_dump_json()
         )
 
         if not is_active:
             logger.info("TTS cancel for non-active request_id=%s (acked and marked dead; "
                         "in-flight request left untouched)", request_id)
             return
+        logger.info("TTS cancelled: request_id=%s reason=%s (acked; executor unwinds in "
+                    "background)", request_id, reason)
 
+    def _tear_down(self, tasks: list[asyncio.Task]) -> None:
+        """Cut the in-flight request's tasks loose, unawaited, and clear its fields."""
         for task in tasks:
             task.cancel()
         self._unwinding.extend(tasks)
@@ -395,8 +434,6 @@ class TTSSession:
             self._stream_pipeline.abandon()  # cancels without awaiting
         self._stream_request_id = None
         self._active_request_id = None
-        logger.info("TTS cancelled: request_id=%s (acked; executor unwinds in background)",
-                    request_id)
 
     async def _supersede(self, request_id: str) -> None:
         """A new request_id arriving over a live one IS a cancel - take that path.

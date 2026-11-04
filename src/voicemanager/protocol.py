@@ -88,8 +88,8 @@ class AudioEndMessage(BaseModel):
     # which reproduces today's behaviour for every existing close path -- including
     # the VM_TTS_STREAM_FLUSH_TIMEOUT close, which is a normal completion, not an
     # interruption. "cancelled" is set when a tts_cancel or a supersede-by-new-
-    # request_id stops a reply. "interrupted" is reserved for the future
-    # server-side barge-in work and is never emitted here.
+    # request_id stops a reply. "interrupted" is set when the turn engine reports
+    # that the user cut in over a played reply; the barge frame comes before it.
     reason: str = "complete"
 
 
