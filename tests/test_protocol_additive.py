@@ -39,6 +39,7 @@ from fastapi.testclient import TestClient
 from voicemanager.app import create_app
 from voicemanager.pipeline.tts import TTSPipeline, TTSStreamPipeline
 from voicemanager.pipeline.tts_session import TTSSession
+from voicemanager import protocol
 from voicemanager.protocol import (
     MessageType, TranscriptionMessage, AudioEndMessage, TTSStreamMessage,
 )
@@ -56,6 +57,50 @@ _LEGACY_MESSAGE_TYPES = frozenset({
 # The only additions this project makes to the enum. turn_start is client->server;
 # turn_started is the sole new SERVER-emitted type, and only as a turn_start ack.
 _TURN_MESSAGE_TYPES = frozenset({"turn_start", "turn_started"})
+# The turn-engine frames, added later and also opt-in: turn_engine and playback are
+# client->server; turn_engine_ready answers a turn_engine opt-in, and barge and
+# turn_end are sent only to a session that opted in.
+_TURN_ENGINE_MESSAGE_TYPES = frozenset({
+    "turn_engine", "turn_engine_ready", "playback", "barge", "turn_end",
+})
+
+# Every error_type the server sent before the turn engine. The turn engine reuses
+# invalid_request for bad frames and adds only its three own types.
+_LEGACY_ERROR_TYPES = frozenset({
+    "invalid_audio_format", "invalid_request", "server_error", "stt_backend_fault",
+    "stt_backend_unavailable", "stt_backend_unready", "timeout", "timeout_warning",
+    "tts_backend_fault", "unknown_voice",
+})
+_TURN_ENGINE_ERROR_TYPES = (
+    "turn_engine_unavailable", "turn_engine_unsupported", "turn_engine_lost",
+)
+
+# Marks a required field in the snapshot below.
+_REQUIRED = object()
+# The frame models as they stood before the turn engine: every field, in order,
+# with its default or _REQUIRED. The turn engine must leave each one untouched.
+_LEGACY_MODEL_FIELDS = {
+    "HandshakeMessage": {
+        "type": "ready", "session_id": _REQUIRED, "audio_format": _REQUIRED,
+        "stt_engine": "whisper", "tts_engine": "openvoice", "available_voices": [],
+        "default_voice": None},
+    "ErrorMessage": {"type": "error", "error_type": _REQUIRED, "message": _REQUIRED},
+    "TranscriptionMessage": {
+        "type": "transcription", "text": _REQUIRED, "is_final": True, "endpoint": False,
+        "turn_id": 0, "segment_index": 0, "language": "", "inference_duration": 0.0,
+        "confidence": 0.0, "start": 0.0, "end": 0.0},
+    "AudioEndMessage": {"type": "audio_end", "request_id": None, "reason": "complete"},
+    "TTSRequestMessage": {
+        "type": "tts", "text": _REQUIRED, "request_id": _REQUIRED, "voice": None},
+    "AudioStartMessage": {
+        "type": "audio_start", "request_id": _REQUIRED, "sample_rate": _REQUIRED,
+        "channels": 1, "bit_depth": 16, "encoding": "pcm"},
+    "TTSCancelMessage": {"type": "tts_cancel", "request_id": _REQUIRED},
+    "TTSStreamMessage": {
+        "type": "tts_stream", "request_id": _REQUIRED, "text": _REQUIRED, "done": False,
+        "flush": False, "voice": None, "chunking": "sentence"},
+    "TurnStartedMessage": {"type": "turn_started", "turn_id": _REQUIRED},
+}
 
 # 512 bytes: a valid raw 16-bit PCM frame, enough to trigger one STT feed().
 _ONE_CHUNK = b"\x00\x00" * 256
@@ -241,10 +286,12 @@ def test_legacy_session_trace_is_additive_and_opt_in(monkeypatch):
 # --- structural proofs backing the trace ------------------------------------
 
 def test_project_added_only_the_two_turn_message_types():
-    # The enum grew by EXACTLY the two turn control frames and nothing else,
-    # so a future non-additive frame type (a retraction, a mode negotiation) trips here.
+    # The enum grew by EXACTLY the two turn control frames and the five opt-in
+    # turn-engine frames and nothing else, so a future non-additive frame type (a
+    # retraction, a mode negotiation) trips here.
     current = {m.value for m in MessageType}
-    assert current - _LEGACY_MESSAGE_TYPES == set(_TURN_MESSAGE_TYPES)
+    assert current - _LEGACY_MESSAGE_TYPES == set(
+        _TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES)
     # ...and nothing pre-existing was removed or renamed either.
     assert _LEGACY_MESSAGE_TYPES <= current
 
@@ -290,3 +337,53 @@ def test_turn_started_is_constructed_only_in_the_turn_start_branch():
             break
     assert branch_line < ctor < branch_end, (
         "TurnStartedMessage is constructed outside the turn_start branch")
+
+
+# --- the turn-engine additions leave the existing contract alone ------------
+
+def _field_snapshot(model) -> dict:
+    return {name: (_REQUIRED if field.is_required() else field.default)
+            for name, field in model.model_fields.items()}
+
+
+def test_existing_frame_models_are_unchanged():
+    # Same fields, same order, same defaults, same required set for every frame
+    # model that existed before the turn engine.
+    for name, expected in _LEGACY_MODEL_FIELDS.items():
+        actual = _field_snapshot(getattr(protocol, name))
+        assert list(actual) == list(expected), f"{name} fields changed"
+        for field, default in expected.items():
+            if default is _REQUIRED:
+                assert actual[field] is _REQUIRED, f"{name}.{field} is no longer required"
+            else:
+                assert actual[field] == default, f"{name}.{field} default changed"
+
+
+def test_new_error_types_are_distinct_from_the_existing_ones():
+    assert protocol.TURN_ENGINE_ERROR_TYPES == _TURN_ENGINE_ERROR_TYPES
+    assert len(set(_TURN_ENGINE_ERROR_TYPES)) == 3
+    assert not set(_TURN_ENGINE_ERROR_TYPES) & _LEGACY_ERROR_TYPES
+    # Bad turn-engine frames reuse the existing invalid_request type.
+    assert protocol.INVALID_REQUEST == "invalid_request"
+    assert protocol.INVALID_REQUEST in _LEGACY_ERROR_TYPES
+
+
+def test_existing_error_types_are_still_sent_by_name():
+    # The turn engine renames none of today's error types: each is still in the
+    # source the server sends it from.
+    source = "\n".join(p.read_text() for p in _SRC.rglob("*.py"))
+    for error_type in _LEGACY_ERROR_TYPES:
+        assert f'"{error_type}"' in source, error_type
+
+
+def test_turn_engine_fields_are_opt_in_only():
+    # The new frames are new models: no existing model gained a turn-engine field,
+    # and none of the five frame types is in the set a legacy session may see.
+    for fields in _LEGACY_MODEL_FIELDS.values():
+        assert not {"engine", "onset_mic_sample", "mic_sample", "by", "reply_sample"} & set(
+            fields)
+    assert not _TURN_ENGINE_MESSAGE_TYPES & _LEGACY_MESSAGE_TYPES
+    for model in (protocol.TurnEngineMessage, protocol.TurnEngineReadyMessage,
+                  protocol.PlaybackMessage, protocol.BargeMessage,
+                  protocol.TurnEndMessage):
+        assert model.model_fields["type"].default in _TURN_ENGINE_MESSAGE_TYPES

@@ -5,7 +5,7 @@ This module defines the canonical message types and their schemas.
 """
 import enum
 from typing import Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 
 class MessageType(str, enum.Enum):
@@ -23,6 +23,14 @@ class MessageType(str, enum.Enum):
     # turn_start; the server acks with turn_started carrying the new id.
     turn_start = "turn_start"
     turn_started = "turn_started"
+    # Turn-engine frames, all opt-in: a client opts in with turn_engine and the
+    # server answers turn_engine_ready; the client reports playback edges with
+    # playback; the server reports barge and turn_end only to an opted-in session.
+    turn_engine = "turn_engine"
+    turn_engine_ready = "turn_engine_ready"
+    playback = "playback"
+    barge = "barge"
+    turn_end = "turn_end"
 
 
 class HandshakeMessage(BaseModel):
@@ -143,6 +151,112 @@ class TurnStartedMessage(BaseModel):
     """
     type: Literal["turn_started"] = "turn_started"
     turn_id: int
+
+
+# --- turn engine ---------------------------------------------------------------
+#
+# A session opts in to a turn engine, which decides from the mic audio and the
+# agent's own playback when the user's turn ended and when the user cut in over a
+# reply. A session that never sends turn_engine sees none of these frames.
+
+#: The turn engines a client may name in a turn_engine opt-in.
+TURN_ENGINES: tuple[str, ...] = ("tyger",)
+#: The edges a playback frame reports.
+PLAYBACK_EVENTS: tuple[str, ...] = ("start", "stop")
+#: What ended a turn: the turn model's endpoint head, or its silence fallback.
+TURN_END_BY: tuple[str, ...] = ("model", "silence")
+
+#: error_type for a bad frame. Turn-engine frames reuse it: a malformed frame, an
+#: opt-in after the first audio frame, a second opt-in, an unknown engine name, a
+#: playback stop without a start, or an unknown request_id.
+INVALID_REQUEST = "invalid_request"
+#: error_type for an opt-in while the server runs with the turn engine off.
+TURN_ENGINE_UNAVAILABLE = "turn_engine_unavailable"
+#: error_type for an opt-in on an STT engine the turn engine does not support.
+TURN_ENGINE_UNSUPPORTED = "turn_engine_unsupported"
+#: error_type sent once to each opted-in session when the turn engine's process
+#: exits; the session goes on as one that never opted in.
+TURN_ENGINE_LOST = "turn_engine_lost"
+#: The error types the turn engine adds, in the order above.
+TURN_ENGINE_ERROR_TYPES: tuple[str, ...] = (
+    TURN_ENGINE_UNAVAILABLE, TURN_ENGINE_UNSUPPORTED, TURN_ENGINE_LOST,
+)
+
+
+class TurnEngineMessage(BaseModel):
+    """Client opt-in to a turn engine, sent before the connection's first audio frame.
+
+    ``engine`` is kept as any string so the server can answer an unknown name with
+    an invalid_request error frame; the known names are ``TURN_ENGINES``.
+    """
+    type: Literal["turn_engine"] = "turn_engine"
+    engine: str
+
+
+class TurnEngineReadyMessage(BaseModel):
+    """Server answer to a successful turn_engine opt-in."""
+    type: Literal["turn_engine_ready"] = "turn_engine_ready"
+    engine: str
+
+
+class PlaybackMessage(BaseModel):
+    """Client report that a reply's playback started or stopped at the speaker.
+
+    ``mic_sample`` is the index on the client's own outgoing 16 kHz mic stream
+    (samples sent since its first audio frame) at which the edge reached the
+    speaker. ``reply_sample`` is sent only on stop: how many of the reply's samples
+    played. The frame carries no audio; the server builds the agent channel from the
+    PCM it sent for ``request_id``. Integers are strict: a string, float or bool is a
+    malformed frame.
+    """
+    type: Literal["playback"] = "playback"
+    request_id: str
+    event: Literal["start", "stop"]
+    mic_sample: int = Field(ge=0, strict=True)
+    reply_sample: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def _reply_sample_only_on_stop(self) -> "PlaybackMessage":
+        if self.event == "stop" and self.reply_sample is None:
+            raise ValueError("a playback stop needs reply_sample")
+        if self.event == "start" and self.reply_sample is not None:
+            raise ValueError("reply_sample is sent only on a playback stop")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_reply_sample_on_start(self, handler):
+        data = handler(self)
+        if self.reply_sample is None:
+            data.pop("reply_sample", None)
+        return data
+
+
+class BargeMessage(BaseModel):
+    """Server report that the user cut in over a played reply.
+
+    ``onset_mic_sample`` is where on the client's mic stream the user's speech began,
+    and ``mic_sample`` is where the turn engine decided. The server cancels the
+    request, sends no more PCM for it, and ends it with audio_end reason
+    'interrupted' after this frame.
+    """
+    type: Literal["barge"] = "barge"
+    request_id: str
+    onset_mic_sample: int
+    mic_sample: int
+
+
+class TurnEndMessage(BaseModel):
+    """Server report that the user's turn ended, for an opted-in session.
+
+    ``text`` joins, in order, every final sent since the previous turn_end.
+    ``mic_sample`` is where on the client's mic stream the turn engine decided, and
+    ``by`` says whether the model's endpoint head or its silence fallback ended it.
+    """
+    type: Literal["turn_end"] = "turn_end"
+    turn_id: int
+    text: str
+    mic_sample: int
+    by: Literal["model", "silence"]
 
 
 # Audio format specification for handshake
