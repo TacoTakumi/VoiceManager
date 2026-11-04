@@ -229,7 +229,7 @@ Set `VM_TURN_ENGINE=tyger`. The other settings are optional:
 - `VM_TYGER_PORT`: the loopback port the sidecar listens on (default 8257).
 - `VM_TYGER_READY_TIMEOUT`: seconds to wait for the sidecar to load the model (default 180).
 - The turn rules, on Tyger's 80 ms frames: `VM_TYGER_ENDPOINT_THRESHOLD` (0.915) and `VM_TYGER_ENDPOINT_DEBOUNCE` (2 frames) end a turn, after at least `VM_TYGER_MIN_SPEECH_MS` (350) of voice; `VM_TYGER_BARGE_THRESHOLD` (0.6) and `VM_TYGER_BARGE_DEBOUNCE` (2 frames) make a barge, never in the first `VM_TYGER_WARMUP_FRAMES` (6) after a reply starts to play; audio below `VM_TYGER_VOICE_GATE_DB` (-50 dBFS) is silence, and `VM_TYGER_SILENCE_FALLBACK_MS` (1200) of it ends a turn that the model has not ended.
-- The mic hold: `VM_TYGER_HOLD_TAIL_MS` (150) of room echo after a reply stops stays out of the STT, and with no playback start from the client `VM_TYGER_START_WAIT_MS` (2000) after a reply's `audio_end` the held mic audio goes to the STT as if the reply never played.
+- The mic hold: `VM_TYGER_HOLD_TAIL_MS` (150) of room echo after a reply stops stays out of the STT, and with no playback start from the client `VM_TYGER_START_WAIT_MS` (2000) after a reply's `audio_end` the held mic audio goes to the STT as if the reply never played. After a playback stop, the held audio waits until the sidecar has scored the mic audio up to the stop plus the tail, so a barge at the very end of a reply still counts; the same `VM_TYGER_START_WAIT_MS` of mic audio bounds that wait.
 
 `.env.example` lists all of them with an explanation.
 

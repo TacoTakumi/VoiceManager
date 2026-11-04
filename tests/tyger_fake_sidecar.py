@@ -20,6 +20,14 @@ Two ways to use it:
   path, unpacked hops and any bad messages. ``ready = False`` makes /health 503.
   A message that is not a hop gets an error event line, as from the real sidecar.
 
+  Progress lines (``wire.ScoredEvent``): by default the fake sends none, like a
+  sidecar that does not report progress, whatever the session asks. With
+  ``progress=True`` it answers a session that connects with ``progress=1`` as the
+  real sidecar does: a scored line at 0 when it opens, and one at the hop's
+  mic_sample last in each hop's message. Set ``withhold_progress = True`` to keep
+  the per-hop lines back (the opening line still goes out); a test then sends its
+  own with ``send(i, wire.ScoredEvent(...))``.
+
 * As a process, for the spawn and watch tests: run it with the test interpreter
   as if it were the Tyger environment's python::
 
@@ -89,7 +97,8 @@ class FakeTygerSidecar:
     def __init__(self, events: dict | None = None,
                  on_hop: Callable[[FakeSession, int, "wire.Hop"], list | None] | None = None,
                  host: str = "127.0.0.1", port: int = 0,
-                 record: Callable[[FakeSession, int, "wire.Hop"], None] | None = None) -> None:
+                 record: Callable[[FakeSession, int, "wire.Hop"], None] | None = None,
+                 progress: bool = False) -> None:
         self.events = {str(k): {int(n): list(v) for n, v in hops.items()}
                        for k, hops in (events or {}).items()}
         self.on_hop = on_hop
@@ -98,6 +107,8 @@ class FakeTygerSidecar:
         self.port: int | None = port or None
         self._bind_port = port
         self.ready = True
+        self.progress = progress
+        self.withhold_progress = False
         self.sessions: list[FakeSession] = []
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -199,13 +210,17 @@ class FakeTygerSidecar:
 
     async def _handle(self, ws) -> None:
         split = urllib.parse.urlsplit(ws.request.path)
-        label = urllib.parse.parse_qs(split.query).get("session", [""])[0]
+        query = urllib.parse.parse_qs(split.query)
+        label = query.get("session", [""])[0]
+        progress = self.progress and query.get(wire.PROGRESS_PARAM, [""])[0] == "1"
         with self._lock:
             index = len(self.sessions)
             session = FakeSession(index=index, key=label or str(index), path=ws.request.path,
                                   ws=ws)
             self.sessions.append(session)
         try:
+            if progress:
+                await self._send(session, [wire.ScoredEvent(mic_sample=0)])
             async for message in ws:
                 try:
                     hop = wire.unpack_hop(message) if isinstance(message, bytes) else None
@@ -226,6 +241,8 @@ class FakeTygerSidecar:
                 events = list(self.events.get(session.key, {}).get(number, []))
                 if self.on_hop is not None:
                     events += self.on_hop(session, number, hop) or []
+                if progress and not self.withhold_progress:
+                    events.append(wire.ScoredEvent(mic_sample=hop.mic_sample))
                 await self._send(session, events)
         except Exception:
             pass

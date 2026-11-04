@@ -4,7 +4,9 @@ The sidecar runs from its own virtual environment and loads this file by path, s
 imports only the standard library: no pydantic, no FastAPI, no numpy. Both processes
 use it, so the two ends cannot drift apart.
 
-Each opted-in session has one WebSocket to the sidecar.
+Each opted-in session has one WebSocket to the sidecar. A session that connects with
+the query parameter ``progress=1`` (``PROGRESS_PARAM``) asks for progress lines (see
+below).
 
 Server to sidecar: one binary message per hop of 320 ms (5120 samples at 16 kHz).
 All fields are little-endian::
@@ -28,11 +30,20 @@ Sidecar to server: text messages holding event lines, one JSON object per line
     {"event": "endpoint", "by": "model" | "silence", "mic_sample": int}
     {"event": "barge", "onset_mic_sample": int, "mic_sample": int}
     {"event": "error", "message": str}
+    {"event": "scored", "mic_sample": int}
 
 ``mic_sample`` is the hop end at which the sidecar decided; ``onset_mic_sample`` is
 where the user's speech began, never after ``mic_sample``. Unknown keys are ignored
 so that either end can add one; a missing or ill-typed known key is rejected with
 ValueError.
+
+A ``scored`` line is a progress line, sent only to a session that asked for them:
+the sidecar is done with every hop up to the one that ends at ``mic_sample``, and
+every event those hops give was sent before it. One goes out with ``mic_sample`` 0
+as soon as the session opens (it says the sidecar sends them), and one after each
+hop, last in that hop's message, whether the hop scored or failed with an error
+line. A hop that is not a valid hop message gets none. So once the server has read
+a scored line at X, it has read every barge and endpoint up to X.
 """
 import array
 import json
@@ -57,6 +68,9 @@ _MODE_CODES = {MODE_LISTENING: 0, MODE_SPEAKING: 1}
 _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}
 
 ENDPOINT_BY: tuple[str, ...] = ("model", "silence")
+
+#: The session URL's query parameter that asks for progress lines, set to "1".
+PROGRESS_PARAM = "progress"
 
 _INT64_MAX = 2**63 - 1
 _BIG_ENDIAN_HOST = sys.byteorder != "little"
@@ -99,7 +113,13 @@ class ErrorEvent:
     message: str
 
 
-Event = EndpointEvent | BargeEvent | ErrorEvent
+@dataclass(frozen=True)
+class ScoredEvent:
+    """Progress: the sidecar is done with every hop up to the one ending at mic_sample."""
+    mic_sample: int
+
+
+Event = EndpointEvent | BargeEvent | ErrorEvent | ScoredEvent
 
 
 # --- hops ---------------------------------------------------------------------
@@ -207,6 +227,8 @@ def format_event(event: Event) -> str:
     elif isinstance(event, BargeEvent):
         obj = {"event": "barge", "onset_mic_sample": event.onset_mic_sample,
                "mic_sample": event.mic_sample}
+    elif isinstance(event, ScoredEvent):
+        obj = {"event": "scored", "mic_sample": event.mic_sample}
     else:
         obj = {"event": "error", "message": event.message}
     # json.dumps escapes a newline inside a string, so the line stays one line.
@@ -236,6 +258,8 @@ def parse_event_line(line: str) -> Event:
                            mic_sample=_get(obj, "mic_sample", int))
     elif kind == "error":
         event = ErrorEvent(message=_get(obj, "message", str))
+    elif kind == "scored":
+        event = ScoredEvent(mic_sample=_get(obj, "mic_sample", int))
     else:
         raise ValueError(f"unknown event {kind!r}")
     _check_event(event)
@@ -274,5 +298,7 @@ def _check_event(event) -> None:
     elif isinstance(event, ErrorEvent):
         if not isinstance(event.message, str):
             raise ValueError("error message must be a string")
+    elif isinstance(event, ScoredEvent):
+        _check_sample_index("mic_sample", event.mic_sample)
     else:
         raise ValueError(f"not a turn-engine event: {event!r}")

@@ -11,13 +11,16 @@ Wire protocol (``wire`` has the formats):
 
 - One WebSocket per session at ``/tyger``, optionally labelled
   ``/tyger?session=LABEL`` (the label shows in the log and picks the fake
-  scorer's script).
+  scorer's script). ``progress=1`` in the query asks for progress lines.
 - The server sends one binary message per 320 ms hop. The sidecar scores the hop's
   four 80 ms frames with the session's scorer, feeds them through the session's
   turn rules, and sends the hop's events, if any, as one text message of event
   lines (endpoint, barge).
 - A message that is not a valid hop, or a hop the scorer fails on, gets one error
   event line, and the session goes on with the next hop.
+- A session that asked for progress gets a scored line at 0 when it opens, and one
+  at the hop's mic_sample last in the message of every valid hop, scored or failed,
+  so each hop then gets a message.
 
 Each session has its own turn rules and scorer state; the model is shared. Scoring
 runs on one thread, so the GPU serves one hop at a time and the event loop keeps
@@ -178,11 +181,14 @@ def create_app(settings: "rules.TurnRuleSettings | None" = None,
             await _close(ws, code=1013)
             return
         key = ws.query_params.get("session") or str(index)
+        progress = ws.query_params.get(wire.PROGRESS_PARAM) == "1"
         session = Session(key, rules.TurnRules(rule_settings), active.new_session(key, index))
         app.state.sessions += 1
         logger.info("session %s opened", key)
         try:
-            await _serve_session(ws, session, app.state.executor)
+            if progress and not await _send_events(ws, [wire.ScoredEvent(mic_sample=0)]):
+                return
+            await _serve_session(ws, session, app.state.executor, progress)
         finally:
             app.state.sessions -= 1
             logger.info("session %s closed after %d hops", key, session.hops)
@@ -190,9 +196,11 @@ def create_app(settings: "rules.TurnRuleSettings | None" = None,
     return app
 
 
-async def _serve_session(ws: WebSocket, session: Session, executor: ThreadPoolExecutor) -> None:
+async def _serve_session(ws: WebSocket, session: Session, executor: ThreadPoolExecutor,
+                         progress: bool = False) -> None:
     """Receive hops in order; each is scored before the next is read, so a
-    session's events keep the order of its hops."""
+    session's events keep the order of its hops. With ``progress``, each valid
+    hop's message ends with its scored line."""
     loop = asyncio.get_running_loop()
     while True:
         try:
@@ -215,6 +223,8 @@ async def _serve_session(ws: WebSocket, session: Session, executor: ThreadPoolEx
                 except Exception as exc:  # one hop's failure; the session goes on
                     logger.exception("session %s: scoring a hop failed", session.key)
                     events = [wire.ErrorEvent(f"scoring failed: {exc or type(exc).__name__}")]
+                if progress:
+                    events.append(wire.ScoredEvent(mic_sample=hop.mic_sample))
         if events and not await _send_events(ws, events):
             return
 

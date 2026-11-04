@@ -1017,7 +1017,7 @@ The Python client's `DuplexSession.mic_sample` property is the count of samples 
 
 #### `barge` - `BargeMessage`
 
-Server to client. The user cut in over a reply that plays at the client. The server picks the reply that plays at the barge's `mic_sample`, from the replies with a `start` and no `stop`.
+Server to client. The user cut in over a reply that plays at the client. The server picks the reply by position on the mic stream, from the replies with a `start`: the latest-started one that played at the barge's `mic_sample`, else the latest-started one with no `stop`. A stopped reply still takes a barge whose speech began by its `stop`'s `mic_sample` and that the turn engine decided by that `mic_sample` plus `VM_TYGER_HOLD_TAIL_MS`. The turn engine decides a little after the audio it hears, so a barge over the last moments of a reply can come after the client's `stop` for it; the server still sends it. A barge frame can therefore name a reply that has already stopped at the client.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -1030,12 +1030,12 @@ Server to client. The user cut in over a reply that plays at the client. The ser
 { "type": "barge", "request_id": "b7c1d0e2-9f3a-4c58-8e21-0a1b2c3d4e5f", "onset_mic_sample": 112000, "mic_sample": 115840 }
 ```
 
-The order is fixed. The server cancels the request and sends the `barge` frame first, then that request's `audio_end` with `reason: "interrupted"`, and **no PCM for the request after the `barge` frame**. If the reply's `audio_end` already went out (the server sent all of it and it still plays at the client), the `barge` frame comes alone and there is no second `audio_end`.
+The order is fixed. The server cancels the request and sends the `barge` frame first, then that request's `audio_end` with `reason: "interrupted"`, and **no PCM for the request after the `barge` frame**. If the reply's `audio_end` already went out (the server sent all of it and it still plays at the client, or it stopped), the `barge` frame comes alone and there is no second `audio_end`.
 
 On a `barge` the client must:
 
 1. Clear its playback of that request at once (the queued audio too, not only the current block).
-2. Send `playback` `stop` for the request with what really played (`mic_sample` and `reply_sample` as above).
+2. Send `playback` `stop` for the request with what really played (`mic_sample` and `reply_sample` as above), unless it already sent one: a second `stop` is refused with `invalid_request`.
 3. Not send `tts_cancel` for it. The request is cancelled and its `request_id` is dead (see [Turn-taking](#7-a-cancelled-request_id-is-permanently-dead)); mint a new one for the next reply.
 
 The user's words from the onset reach the STT (see [The mic hold](#the-mic-hold)) and end with a `turn_end` as usual.
@@ -1080,7 +1080,7 @@ While a reply plays, the mic picks up the speaker, and the STT would transcribe 
 
 - From a reply's `audio_start`, the mic audio is held.
 - The `playback` `start` releases the audio before its `mic_sample` to the STT, in order.
-- From the `start` to the `stop`'s `mic_sample` plus `VM_TYGER_HOLD_TAIL_MS` (default 150 ms, for room echo), the audio is dropped: the STT does not hear the echo of the reply.
+- From the `start` to the `stop`'s `mic_sample` plus `VM_TYGER_HOLD_TAIL_MS` (default 150 ms, for room echo), the audio is dropped: the STT does not hear the echo of the reply. A barge can still come for that audio after the `stop` arrives, so the server holds it until the turn engine has scored the mic audio up to that point, and drops it then if no barge came. If the turn engine is slow, it waits until the mic stream is `VM_TYGER_START_WAIT_MS` past that point at most. Mic audio after that point waits behind it, so the STT gets it a little later (about one hop, 320 ms, plus the turn engine's scoring time).
 - After a `barge`, the held audio goes to the STT from the user's onset (`onset_mic_sample`, at most 4 s before the barge's `mic_sample`), so **the user's speech from the onset is transcribed**, and the audio after it goes on to the STT.
 - With no `start` within `VM_TYGER_START_WAIT_MS` after the reply's `audio_end`, the held audio goes to the STT as if the reply never played. A reply that sent no PCM holds nothing.
 
@@ -1486,7 +1486,7 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_DEVICE` | `auto` | Compute device (`auto`, `cpu`, `cuda`, `cuda:N`); affects latency, not the protocol. |
 | `VM_TURN_ENGINE` | `off` | `tyger` starts the turn engine, which a connection may then [opt in to](#turn-engine); with `off` every opt-in gets `turn_engine_unavailable`. |
 | `VM_TYGER_HOLD_TAIL_MS` | `150` | Turn engine: mic audio up to a `playback` `stop` plus this many ms stays out of the STT. |
-| `VM_TYGER_START_WAIT_MS` | `2000` | Turn engine: with no `playback` `start` this many ms after a reply's `audio_end`, the held mic audio goes to the STT as if the reply never played. |
+| `VM_TYGER_START_WAIT_MS` | `2000` | Turn engine: with no `playback` `start` this many ms after a reply's `audio_end`, the held mic audio goes to the STT as if the reply never played. After a `stop`, it is also the most mic audio past the stop plus the hold tail that the server waits for the turn engine's scoring before it drops the reply's echo. |
 | `VM_TYGER_SILENCE_FALLBACK_MS` | `1200` | Turn engine: this many ms of silence after speech end the turn with `by: "silence"` when the model has not ended it. |
 
 The server has many more `VM_` variables for model selection and tuning

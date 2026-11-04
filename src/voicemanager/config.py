@@ -345,7 +345,9 @@ class Settings(BaseSettings):
     # this tail stays out of the STT (room echo after the last played sample).
     tyger_hold_tail_ms: int = Field(default=150, ge=0)         # VM_TYGER_HOLD_TAIL_MS
     # With no playback start from the client this long after a reply's audio_end, the
-    # hold ends and the held audio goes to the STT, as if the reply never played.
+    # hold ends and the held audio goes to the STT, as if the reply never played. It
+    # also bounds, in mic audio, how long a stopped reply's held audio waits for the
+    # sidecar to score up to the stop plus the tail.
     tyger_start_wait_ms: int = Field(default=2000, gt=0)       # VM_TYGER_START_WAIT_MS
     # Seconds to wait for the sidecar's /health to answer 200 after the spawn.
     tyger_ready_timeout: float = Field(default=180.0, gt=0)    # VM_TYGER_READY_TIMEOUT
