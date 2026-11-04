@@ -946,8 +946,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # An opted-in session copies every mic frame to its turn engine, ahead
                 # of the STT routing (whose idle gate may skip the frame). This only
-                # buffers and queues hops; it never waits on the sidecar.
-                if turn_engine.active:
+                # buffers and queues hops; it never waits on the sidecar. The choice is
+                # made once per frame: a frame that went into the mic hold comes out of
+                # it, even if the turn engine is lost meanwhile (the hold then gives
+                # everything it keeps, in order, before any later frame).
+                via_hold = turn_engine.holds_mic
+                if via_hold:
                     turn_engine.feed_mic(data)
 
                 # Snapshot the open turn as this audio's turn BEFORE transcribing
@@ -990,7 +994,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # it is when nothing is held); any other session's frame goes
                     # straight on.
                     async with stt_lock:
-                        if turn_engine.active:
+                        if via_hold:
                             await _feed_audiocpp_stt(turn_engine.take_stt_audio())
                         else:
                             await _audiocpp_stt_frame(data)

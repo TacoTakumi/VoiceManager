@@ -31,7 +31,7 @@ from voicemanager.transport import turn_engine as te
 from tyger_fake_sidecar import FakeTygerSidecar
 from tyger_ws_kit import (
     TTS_RATE, FakeTTSEngine, ScriptedAudioCppSTT, StandInSidecar, barrier, errors,
-    make_app, opt_in, speak,
+    is_type, make_app, opt_in, recv_until, speak,
 )
 
 HOP = wire.HOP_SAMPLES
@@ -268,6 +268,10 @@ def test_hops_are_dropped_quietly_when_the_sidecar_link_is_down(client, tyger):
         _send_mic(ws, _mic(HOP))
         _hops(tyger, 1)
         tyger.drop(0)
+        # A closed link is a lost turn engine: one error frame says so, and then the
+        # session goes on without it.
+        lost = errors(recv_until(ws, is_type("error")))
+        assert [f["error_type"] for f in lost] == ["turn_engine_lost"]
         _send_mic(ws, _mic(3 * HOP))
         frames = barrier(ws)
         assert errors(frames) == []

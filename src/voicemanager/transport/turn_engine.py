@@ -15,7 +15,8 @@ An opt-in is checked in this order, and the first check that fails answers it:
 2. The connection's STT engine is not audiocpp: ``turn_engine_unsupported``.
 3. The frame itself: malformed (no string ``engine``), an engine name not in
    ``TURN_ENGINES``, sent after the first audio frame, or sent after an earlier
-   opt-in that already got ``turn_engine_ready``: ``invalid_request``.
+   opt-in that already got ``turn_engine_ready`` (also once that turn engine is
+   lost: see "Losing the sidecar"): ``invalid_request``.
 4. The sidecar is configured but not up (starting or restarting), or the
    connection to it fails: ``turn_engine_unavailable``.
 
@@ -168,6 +169,31 @@ utterance under the same lock the handler drives the pipeline with, and then cal
 the turn_end's text, and no other final can slip in between. Without ``end_turn`` the
 session calls ``send_turn_end`` directly. Silero still ends utterances and their finals
 still go out at once; for an opted-in session only turn_end ends the turn.
+
+Losing the sidecar
+------------------
+
+The session's sidecar is lost when its own link to the sidecar closes while the
+session did not close it (the reader ends), or when the sidecar's watcher reports
+that the generation it connected to is gone (``sidecar.add_listener``; the listener
+may run on another thread or loop, so it hands over to the session's loop). Either
+one, whichever comes first, degrades the session once:
+
+* the client gets one error frame of error_type ``turn_engine_lost``;
+* ``active`` turns False, so the handler routes everything as for a connection that
+  never opted in: playback frames are dropped unanswered, and no final is collected;
+* the hold ends: all the mic audio it keeps goes to the STT in order, through
+  ``release_held``, and the handler routes each later frame through the hold for as
+  long as it still keeps audio (``holds_mic``), so no later frame overtakes it; once
+  it is empty, frames go straight to the STT;
+* the TTS audio tap is detached, start-wait timers are cancelled, the hop sender
+  stops and queued hops are dropped;
+* events the sidecar still sends are ignored, and a turn end already under way sends
+  no turn_end frame.
+
+The session stays lost for the life of the connection: a later opt-in on it is
+refused with ``invalid_request``. Once the sidecar is back, a new connection may opt
+in again.
 """
 import asyncio
 import collections
@@ -188,7 +214,8 @@ from voicemanager.pipeline.tyger import wire
 from voicemanager.protocol import (
     BargeMessage, ErrorMessage, PlaybackMessage, TurnEndMessage, TurnEngineMessage,
     TurnEngineReadyMessage,
-    INVALID_REQUEST, TURN_ENGINES, TURN_ENGINE_UNAVAILABLE, TURN_ENGINE_UNSUPPORTED,
+    INVALID_REQUEST, TURN_ENGINES, TURN_ENGINE_LOST, TURN_ENGINE_UNAVAILABLE,
+    TURN_ENGINE_UNSUPPORTED,
 )
 
 logger = logging.getLogger(__name__)
@@ -575,6 +602,11 @@ class MicHold:
         """Mic samples in the hold now."""
         return sum(len(run.pcm) for run in self._runs) // 2
 
+    @property
+    def empty(self) -> bool:
+        """Nothing is in the hold (not even a frame with no samples)."""
+        return not self._runs
+
     def push(self, start: int, raw: bytes, pcm: bytes) -> None:
         """One mic frame: ``raw`` as received, ``pcm`` its samples from mic sample start."""
         self._runs.append(_Held(start=start, pcm=pcm, raw=raw))
@@ -599,6 +631,12 @@ class MicHold:
             self._runs[0] = _Held(start=run.start + cut, pcm=run.pcm[2 * cut:], raw=None)
             if kind == _FEED:
                 out.append(head)
+        return out
+
+    def take_all(self) -> list[bytes]:
+        """Everything in the hold, in order, whatever the replies hold: the hold ends."""
+        out = [run.raw if run.raw is not None else run.pcm for run in self._runs]
+        self._runs.clear()
         return out
 
     def _rules(self, now: int) -> list[tuple[int, float, str]]:
@@ -687,11 +725,28 @@ class TurnEngineSession:
         self._sender: asyncio.Task | None = None
         self._dropping = False        # hops are being dropped on a full queue
         self._tts_session = None      # the connection's TTS session, once attached
+        self._lost = False            # the sidecar was lost: see "Losing the sidecar"
+        self._generation = None       # the sidecar generation the link was opened on
+        self._remove_listener: Callable[[], None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def active(self) -> bool:
-        """The connection opted in and its sidecar link is open."""
-        return self._ws is not None and not self._closed
+        """The connection opted in, its sidecar link is open and it was not lost."""
+        return self._ws is not None and not self._closed and not self._lost
+
+    @property
+    def lost(self) -> bool:
+        """The connection opted in and then lost its sidecar."""
+        return self._lost
+
+    @property
+    def holds_mic(self) -> bool:
+        """The handler routes mic frames through the hold (``feed_mic`` and
+        ``take_stt_audio``): while active, and after a loss until the hold is empty."""
+        if self.active:
+            return True
+        return self._lost and not self._closed and not self._hold.empty
 
     # --- the opt-in frame -----------------------------------------------------------
 
@@ -738,6 +793,10 @@ class TurnEngineSession:
         if audio_started:
             return (INVALID_REQUEST,
                     "A turn_engine frame must come before the first audio frame.")
+        if self._lost:
+            return (INVALID_REQUEST,
+                    "This connection's turn engine was lost; open a new connection to "
+                    "opt in again.")
         if self.engine is not None:
             return (INVALID_REQUEST,
                     "This connection already opted in to a turn engine.")
@@ -821,7 +880,11 @@ class TurnEngineSession:
                              self._label)
 
     def take_stt_audio(self) -> list[bytes]:
-        """The mic audio the STT gets now, in order. Call it under the STT lock."""
+        """The mic audio the STT gets now, in order. Call it under the STT lock.
+
+        After a loss it is everything still in the hold, which ends the hold."""
+        if self._lost:
+            return self._hold.take_all()
         return self._hold.take()
 
     def on_tts_pcm(self, request_id: str, pcm: bytes) -> None:
@@ -833,7 +896,11 @@ class TurnEngineSession:
         """One binary frame of the client's mic stream. Never waits on the sidecar.
 
         The hop feed gets it at once; the STT gets it through ``take_stt_audio``.
+        After a loss (while ``holds_mic``) it only queues behind the held audio.
         """
+        if self._lost:
+            self._hold.push(self._feed.mic_samples, data, data)
+            return
         at = self._feed.mic_samples
         self._hold.push(at, data, self._feed.feed_mic(data))
         self._queue_due_hops()
@@ -885,8 +952,14 @@ class TurnEngineSession:
             self._finals.append((text, turn_id))
 
     async def send_turn_end(self, event: wire.EndpointEvent) -> bool:
-        """Send the turn_end for every final since the previous one; False when none."""
+        """Send the turn_end for every final since the previous one; False when none.
+
+        Nothing goes out once the sidecar is lost."""
         finals, self._finals = self._finals, []
+        if self._lost:
+            logger.debug("Turn end after the turn engine was lost, nothing sent: "
+                         "session=%s", self._label)
+            return False
         if not finals:
             logger.debug("Turn end with no final text, nothing sent: session=%s by=%s "
                          "mic_sample=%s", self._label, event.by, event.mic_sample)
@@ -921,6 +994,11 @@ class TurnEngineSession:
                            self._label, url, exc)
             self._ws = None
             return False
+        self._loop = asyncio.get_running_loop()
+        self._generation = getattr(self._sidecar, "generation", None)
+        add_listener = getattr(self._sidecar, "add_listener", None)
+        if callable(add_listener):
+            self._remove_listener = add_listener(self._on_sidecar_change)
         self._reader = asyncio.create_task(self._read(self._ws),
                                            name=f"turn-engine-reader-{self._label}")
         self._hop_queue = asyncio.Queue(maxsize=MAX_QUEUED_HOPS)
@@ -949,9 +1027,73 @@ class TurnEngineSession:
                         self._label, exc)
         else:
             logger.info("Turn engine sidecar connection ended: session=%s", self._label)
+        # The link closed and this session did not close it (aclose cancels the reader).
+        self._lose("its connection to the turn engine sidecar closed")
+
+    def _on_sidecar_change(self, up: bool, generation: int) -> None:
+        """The sidecar's listener: a loss of the generation this link was opened on."""
+        if up or (self._generation is not None and generation != self._generation):
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        why = "the turn engine sidecar exited"
+        if running is loop:
+            self._lose(why)
+        else:
+            loop.call_soon_threadsafe(self._lose, why)
+
+    def _lose(self, why: str) -> None:
+        """Degrade to a session that never opted in: see "Losing the sidecar"."""
+        if self._lost or self._closed or self._ws is None:
+            return
+        self._lost = True
+        logger.warning("Turn engine lost: session=%s (%s); the session goes on without it",
+                       self._label, why)
+        if self._remove_listener is not None:
+            self._remove_listener()
+            self._remove_listener = None
+        for handle in self._timers:
+            handle.cancel()
+        self._timers.clear()
+        self._finals.clear()
+        tts = self._tts_session
+        if tts is not None and tts.audio_tap is self:
+            tts.audio_tap = None
+        sender, self._sender = self._sender, None
+        self._hop_queue = None
+        if sender is not None:
+            sender.cancel()
+        task = asyncio.get_running_loop().create_task(self._after_loss())
+        self._releases.add(task)
+        task.add_done_callback(self._releases.discard)
+
+    async def _after_loss(self) -> None:
+        """Tell the client, then feed the STT everything the hold keeps, in order."""
+        try:
+            await self._send_error(
+                TURN_ENGINE_LOST,
+                "The turn engine stopped; the session goes on without it (silero "
+                "endpointing, no barge or turn_end frames).")
+        except Exception:
+            logger.debug("Sending turn_engine_lost failed: session=%s", self._label,
+                         exc_info=True)
+        if self._release_held is None or self._hold.empty:
+            return
+        try:
+            await self._release_held()
+        except Exception:
+            logger.exception("Feeding held mic audio to the STT failed: session=%s",
+                             self._label)
 
     async def _dispatch(self, event: wire.Event) -> None:
         logger.debug("Turn engine event: session=%s %s", self._label, event)
+        if self._lost:
+            return  # the session goes on as one that never opted in
         if isinstance(event, wire.BargeEvent):
             await self._on_barge(event)
         elif isinstance(event, wire.EndpointEvent):
@@ -1000,6 +1142,9 @@ class TurnEngineSession:
         if self._closed:
             return
         self._closed = True
+        if self._remove_listener is not None:
+            self._remove_listener()
+            self._remove_listener = None
         for handle in self._timers:
             handle.cancel()
         self._timers.clear()

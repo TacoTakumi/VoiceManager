@@ -77,6 +77,32 @@ class StandInSidecar:
         return f"{self.url}?{urllib.parse.urlencode({'session': label})}"
 
 
+class ListeningSidecar(StandInSidecar):
+    """A StandInSidecar that also has the watcher's side: generation and listeners.
+
+    ``lose()`` reports a loss the way TygerSidecar's watcher does, from the calling
+    thread (a test thread, not the app's event loop).
+    """
+
+    def __init__(self, url: str, up: bool = True, generation: int = 1) -> None:
+        super().__init__(url, up)
+        self.generation = generation
+        self.listeners: list = []
+
+    def add_listener(self, listener):
+        self.listeners.append(listener)
+
+        def remove() -> None:
+            if listener in self.listeners:
+                self.listeners.remove(listener)
+        return remove
+
+    def lose(self) -> None:
+        self.up = False
+        for listener in list(self.listeners):
+            listener(False, self.generation)
+
+
 class ScriptedAudioCppSTT:
     """A stand-in for AudioCppSTTPipeline: each fed frame gives one interim and one
     final on its own segment, whatever the timing."""
