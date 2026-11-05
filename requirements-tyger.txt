@@ -25,3 +25,8 @@ librosa==1.0.0
 fastapi
 uvicorn
 websockets
+
+# The experimental pre-filter (VM_TYGER_PREFILTER=voxlock) runs VoxLock's ONNX models on
+# the GPU. The cuda and cudnn extras install the CUDA 12 libraries this build loads,
+# which torch's CUDA 13 build does not ship. Unused while the pre-filter is off.
+onnxruntime-gpu[cuda,cudnn]==1.31.1

@@ -15,7 +15,8 @@ requirements.txt covers only the default audiocpp engines. When an engine needs
 packages from its requirements-<engine>.txt that are missing, this script asks
 before it installs them, and only prints the pip command when stdin is not a TTY.
 The Tyger sidecar runs from its own environment (requirements-tyger.txt), so the
-tyger target only downloads and checks the bundle; it needs nothing beyond the core.
+tyger target only downloads and checks the bundle (and, with VM_TYGER_PREFILTER=voxlock,
+the pre-filter's VoxLock models); it needs nothing beyond the core.
 """
 import argparse
 import hashlib
@@ -39,6 +40,11 @@ AUDIOCPP_GGUF_REPO = "audio-cpp/audio.cpp-gguf"
 # The files of the Tyger bundle the sidecar loads: the weights, the config that
 # describes them and carries the checksums, and nemotron's config and tokenizer.
 TYGER_FILES = ["config.json", "model.safetensors", "nemotron/*.json"]
+# The experimental pre-filter's VoxLock models (VM_TYGER_PREFILTER=voxlock), fp32, at the
+# revision the vendored filter in the sidecar is written for.
+VOXLOCK_REPO = "arbazsiddiqui/voxlock"
+VOXLOCK_REVISION = "2413b292bc2c337bfc19a9802aaf3e011e68e9c4"
+VOXLOCK_FILES = ["onnx/v2/enroll.onnx", "onnx/v2/chunk.onnx"]
 
 # Setup target for each configured engine. None means the engine has no setup step.
 STT_TARGETS = {"audiocpp": "audiocpp-stt", "whisper": "whisper", "nemotron": None, "qwen": None}
@@ -228,6 +234,22 @@ def setup_tyger():
     except ValueError as e:
         sys.exit(f"tyger: {e}")
     print(f"Tyger bundle ready in {folder}\n")
+    if settings.tyger_prefilter == "voxlock":
+        setup_voxlock()
+
+
+def setup_voxlock():
+    """Download the experimental pre-filter's VoxLock models into the Hugging Face cache."""
+    print(f"--- Setting up the pre-filter: {VOXLOCK_REPO} at revision {VOXLOCK_REVISION} ---")
+    try:
+        folder = Path(snapshot_download(repo_id=VOXLOCK_REPO, revision=VOXLOCK_REVISION,
+                                        allow_patterns=VOXLOCK_FILES))
+    except (RepositoryNotFoundError, GatedRepoError) as e:
+        sys.exit(f"tyger: cannot download {VOXLOCK_REPO}: {e}")
+    missing = [name for name in VOXLOCK_FILES if not (folder / name).is_file()]
+    if missing:
+        sys.exit(f"tyger: the pre-filter models {', '.join(missing)} are missing from {folder}")
+    print(f"Pre-filter models ready in {folder}\n")
 
 
 def _setup_voice_presets():

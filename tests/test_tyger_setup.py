@@ -215,3 +215,71 @@ def test_requirements_cover_the_scorer_and_the_sidecar_server():
     for needed in ("torch", "transformers", "safetensors", "huggingface_hub", "numpy",
                    "librosa", "fastapi", "uvicorn", "websockets"):
         assert needed in names, needed
+
+
+# --- the experimental pre-filter's models --------------------------------------------
+
+VOXLOCK_REPO = "arbazsiddiqui/voxlock"
+VOXLOCK_REVISION = "2413b292bc2c337bfc19a9802aaf3e011e68e9c4"
+VOXLOCK_FILES = ["onnx/v2/chunk.onnx", "onnx/v2/enroll.onnx"]
+
+
+@pytest.fixture
+def fake_both(setup_models, monkeypatch, tmp_path):
+    """snapshot_download for the Tyger bundle and the VoxLock models; the calls it got."""
+    bundle = _make_bundle(tmp_path / "snapshot")
+    models = tmp_path / "voxlock"
+    for name in VOXLOCK_FILES:
+        (models / name).parent.mkdir(parents=True, exist_ok=True)
+        (models / name).write_bytes(b"onnx")
+    calls = []
+
+    def fake_snapshot_download(*args, **kwargs):
+        calls.append(kwargs)
+        return str(models if kwargs.get("repo_id") == VOXLOCK_REPO else bundle)
+    monkeypatch.setattr(setup_models, "snapshot_download", fake_snapshot_download)
+    return models, calls
+
+
+def _prefilter_on(setup_models, monkeypatch):
+    monkeypatch.setattr(setup_models, "get_settings", lambda: Settings(
+        _env_file=None, tyger_prefilter="voxlock"))
+
+
+def test_with_the_prefilter_off_only_the_tyger_bundle_is_fetched(setup_models, fake_both):
+    _models, calls = fake_both
+    setup_models.setup_tyger()
+    assert [c["repo_id"] for c in calls] == [PINNED_REPO]
+
+
+def test_with_the_prefilter_on_the_two_fp32_models_are_fetched_at_the_pinned_revision(
+        setup_models, fake_both, monkeypatch):
+    _models, calls = fake_both
+    _prefilter_on(setup_models, monkeypatch)
+    setup_models.setup_tyger()
+    vox = [c for c in calls if c["repo_id"] == VOXLOCK_REPO]
+    assert len(vox) == 1
+    assert vox[0]["revision"] == VOXLOCK_REVISION
+    assert sorted(vox[0]["allow_patterns"]) == VOXLOCK_FILES
+
+
+def test_a_missing_prefilter_model_fails_the_setup_naming_it(setup_models, fake_both, monkeypatch):
+    models, _calls = fake_both
+    (models / "onnx/v2/chunk.onnx").unlink()
+    _prefilter_on(setup_models, monkeypatch)
+    with pytest.raises(SystemExit) as err:
+        setup_models.setup_tyger()
+    assert "chunk.onnx" in str(err.value)
+
+
+def test_setup_models_pins_the_same_models_as_the_sidecar(setup_models):
+    from voicemanager.pipeline.tyger import voxlock
+    assert setup_models.VOXLOCK_REPO == voxlock.REPO
+    assert setup_models.VOXLOCK_REVISION == voxlock.REVISION
+    assert tuple(setup_models.VOXLOCK_FILES) == voxlock.FILES
+
+
+def test_requirements_pin_onnxruntime_gpu_with_its_cuda_and_cudnn_extras():
+    pins = [line for line in _requirement_lines() if line.lower().startswith("onnxruntime")]
+    assert len(pins) == 1, pins
+    assert re.fullmatch(r"onnxruntime-gpu\[cuda,\s*cudnn\]==\d+\.\d+\.\d+", pins[0]), pins[0]
