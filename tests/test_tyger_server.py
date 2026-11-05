@@ -335,3 +335,81 @@ def test_main_passes_torch_threads_to_the_scorer_load(monkeypatch):
     assert seen["ran"] is True
     assert seen["load_scorer"]() == "loaded"
     assert seen["load"] == (server.DEFAULT_MODEL, "abc", "cpu", 3)
+
+
+# --- the experimental pre-filter, through the sidecar app -------------------------------
+
+class _RecordingSession:
+    def __init__(self, store):
+        self.store = store
+
+    def reset(self):
+        pass
+
+    def score_hop(self, user, agent, mode):
+        from voicemanager.pipeline.tyger.scorer import FrameScore
+        self.store.append((bytes(user), bytes(agent), mode))
+        return iter([FrameScore(0.0, 0.0, -90.0)] * 4)
+
+
+class _RecordingScorer:
+    name = "recording"
+
+    def __init__(self):
+        self.hops = []
+
+    def new_session(self, key, index):
+        return _RecordingSession(self.hops)
+
+
+class _SilentFactory:
+    """Enrolls at once into a filter that outputs silence, 384 samples late."""
+
+    def enroll(self, sample):
+        import numpy as np
+
+        class _F:
+            delay = 384
+
+            def push(self, samples):
+                return np.zeros(len(samples), np.float32)
+        return _F()
+
+
+def _feed_app(prefilter_factory):
+    import numpy as np
+    from fastapi.testclient import TestClient
+    from voicemanager.pipeline.tyger import server
+    rec = _RecordingScorer()
+    app = server.create_app(turn_scorer=rec, prefilter_factory=prefilter_factory)
+    rng = np.random.default_rng(5)
+    voiced = lambda: (rng.uniform(-0.1, 0.1, wire.HOP_SAMPLES) * 32768).astype("<i2").tobytes()
+    agent = (rng.uniform(-0.3, 0.3, wire.HOP_SAMPLES) * 32768).astype("<i2").tobytes()
+    sent = []
+    for i in range(12):        # 3.84 s of voice while listening: enough to enroll
+        sent.append((voiced(), bytes(wire.HOP_SAMPLES * 2), wire.MODE_LISTENING))
+    for i in range(3):
+        sent.append((voiced(), agent, wire.MODE_SPEAKING))
+    # With progress lines every hop gets an answer once it is scored.
+    with TestClient(app) as client, \
+            client.websocket_connect(f"/tyger?session=p&{wire.PROGRESS_PARAM}=1") as ws:
+        ws.receive_text()
+        for k, (u, a, m) in enumerate(sent):
+            ws.send_bytes(wire.pack_hop(m, (k + 1) * wire.HOP_SAMPLES, u, a))
+            ws.receive_text()
+    return sent, rec.hops
+
+
+def test_with_no_prefilter_the_scorer_sees_every_hop_as_sent():
+    sent, seen = _feed_app(None)
+    assert seen == sent
+
+
+def test_with_a_prefilter_speaking_hops_reach_the_scorer_filtered_with_a_silent_agent():
+    sent, seen = _feed_app(_SilentFactory())
+    assert len(seen) == len(sent)
+    assert seen[:12] == sent[:12]                  # listening hops: unchanged
+    for (u, a, m), (su, _sa, _sm) in zip(seen[12:], sent[12:]):
+        assert m == wire.MODE_SPEAKING
+        assert a == bytes(wire.HOP_SAMPLES * 2)
+        assert u != su and len(u) == wire.HOP_SAMPLES * 2

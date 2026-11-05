@@ -45,7 +45,7 @@ from typing import Any, Callable
 _HERE = Path(__file__).resolve().parent
 
 if __package__:
-    from . import rules, scorer, wire
+    from . import prefilter, rules, scorer, wire
 else:
     # Run as a script: sys.path[0] is this directory, where wire.py and rules.py
     # would import as top-level modules of their own. Load the directory as the
@@ -57,6 +57,7 @@ else:
             "tyger", _HERE / "__init__.py", submodule_search_locations=[str(_HERE)])
         sys.modules["tyger"] = _pkg = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_pkg)
+    import tyger.prefilter as prefilter
     import tyger.rules as rules
     import tyger.scorer as scorer
     import tyger.wire as wire
@@ -102,6 +103,17 @@ class Session:
         self.hops = 0
 
 
+def session_scorer(inner: "scorer.SessionScorer", key: str,
+                   prefilter_factory: "prefilter.FilterFactory | None",
+                   floor_db: float, voice_gate_db: float) -> "scorer.SessionScorer":
+    """The scorer a new session uses: ``inner`` itself, or ``inner`` behind the
+    experimental pre-filter when a filter factory is given."""
+    if prefilter_factory is None:
+        return inner
+    return prefilter.PrefilterSessionScorer(inner, prefilter_factory, floor_db=floor_db,
+                                            voice_gate_db=voice_gate_db, key=key)
+
+
 def process_hop(session: Session, hop: "wire.Hop") -> list:
     """Score one hop and run its frames through the session's rules -> its events.
 
@@ -133,8 +145,14 @@ def process_hop(session: Session, hop: "wire.Hop") -> list:
 def create_app(settings: "rules.TurnRuleSettings | None" = None,
                turn_scorer: "scorer.Scorer | None" = None,
                load_scorer: "Callable[[], scorer.Scorer] | None" = None,
-               on_load_error: Callable[[], None] | None = None) -> FastAPI:
+               on_load_error: Callable[[], None] | None = None,
+               prefilter_factory: "prefilter.FilterFactory | None" = None,
+               prefilter_floor_db: float = -52.0) -> FastAPI:
     """Build the sidecar app.
+
+    With ``prefilter_factory`` given, every new session's scorer sits behind the
+    experimental pre-filter, with noise at ``prefilter_floor_db``; without it the
+    scorer sees each hop as it came.
 
     With ``turn_scorer`` given it is served at once. Otherwise the lifespan runs
     ``load_scorer`` on the scoring thread and /health answers 503 until it is
@@ -182,7 +200,9 @@ def create_app(settings: "rules.TurnRuleSettings | None" = None,
             return
         key = ws.query_params.get("session") or str(index)
         progress = ws.query_params.get(wire.PROGRESS_PARAM) == "1"
-        session = Session(key, rules.TurnRules(rule_settings), active.new_session(key, index))
+        session = Session(key, rules.TurnRules(rule_settings),
+                          session_scorer(active.new_session(key, index), key, prefilter_factory,
+                                         prefilter_floor_db, rule_settings.voice_gate_db))
         app.state.sessions += 1
         logger.info("session %s opened", key)
         try:
