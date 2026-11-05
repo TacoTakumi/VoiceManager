@@ -170,3 +170,37 @@ def test_the_changelog_records_the_turn_engine_under_a_minor_release():
 def test_the_docs_are_ascii(name, text):
     bad = [n for n, line in enumerate(text.splitlines(), 1) if not line.isascii()]
     assert not bad, f"{name}: non-ASCII on lines {bad}"
+
+
+# --- the experimental pre-filter ---------------------------------------------------------
+
+ENV_EXAMPLE = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+CHANGELOG = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+PREFILTER_HEADING = "### Barge-in on speakers: the experimental pre-filter"
+
+
+@pytest.mark.parametrize("name", ["VM_TYGER_PREFILTER", "VM_TYGER_PREFILTER_FLOOR_DB"])
+def test_the_prefilter_settings_are_documented_as_experimental(name):
+    env_block = ENV_EXAMPLE[ENV_EXAMPLE.index("# Experimental pre-filter"):]
+    assert f"# {name}=" in env_block
+    guide = section(turn_engine_section(), PREFILTER_HEADING)
+    assert name in guide or name in README
+    for text in (env_block, guide, README):
+        assert "xperimental" in text
+
+
+def test_the_guide_says_how_the_prefilter_enrolls_and_when_it_filters():
+    guide = section(turn_engine_section(), PREFILTER_HEADING)
+    assert "first 3 s" in guide and "while a reply plays" in guide
+    assert "nothing from the client" in guide
+
+
+def test_the_readme_names_the_install_and_the_setup_step():
+    assert "onnxruntime-gpu" in README and "python setup_models.py tyger" in README
+    assert "VM_TYGER_PREFILTER=voxlock" in README
+
+
+def test_the_changelog_has_the_prefilter_under_the_next_version():
+    newest = CHANGELOG[CHANGELOG.index("## ["):]
+    newest = newest[:newest.index("## [", 4)]
+    assert "VM_TYGER_PREFILTER" in newest and "xperimental" in newest

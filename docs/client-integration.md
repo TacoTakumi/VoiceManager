@@ -935,6 +935,12 @@ client -> clears its playback, then { "type": "playback", "event": "stop", ... }
 
 For a complete client, see `scripts/voice_agent.py classic --turn-engine tyger`. It opts in, sends the `playback` frames, ends a turn on `turn_end` and clears its playback on a `barge`.
 
+### Barge-in on speakers: the experimental pre-filter
+
+On speakers the mic hears the reply as well as the user. Tyger compares the mic with the reply it is told is playing, which keeps the reply's echo from counting as a barge, but it also scores the user's own speech low while it overlaps the reply. On a speakers call a barge in the middle of a long reply may then not fire. On headphones it does.
+
+`VM_TYGER_PREFILTER=voxlock` is an experimental server setting for that case. It changes nothing in the protocol and needs nothing from the client. The server learns the user's voice from the first 3 s of speech it hears on the connection while no reply plays. From then on, while a reply plays, Tyger hears only that voice, filtered out of the mic by a target-speaker model (VoxLock), with noise added at `VM_TYGER_PREFILTER_FLOOR_DB`. While no reply plays, Tyger hears the mic as before. Until the server has those 3 s, the connection works exactly as without the setting. The filter assumes one speaker at the mic, and its first seconds of speech should be that speaker.
+
 ### Opting in
 
 Send one `turn_engine` frame after the `ready` handshake and **before the first audio frame** of the connection. The server answers with `turn_engine_ready`, or with one `error` frame. No answer closes the socket. The server checks the opt-in in this order and the first check that fails gives the answer:
@@ -1487,6 +1493,7 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_AUDIOCPP_TTS_START_BUFFER_MS` | `250` | audiocpp `tts_stream`: the first audio of each engine request is held until this many ms are in hand and sent as one chunk. Adds up to this much to the first audio of each piece. `0` sends every chunk on arrival. |
 | `VM_DEVICE` | `auto` | Compute device (`auto`, `cpu`, `cuda`, `cuda:N`); affects latency, not the protocol. |
 | `VM_TURN_ENGINE` | `off` | `tyger` starts the turn engine, which a connection may then [opt in to](#turn-engine); with `off` every opt-in gets `turn_engine_unavailable`. |
+| `VM_TYGER_PREFILTER` | `off` | Experimental. `voxlock` filters the mic to the user's voice for the turn engine while a reply plays, for barge-in on speakers. See [Barge-in on speakers](#barge-in-on-speakers-the-experimental-pre-filter). |
 | `VM_TYGER_HOLD_TAIL_MS` | `150` | Turn engine: mic audio up to a `playback` `stop` plus this many ms stays out of the STT. |
 | `VM_TYGER_START_WAIT_MS` | `2000` | Turn engine: with no `playback` `start` this many ms after a reply's `audio_end`, the held mic audio goes to the STT as if the reply never played. After a `stop`, it is also the most mic audio past the stop plus the hold tail that the server waits for the turn engine's scoring before it drops the reply's echo. |
 | `VM_TYGER_SILENCE_FALLBACK_MS` | `1200` | Turn engine: this many ms of silence after speech end the turn with `by: "silence"` when the model has not ended it. |

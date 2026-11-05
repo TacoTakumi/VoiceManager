@@ -4,6 +4,22 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0]
+
+### Added
+
+- Experimental: barge-in on speakers with the Tyger turn engine.
+  `VM_TYGER_PREFILTER=voxlock` puts a target-speaker filter (VoxLock) in the
+  Tyger sidecar. Each connection learns the user's voice from its first 3 s of
+  speech while no reply plays; from then on, while a reply plays, Tyger hears that
+  voice filtered out of the mic, plus noise at `VM_TYGER_PREFILTER_FLOOR_DB`
+  (default -52 dBFS), and no reply channel, so a barge in the middle of a reply
+  on speakers is heard as on headphones. Off by default; no protocol change. It
+  needs `onnxruntime-gpu` (now in `requirements-tyger.txt`) and runs on the
+  sidecar's GPU only; `python setup_models.py tyger` fetches its models when the
+  setting is on. The VoxLock code is adapted from voxlock 1.3.0 and ships with its
+  Apache-2.0 `LICENSE` and a `NOTICE`.
+
 ## [0.5.1]
 
 ### Changed
