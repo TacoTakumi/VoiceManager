@@ -96,6 +96,11 @@ class TygerSidecar:
         rule_args: list[str] = []
         for flag, field in RULE_ARGUMENTS:
             rule_args += [flag, str(getattr(settings, field))]
+        # The experimental pre-filter is passed only when it is on, so a sidecar
+        # launched with it off gets today's command line.
+        if settings.tyger_prefilter != "off":
+            rule_args += ["--prefilter", settings.tyger_prefilter,
+                          "--prefilter-floor-db", str(settings.tyger_prefilter_floor_db)]
         return cls(python=settings.tyger_py, port=settings.tyger_port, device=device,
                    model=settings.tyger_model, revision=settings.tyger_revision,
                    rule_args=rule_args, ready_timeout_s=settings.tyger_ready_timeout)

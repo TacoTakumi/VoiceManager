@@ -298,6 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
     for flag, field, kind, text in RULE_FLAGS:
         parser.add_argument(flag, dest=field, type=kind, default=getattr(defaults, field),
                             help=f"{text} (default {getattr(defaults, field)})")
+    parser.add_argument("--prefilter", choices=("off", "voxlock"), default="off",
+                        help="experimental: filter the user channel to the enrolled "
+                             "voice while a reply plays (default off)")
+    parser.add_argument("--prefilter-floor-db", type=float, default=-52.0,
+                        help="noise level (dBFS) added to the filtered user channel "
+                             "(default -52.0)")
     parser.add_argument("--log-level", default="info")
     return parser
 

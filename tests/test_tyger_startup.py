@@ -164,6 +164,28 @@ def test_the_rule_values_match_the_sidecar_scripts_flags():
         assert f'"{flag}"' in text, flag
 
 
+def test_no_prefilter_flag_is_passed_while_the_prefilter_is_off():
+    cmd = TygerSidecar.from_settings(_settings(), device="cpu").command()
+    assert not [a for a in cmd if a.startswith("--prefilter")]
+
+
+def test_the_prefilter_and_its_floor_are_passed_when_it_is_on():
+    settings = _settings(tyger_prefilter="voxlock", tyger_prefilter_floor_db=-47.0)
+    cmd = TygerSidecar.from_settings(settings, device="cuda:3").command()
+    assert cmd[cmd.index("--prefilter") + 1] == "voxlock"
+    assert float(cmd[cmd.index("--prefilter-floor-db") + 1]) == -47.0
+
+
+def test_the_prefilter_flags_are_ones_the_sidecar_script_knows():
+    text = REAL_SCRIPT.read_text()
+    settings = _settings(tyger_prefilter="voxlock")
+    cmd = TygerSidecar.from_settings(settings, device="cpu").command()
+    flags = [a for a in cmd[2:] if a.startswith("--prefilter")]
+    assert flags == ["--prefilter", "--prefilter-floor-db"]
+    for flag in flags:
+        assert f'"{flag}"' in text, flag
+
+
 # --- failures name the setting -------------------------------------------------------
 
 def test_missing_interpreter_fails_naming_the_setting(fake_sidecar, tmp_path):

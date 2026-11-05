@@ -187,6 +187,33 @@ def test_env_example_lists_every_turn_engine_key():
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     names = [name for name in Settings.model_fields
              if name == "turn_engine" or name.startswith("tyger_")]
-    assert len(names) == 17
+    assert len(names) == 19
     for name in names:
         assert f"# VM_{name.upper()}=" in text, name
+
+
+# --- the experimental pre-filter -------------------------------------------------------
+
+def test_the_prefilter_is_off_by_default_with_a_floor_of_minus_52_db():
+    s = _settings()
+    assert s.tyger_prefilter == "off"
+    assert s.tyger_prefilter_floor_db == -52.0
+
+
+def test_the_prefilter_settings_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("VM_TYGER_PREFILTER", "voxlock")
+    monkeypatch.setenv("VM_TYGER_PREFILTER_FLOOR_DB", "-48.5")
+    s = _settings()
+    assert s.tyger_prefilter == "voxlock"
+    assert s.tyger_prefilter_floor_db == -48.5
+
+
+@pytest.mark.parametrize("field, value, env_name", [
+    ("tyger_prefilter", "speex", "VM_TYGER_PREFILTER"),
+    ("tyger_prefilter_floor_db", 3.0, "VM_TYGER_PREFILTER_FLOOR_DB"),
+])
+def test_a_bad_prefilter_value_is_refused_naming_the_setting(field, value, env_name, monkeypatch):
+    monkeypatch.setenv(env_name, str(value))
+    with pytest.raises(ValidationError) as err:
+        _settings()
+    assert field in str(err.value)

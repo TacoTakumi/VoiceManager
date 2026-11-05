@@ -351,6 +351,13 @@ class Settings(BaseSettings):
     tyger_start_wait_ms: int = Field(default=2000, gt=0)       # VM_TYGER_START_WAIT_MS
     # Seconds to wait for the sidecar's /health to answer 200 after the spawn.
     tyger_ready_timeout: float = Field(default=180.0, gt=0)    # VM_TYGER_READY_TIMEOUT
+    # Experimental. "voxlock" puts a target-speaker filter in the sidecar in front of
+    # Tyger, for barge-in on speakers: each session learns the user's voice from its
+    # first 3 s of speech while no reply plays, and from then on, while a reply plays,
+    # Tyger hears the filtered mic with noise added at the floor level below, and a
+    # silent agent channel. The filter needs the sidecar's extra install and setup.
+    tyger_prefilter: Literal["off", "voxlock"] = Field(default="off")  # VM_TYGER_PREFILTER
+    tyger_prefilter_floor_db: float = Field(default=-52.0, le=0.0)  # VM_TYGER_PREFILTER_FLOOR_DB (dBFS)
 
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
