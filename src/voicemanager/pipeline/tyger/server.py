@@ -352,13 +352,26 @@ def main(argv: list[str] | None = None) -> None:
             return scorer.TygerScorer.load(args.model, args.revision, args.device,
                                            threads=args.torch_threads)
 
+    prefilter_factory = None
+    if args.prefilter == "voxlock":
+        # Loaded before the server answers /health, so a pre-filter that cannot run
+        # stops the sidecar at startup instead of serving without it.
+        voxlock = importlib.import_module(".voxlock", rules.__package__)
+        try:
+            prefilter_factory = voxlock.VoxLockFactory.load(args.device)
+        except Exception as exc:
+            logger.error("The pre-filter cannot start: %s", exc)
+            sys.exit(1)
+        logger.info("pre-filter VoxLock loaded on %s (CUDA provider)", args.device)
+
     server: Any = None
 
     def stop() -> None:
         server.should_exit = True
 
     app = create_app(settings, turn_scorer=turn_scorer, load_scorer=load_scorer,
-                     on_load_error=stop)
+                     on_load_error=stop, prefilter_factory=prefilter_factory,
+                     prefilter_floor_db=args.prefilter_floor_db)
     server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port,
                                            log_level=args.log_level))
     server.run()

@@ -1,0 +1,28 @@
+VoiceManager - VoxLock pre-filter
+
+__init__.py in this directory is adapted from voxlock 1.3.0 by Arbaz Siddiqui
+(https://github.com/arbazsiddiqui/voxlock, voxlock/core.py), which is licensed
+under the Apache License, Version 2.0. A copy of that licence is in the LICENSE
+file next to this notice.
+
+The streaming overlap-add, the window, the output gain and the ONNX session
+inputs are taken from voxlock/core.py. They were modified for VoiceManager: only
+the fp32 models are used, the sessions run on the CUDA provider only, and the
+download code, file mode, live mode, CLI and precision choices were left out.
+
+The model files are not part of VoiceManager. They are downloaded from
+https://huggingface.co/arbazsiddiqui/voxlock at revision
+2413b292bc2c337bfc19a9802aaf3e011e68e9c4 by `python setup_models.py tyger`.
+
+Upstream notice (the voxlock repository, NOTICE):
+
+  VoxLock
+  Copyright 2026 Arbaz Siddiqui
+
+  The VoxLock model weights are fine-tuned from the REAL-TSE
+  tfmap_context_causal_100 baseline checkpoint, trained by Ke Zhang and
+  released through the REAL-TSE WeSep project
+  (https://github.com/REAL-TSE/wesep-real-tse). Ke Zhang has confirmed that the
+  inference code he wrote and the parameters he trained are available under
+  Apache-2.0. This notice is attribution only and does not imply endorsement by
+  the REAL-TSE organizers.
