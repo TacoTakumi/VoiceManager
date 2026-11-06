@@ -514,11 +514,20 @@ def test_a_room_over_the_configured_gate_ends_turns_by_silence_after_calibration
     assert run(room + speech + quiet + _room([-49.0] * 200), pinned) == []
 
 
-def test_turn_ends_and_mode_changes_keep_the_calibrated_gate():
+def test_turn_ends_mode_changes_and_barges_keep_the_calibrated_gate():
+    # Calibrated on a -49 dB room: gate -41 dB. Every later listening run is a
+    # -60 dB room, which would calibrate to the -50 dB floor if calibration restarted.
     engine = TurnRules()
-    events = run(_room([-49.0] * 25) + listen(10) + _room([-49.0] * 20), engine=engine)
+    later = _room([-60.0] * 30)
+    run(_room([-49.0] * 25), engine=engine)
+    assert engine.voice_gate_db == pytest.approx(-41.0)
+    events = run(listen(10) + _room([-49.0] * 20) + later, engine=engine)  # a silence turn end
     assert any(e.by == "silence" for _i, e in events)
-    run(speak(10) + _room([-49.0] * 30), engine=engine)
+    assert engine.voice_gate_db == pytest.approx(-41.0)
+    run(speak(10) + later, engine=engine)                                   # a reply, no barge
+    assert engine.voice_gate_db == pytest.approx(-41.0)
+    events = run(speak(6) + speak(4, yld=0.9, db=VOICED) + later, engine=engine)  # a barge
+    assert any(isinstance(e, BargeEvent) for _i, e in events)
     assert engine.voice_gate_db == pytest.approx(-41.0)
 
 
