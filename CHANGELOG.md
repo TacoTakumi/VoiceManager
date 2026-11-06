@@ -26,6 +26,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   3 s voice sample only after the gate is calibrated, and only from audio above
   that gate, so it no longer learns room noise. The order on a connection is:
   calibrate the gate, learn the voice, then allow barge-in.
+- The README's server-side barge-in steps now say what to expect on speakers
+  (calibration, then the voice sample, then barge-in), the hardware it was tested
+  with, and how to record a session and replay it offline.
 
 ### Fixed
 

@@ -265,6 +265,8 @@ The server can detect when the user cuts in over a reply and stop the reply itse
 
 Each client must opt in with a `turn_engine` frame before its first audio and report when each reply starts and stops playing. See [Turn engine](docs/client-integration.md#turn-engine). `scripts/voice_agent.py classic --turn-engine tyger` is a client that does this.
 
+What to expect on speakers. At the start of each connection the server measures the room for 2 s and sets the voice gate from it. Then it learns the user's voice from 3 s of speech heard while no reply plays. Barge-in works only after that, so the user cannot cut into the first reply of a session that opens with the agent speaking. It has been tested with an Anker PowerConf A3301 USB speakerphone, and with a USB mic beside desktop speakers. On headphones the pre-filter is not needed. To look into a bad session, record it with `scripts/voice_agent.py classic --turn-engine tyger --capture`, then replay the capture offline with `venv-tyger/bin/python scripts/tyger_prefilter_check.py runs/classic/<stamp>` (it needs the GPU and the VoxLock models). The replay prints the calibrated gate, when the voice was learned, and each barge.
+
 ## Users and tokens
 
 Clients authenticate with a bearer token in the `Authorization: Bearer <token>` header. Each token belongs to a user. The server keeps users and tokens in a SQLite file (`VM_DB_PATH`) and stores only the SHA-256 of each token.
