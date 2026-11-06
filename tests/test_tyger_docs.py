@@ -204,3 +204,13 @@ def test_the_changelog_has_the_prefilter_under_the_next_version():
     newest = CHANGELOG[CHANGELOG.index("## ["):]
     newest = newest[:newest.index("## [", 4)]
     assert "VM_TYGER_PREFILTER" in newest and "xperimental" in newest
+
+
+@pytest.mark.parametrize("name", ["VM_TYGER_GATE_MARGIN_DB", "VM_TYGER_GATE_MAX_DB"])
+def test_the_calibrated_gate_settings_are_documented(name):
+    assert name in README and name in GUIDE
+    assert f"# {name}=" in ENV_EXAMPLE
+    newest = CHANGELOG[CHANGELOG.index("## ["):]
+    newest = newest[:newest.index("## [", 4)]
+    assert name in newest
+

@@ -4,7 +4,28 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.1]
+## [0.7.0]
+
+### Added
+
+- `VM_TYGER_GATE_MARGIN_DB` (default 8 dB) and `VM_TYGER_GATE_MAX_DB` (default
+  -38 dBFS): the margin and the cap of the calibrated voice gate below.
+
+### Changed
+
+- The Tyger turn engine calibrates its voice gate per connection. Each session
+  measures the room from its first 2 s of mic audio heard while no reply plays,
+  and sets its gate to the room level plus `VM_TYGER_GATE_MARGIN_DB`, no lower
+  than `VM_TYGER_VOICE_GATE_DB` and no higher than `VM_TYGER_GATE_MAX_DB`.
+  `VM_TYGER_VOICE_GATE_DB` (default -50 dBFS) is now the gate before calibration
+  and the lowest gate. On the mics tested the room sat at -50 to -52 dBFS, so the
+  fixed -50 dBFS gate rarely saw silence and a turn could wait 20 s or more for
+  the silence fallback. To pin a fixed gate as before, set the margin to 0 and the
+  max to the gate.
+- Experimental pre-filter (`VM_TYGER_PREFILTER=voxlock`): the session takes its
+  3 s voice sample only after the gate is calibrated, and only from audio above
+  that gate, so it no longer learns room noise. The order on a connection is:
+  calibrate the gate, learn the voice, then allow barge-in.
 
 ### Fixed
 
