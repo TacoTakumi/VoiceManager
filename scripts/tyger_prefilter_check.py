@@ -11,11 +11,15 @@ Each CALL is a capture prefix of ``scripts/voice_agent.py ... --capture`` (the f
 <prefix>-mic.wav, <prefix>-out.wav and <prefix>-capture.json).
 
 For each call the mic is cut into 320 ms hops. The output is placed on the mic's
-clock at (first DAC time - first ADC time), and a hop is in speaking mode while the
-placed output had an 80 ms frame above -60 dB in the last 0.8 s, as in the offline
-replay harness. Every hop goes through the sidecar's own session code (the turn
-rules, the pre-filter wrapper with self-enrollment, the real Tyger scorer and the
-real VoxLock filter), in order, on one thread, as the sidecar runs it.
+clock at (first DAC time - first ADC time). When the capture holds the client's
+playback frames (``edges`` in the capture JSON, as LLMaster writes them), a hop is in
+speaking mode while it overlaps a played span from a start to its stop, as the
+server places it, and the agent channel is silent outside those spans. Otherwise a
+hop is in speaking mode while the placed output had an 80 ms frame above -60 dB in
+the last 0.8 s, as in the offline replay harness. Every hop goes through the sidecar's own session code (the turn
+rules with their calibrated voice gate, the pre-filter wrapper reading that gate
+for its self-enrollment, the real Tyger scorer and the real VoxLock filter), in
+order, on one thread, as the sidecar runs it.
 
 The user's speech is marked on 80 ms frames in two ways: the raw mic more than 9 dB
 over the echo the placed output predicts at the call's median echo return, or
@@ -23,7 +27,7 @@ VoxLock's own output over the frame above -35 dB. A mid-reply span is a run of a
 least 4 such frames while the output still plays. Printed per call: each mid-reply
 span with its highest debounced yield (the lower of two frames in a row) in the
 span and the 0.4 s after it, each barge with whether user speech was marked in the
-0.6 s before it, when the session enrolled, the per-hop time and the GPU memory of
+0.6 s before it, the calibrated gate, when the session enrolled, the per-hop time and the GPU memory of
 this process. The checks: on calls with mid-reply spans every span reaches 0.6 or
 more (the sidecar's barge threshold), and no barge falls outside user speech.
 """
@@ -105,16 +109,33 @@ def call(tg, tyger_scorer, factory, stem):
     seg = out16[:max(0, len(mic) - off)]
     agent[off:off + len(seg)] = seg
     n_hops = len(mic) // HOP
+    edges = meta.get("edges")
+    if edges:
+        played = np.zeros(len(mic), bool)
+        start = None
+        for e in edges:
+            if e["event"] == "start":
+                start = e["mic_sample"]
+            elif start is not None:
+                played[start:e["mic_sample"]] = True
+                start = None
+        if start is not None:
+            played[start:] = True
+        agent[~played] = 0.0
+        speaking = [bool(played[h * HOP:(h + 1) * HOP].any()) for h in range(n_hops)]
     ad = frame_db(agent)
-    voiced_a = ad > -60
-    speaking = [bool(voiced_a[max(0, (h + 1) * 4 - BRIDGE_FRAMES):(h + 1) * 4].any())
-                for h in range(n_hops)]
+    if not edges:
+        voiced_a = ad > -60
+        speaking = [bool(voiced_a[max(0, (h + 1) * 4 - BRIDGE_FRAMES):(h + 1) * 4].any())
+                    for h in range(n_hops)]
 
     rec_factory = RecordingFactory(factory)
     rec = RecordingScorer(tyger_scorer.new_session(name, 0))
-    session = tg.server.Session(name, tg.rules.TurnRules(tg.rules.TurnRuleSettings()),
+    rules = tg.rules.TurnRules(tg.rules.TurnRuleSettings(), key=name)
+    session = tg.server.Session(name, rules,
                                 tg.prefilter.PrefilterSessionScorer(rec, rec_factory, FLOOR_DB,
-                                                                    GATE_DB, key=name))
+                                                                    GATE_DB, key=name,
+                                                                    gate_source=rules))
     to_pcm = lambda x: np.clip(np.round(x * 32768), -32768, 32767).astype("<i2").tobytes()
     barges, times, enrolled_at = [], [], None
     for h in range(n_hops):
@@ -161,8 +182,10 @@ def call(tg, tyger_scorer, factory, stem):
             i = j
         else:
             i += 1
-    print(f"== {name}: {n_hops} hops, enrolled at "
-          f"{'never' if enrolled_at is None else f'{enrolled_at:.2f} s'}")
+    print(f"== {name}: {n_hops} hops, voice gate {rules.voice_gate_db:.1f} dB"
+          f"{'' if rules.calibrated else ' (never calibrated)'}, enrolled at "
+          f"{'never' if enrolled_at is None else f'{enrolled_at:.2f} s'}"
+          f"{', speaking from playback frames' if edges else ''}")
     span_ok = True
     for a0, a1 in spans:
         w = deb[a0:min(len(deb), a1 + 5)]
