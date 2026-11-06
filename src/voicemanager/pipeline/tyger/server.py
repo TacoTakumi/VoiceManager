@@ -86,7 +86,11 @@ RULE_FLAGS = (
     ("--min-speech-ms", "min_speech_ms", float,
      "voiced audio a turn needs before it can end"),
     ("--voice-gate-db", "voice_gate_db", float,
-     "a frame above this energy (dBFS) is voiced"),
+     "the voice gate (dBFS) before calibration, and the lowest one calibration sets"),
+    ("--gate-margin-db", "gate_margin_db", float,
+     "the calibrated gate sits this many dB above the room"),
+    ("--gate-max-db", "gate_max_db", float,
+     "the highest gate (dBFS) calibration sets"),
     ("--silence-fallback-ms", "silence_fallback_ms", float,
      "quiet below the voice gate that ends a spoken turn the head has not"),
 )

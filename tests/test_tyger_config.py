@@ -35,6 +35,8 @@ def test_rule_defaults():
     assert s.tyger_warmup_frames == 6
     assert s.tyger_min_speech_ms == 350
     assert s.tyger_voice_gate_db == -50.0
+    assert s.tyger_gate_margin_db == 8.0
+    assert s.tyger_gate_max_db == -38.0
     assert s.tyger_silence_fallback_ms == 1200
 
 
@@ -76,6 +78,8 @@ def test_every_tyger_value_reads_from_the_environment(monkeypatch):
         "VM_TYGER_WARMUP_FRAMES": "0",
         "VM_TYGER_MIN_SPEECH_MS": "200",
         "VM_TYGER_VOICE_GATE_DB": "-45",
+        "VM_TYGER_GATE_MARGIN_DB": "6",
+        "VM_TYGER_GATE_MAX_DB": "-40",
         "VM_TYGER_SILENCE_FALLBACK_MS": "800",
         "VM_TYGER_HOLD_TAIL_MS": "0",
         "VM_TYGER_START_WAIT_MS": "500",
@@ -96,6 +100,8 @@ def test_every_tyger_value_reads_from_the_environment(monkeypatch):
     assert s.tyger_warmup_frames == 0
     assert s.tyger_min_speech_ms == 200
     assert s.tyger_voice_gate_db == -45.0
+    assert s.tyger_gate_margin_db == 6.0
+    assert s.tyger_gate_max_db == -40.0
     assert s.tyger_silence_fallback_ms == 800
     assert s.tyger_hold_tail_ms == 0
     assert s.tyger_start_wait_ms == 500
@@ -166,7 +172,7 @@ def test_values_that_must_not_be_negative(field):
 
 
 def test_voice_gate_is_a_level_at_or_below_full_scale():
-    assert _settings(tyger_voice_gate_db=0).tyger_voice_gate_db == 0
+    assert _settings(tyger_voice_gate_db=0, tyger_gate_max_db=0).tyger_voice_gate_db == 0
     with pytest.raises(ValidationError, match="tyger_voice_gate_db"):
         _settings(tyger_voice_gate_db=3)
 
@@ -187,7 +193,7 @@ def test_env_example_lists_every_turn_engine_key():
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     names = [name for name in Settings.model_fields
              if name == "turn_engine" or name.startswith("tyger_")]
-    assert len(names) == 19
+    assert len(names) == 21
     for name in names:
         assert f"# VM_{name.upper()}=" in text, name
 
@@ -217,3 +223,17 @@ def test_a_bad_prefilter_value_is_refused_naming_the_setting(field, value, env_n
     with pytest.raises(ValidationError) as err:
         _settings()
     assert field in str(err.value)
+
+
+def test_the_gate_max_may_not_sit_under_the_voice_gate():
+    with pytest.raises(ValidationError) as err:
+        _settings(tyger_voice_gate_db=-40.0, tyger_gate_max_db=-45.0)
+    assert "VM_TYGER_GATE_MAX_DB" in str(err.value) and "VM_TYGER_VOICE_GATE_DB" in str(err.value)
+    pinned = _settings(tyger_voice_gate_db=-45.0, tyger_gate_margin_db=0, tyger_gate_max_db=-45.0)
+    assert pinned.tyger_gate_max_db == pinned.tyger_voice_gate_db
+
+
+def test_the_gate_margin_is_not_negative():
+    with pytest.raises(ValidationError, match="tyger_gate_margin_db"):
+        _settings(tyger_gate_margin_db=-1)
+

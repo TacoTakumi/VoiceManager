@@ -106,6 +106,8 @@ def test_the_sidecar_is_spawned_with_the_model_device_and_every_rule_value(
         tyger_warmup_frames=5,
         tyger_min_speech_ms=300,
         tyger_voice_gate_db=-45.0,
+        tyger_gate_margin_db=6.0,
+        tyger_gate_max_db=-40.0,
         tyger_silence_fallback_ms=900,
     )
     sidecar = models.load_turn_engine(settings)
@@ -129,6 +131,8 @@ def test_the_sidecar_is_spawned_with_the_model_device_and_every_rule_value(
         assert int(value("--warmup-frames")) == 5
         assert float(value("--min-speech-ms")) == 300
         assert float(value("--voice-gate-db")) == -45.0
+        assert float(value("--gate-margin-db")) == 6.0
+        assert float(value("--gate-max-db")) == -40.0
         assert float(value("--silence-fallback-ms")) == 900
         # The session settings belong to the server, not the sidecar.
         assert not any(a.startswith(("--hold", "--start-wait")) for a in argv)
@@ -159,7 +163,7 @@ def test_the_rule_values_match_the_sidecar_scripts_flags():
     text = REAL_SCRIPT.read_text()
     sidecar = TygerSidecar.from_settings(_settings(), device="cpu")
     flags = [a for a in sidecar.command()[2:] if a.startswith("--")]
-    assert len(flags) == 13, flags
+    assert len(flags) == 15, flags
     for flag in flags:
         assert f'"{flag}"' in text, flag
 

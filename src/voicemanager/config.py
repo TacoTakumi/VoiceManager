@@ -339,7 +339,13 @@ class Settings(BaseSettings):
     tyger_barge_debounce: int = Field(default=2, gt=0)         # VM_TYGER_BARGE_DEBOUNCE (frames)
     tyger_warmup_frames: int = Field(default=6, ge=0)          # VM_TYGER_WARMUP_FRAMES
     tyger_min_speech_ms: int = Field(default=350, ge=0)        # VM_TYGER_MIN_SPEECH_MS
+    # Each session calibrates its voice gate from its first 2 s of mic audio heard
+    # while no reply plays: the room level plus the margin, no lower than
+    # VM_TYGER_VOICE_GATE_DB (also the gate before calibration) and no higher than
+    # the max. To pin a fixed gate, set the margin to 0 and the max to the gate.
     tyger_voice_gate_db: float = Field(default=-50.0, le=0.0)  # VM_TYGER_VOICE_GATE_DB (dBFS)
+    tyger_gate_margin_db: float = Field(default=8.0, ge=0.0)   # VM_TYGER_GATE_MARGIN_DB (dB)
+    tyger_gate_max_db: float = Field(default=-38.0, le=0.0)    # VM_TYGER_GATE_MAX_DB (dBFS)
     tyger_silence_fallback_ms: int = Field(default=1200, gt=0)  # VM_TYGER_SILENCE_FALLBACK_MS
     # Mic audio hold while a reply plays: audio up to the client's playback stop plus
     # this tail stays out of the STT (room echo after the last played sample).
@@ -399,6 +405,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"expected blank, auto, cpu, cuda or cuda:N, got {value!r}")
         return value
+
+    @model_validator(mode="after")
+    def _check_gate_range(self) -> "Settings":
+        if self.tyger_gate_max_db < self.tyger_voice_gate_db:
+            raise ValueError(
+                f"VM_TYGER_GATE_MAX_DB ({self.tyger_gate_max_db}) must be at or above "
+                f"VM_TYGER_VOICE_GATE_DB ({self.tyger_voice_gate_db})")
+        return self
 
     @model_validator(mode="after")
     def _anchor_relative_paths(self) -> "Settings":

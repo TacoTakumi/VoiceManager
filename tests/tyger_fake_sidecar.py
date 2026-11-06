@@ -271,7 +271,7 @@ def main(argv: list[str] | None = None) -> None:
     for flag in ("--model", "--revision", "--device", "--fake-scorer", "--log-level",
                  "--endpoint-threshold", "--endpoint-debounce", "--barge-threshold",
                  "--barge-debounce", "--warmup-frames", "--min-speech-ms", "--voice-gate-db",
-                 "--silence-fallback-ms"):
+                 "--gate-margin-db", "--gate-max-db", "--silence-fallback-ms"):
         parser.add_argument(flag, default=None)
     args = parser.parse_args(argv)
 

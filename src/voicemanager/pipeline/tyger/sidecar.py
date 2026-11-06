@@ -52,6 +52,8 @@ RULE_ARGUMENTS = (
     ("--warmup-frames", "tyger_warmup_frames"),
     ("--min-speech-ms", "tyger_min_speech_ms"),
     ("--voice-gate-db", "tyger_voice_gate_db"),
+    ("--gate-margin-db", "tyger_gate_margin_db"),
+    ("--gate-max-db", "tyger_gate_max_db"),
     ("--silence-fallback-ms", "tyger_silence_fallback_ms"),
 )
 
