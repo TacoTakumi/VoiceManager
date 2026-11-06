@@ -478,10 +478,12 @@ def test_the_gate_is_set_once_from_25_listening_frames(levels, expected_gate):
 
 
 def test_speaking_frames_do_not_count_toward_calibration():
+    # Six echo frames per room frame: counted with the room, the echo would hold the
+    # 20th percentile at -10 dB and the gate at the -38 dB cap.
     engine = TurnRules()
     frames = []
     for i in range(25):
-        frames += speak(3, db=-10.0)                 # the reply's echo, loud
+        frames += speak(6, db=-10.0)                 # the reply's echo, loud
         frames += _room([-51.0])
     run(frames, engine=engine)
     assert engine.calibrated and engine.voice_gate_db == pytest.approx(-43.0)
