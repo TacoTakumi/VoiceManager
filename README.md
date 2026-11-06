@@ -252,6 +252,18 @@ Some important settings:
 - `VM_DB_PATH`: the user store (default `~/.local/state/voicemanager/state.db`)
 - `VM_SESSION_TIMEOUT`: close an inactive session after this many seconds (default 300)
 
+### Server-side barge-in
+
+The server can detect when the user cuts in over a reply and stop the reply itself. To turn it on:
+
+1. Use the audiocpp STT engine: `VM_STT_ENGINE=audiocpp` (the default).
+2. Install the Tyger environment and its model as in [Tyger](#tyger).
+3. Set `VM_TURN_ENGINE=tyger` in `.env`.
+4. For speakers instead of headphones, also set `VM_TYGER_PREFILTER=voxlock` and run `python setup_models.py tyger` again to fetch the VoxLock models. This is experimental and needs a CUDA GPU.
+5. Restart the server.
+
+Each client must opt in with a `turn_engine` frame before its first audio and report when each reply starts and stops playing. See [Turn engine](docs/client-integration.md#turn-engine). `scripts/voice_agent.py classic --turn-engine tyger` is a client that does this.
+
 ## Users and tokens
 
 Clients authenticate with a bearer token in the `Authorization: Bearer <token>` header. Each token belongs to a user. The server keeps users and tokens in a SQLite file (`VM_DB_PATH`) and stores only the SHA-256 of each token.
