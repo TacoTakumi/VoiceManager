@@ -212,10 +212,28 @@ def test_every_hop_after_enrollment_goes_through_the_filter_in_order():
     hops = [(_voiced_hop(400 + i), MODE_SPEAKING if i % 2 else MODE_LISTENING) for i in range(6)]
     for user, mode in hops:
         _run(wrapped, user, _agent_hop(), mode)
-    pushed = factory.filters[0].pushed
+    pushed = factory.filters[0].pushed[1:]      # the first push is the voice sample
     assert len(pushed) == len(hops)
     for got, (user, _mode) in zip(pushed, hops):
         assert np.array_equal(got, _floats(user))
+
+
+def test_the_filter_is_primed_on_its_sample_and_the_stream_still_lags_by_its_delay():
+    """VoxLock's running state must hear the user before the first reply, so the
+    first push is exactly the voice sample. Its output is dropped, and a speaking
+    hop's filtered channel still lags the mic by exactly the filter's delay."""
+    delay = 1000
+    wrapped, inner, factory = _wrap(FakeFactory(delay=delay, fn=lambda x: x), floor_db=-120.0)
+    _enroll(wrapped)
+    f = factory.filters[0]
+    assert len(f.pushed) == 1 and np.array_equal(f.pushed[0], factory.enrolled[0])
+    mic = [_voiced_hop(800 + i) for i in range(3)]
+    for user in mic:
+        _run(wrapped, user, _agent_hop(), MODE_SPEAKING)
+    got = np.concatenate([_floats(u) for u, _a, _m in inner.hops[-3:]])
+    sent = np.concatenate([_floats(u) for u in mic])
+    assert np.max(np.abs(got[delay:] - sent[:-delay])) <= 1.5 / 32768.0
+    assert np.max(np.abs(got[:delay] - factory.enrolled[0][-delay:])) <= 1.5 / 32768.0
 
 
 def test_a_speaking_hop_gets_the_delayed_filter_output_and_a_silent_agent_channel():
@@ -225,7 +243,8 @@ def test_a_speaking_hop_gets_the_delayed_filter_output_and_a_silent_agent_channe
     users = [_voiced_hop(500 + i) for i in range(3)]
     for user in users:
         _run(wrapped, user, _agent_hop(), MODE_SPEAKING)
-    stream = np.concatenate([np.zeros(delay, np.float32)] + [_floats(u) * 0.5 for u in users])
+    tail = factory.enrolled[0][-delay:] * 0.5   # the primed sample's held-back end
+    stream = np.concatenate([tail] + [_floats(u) * 0.5 for u in users])
     for k in range(3):
         user, agent, mode = inner.hops[-3 + k]
         assert mode == MODE_SPEAKING

@@ -13,6 +13,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   speakers an agent that speaks first (before the user has said 3 s) could stop
   its own reply on its echo, and the held echo went to STT as a user turn. The
   user can now cut into replies only after they have spoken for about 3 s.
+- Experimental pre-filter: VoxLock is now run once over its 3 s voice sample when
+  it learns it. Its running state used to start with only a few seconds of the
+  user, so on speakers it could pass the echo of the first reply after it learned
+  the voice, and that echo stopped the reply.
 
 ## [0.6.0]
 

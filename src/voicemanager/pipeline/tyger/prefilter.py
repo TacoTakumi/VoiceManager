@@ -24,9 +24,15 @@ hear the user's barge-in as it does on headphones.
   near-silence as a pause it may barge into; the noise keeps the channel at the
   level the model knows. A listening-mode hop reaches the scorer unchanged.
 
-The filter's output comes ``delay`` samples late. The wrapper starts its output
-queue with that many zeros, so each hop takes exactly one hop of output and the
-filtered channel lags the mic by that fixed delay.
+At enrollment the new filter is run once over its own voice sample and that output
+is dropped. The filter carries a running state from block to block, and a state
+that has heard only a few seconds of the user can pass a reply's echo the first
+time it hears one.
+
+The filter's output comes ``delay`` samples late. After the sample, the filter
+still holds the sample's last ``delay`` samples and gives them out first, so each
+hop takes exactly one hop of output and the filtered channel lags the mic by that
+fixed delay.
 
 A filter factory has ``enroll(sample) -> filter``, with ``sample`` 48000 float32
 samples in -1..1 at 16 kHz; a filter has a ``delay`` in samples and
@@ -124,7 +130,13 @@ class PrefilterSessionScorer:
         sample = np.concatenate(self._voice)[:ENROLL_SAMPLES]
         self._voice, self._voice_len = [], 0
         self._filter = self._factory.enroll(sample)
-        self._out = np.zeros(int(self._filter.delay), np.float32)
+        # Prime the filter's running state on the sample and drop that output. A
+        # state that has heard only a few seconds of the user can pass the reply's
+        # echo at the first reply after enrollment. The filter holds back the
+        # sample's last `delay` samples and gives them out first, so the stream
+        # still lags the mic by exactly `delay`, with no queue of zeros.
+        self._filter.push(sample)
+        self._out = np.zeros(0, np.float32)
         logger.info("session %s enrolled the pre-filter on %.1f s of voice",
                     self._key, len(sample) / SAMPLE_RATE)
 
