@@ -11,7 +11,10 @@ hear the user's barge-in as it does on headphones.
 * Enrollment. Until the session has 3 s of the user's voice, every hop reaches the
   scorer unchanged. The voice is collected from listening-mode hops only (no reply
   plays, so no echo), frame by frame, keeping the 80 ms frames whose energy is
-  above the voice gate, in arrival order. At 3 s the filter is built once from
+  above the voice gate, in arrival order. With a gate source (the session's turn
+  rules) the collection starts only once the source has calibrated its gate, and
+  uses that gate, so the sample is not taken from room noise just over a fixed
+  gate. At 3 s the filter is built once from
   exactly those samples. Before enrollment a speaking-mode hop's frames come back
   with a yield of 0, so no barge fires: without the filter the scorer hears the
   reply's echo on the raw mic, and an agent that speaks first (before the user has
@@ -79,15 +82,25 @@ def _frame_energy_db(x: np.ndarray) -> np.ndarray:
     return 20.0 * np.log10(np.sqrt(mean_sq + 1e-12) + 1e-9)
 
 
+class GateSource(Protocol):
+    calibrated: bool
+    voice_gate_db: float
+
+
 class PrefilterSessionScorer:
-    """One session's scorer behind the pre-filter (see the module docstring)."""
+    """One session's scorer behind the pre-filter (see the module docstring).
+
+    ``gate_source``, when given, says when the session's gate is calibrated and
+    what it is; without one the fixed ``voice_gate_db`` applies from the start."""
 
     def __init__(self, inner: Any, factory: FilterFactory, floor_db: float,
-                 voice_gate_db: float, key: str = "") -> None:
+                 voice_gate_db: float, key: str = "",
+                 gate_source: GateSource | None = None) -> None:
         self._inner = inner
         self._factory = factory
         self._floor_rms = float(10.0 ** (floor_db / 20.0))
         self._gate_db = float(voice_gate_db)
+        self._gate_source = gate_source
         self._key = key
         self._voice: list[np.ndarray] = []
         self._voice_len = 0
@@ -118,8 +131,13 @@ class PrefilterSessionScorer:
         return self._inner.score_hop(_to_pcm(filtered + noise), _SILENT_HOP, mode)
 
     def _collect(self, x: np.ndarray) -> None:
+        gate = self._gate_db
+        if self._gate_source is not None:
+            if not self._gate_source.calibrated:
+                return
+            gate = self._gate_source.voice_gate_db
         for i, level in enumerate(_frame_energy_db(x)):
-            if level > self._gate_db:
+            if level > gate:
                 self._voice.append(x[i * FRAME_SAMPLES:(i + 1) * FRAME_SAMPLES])
                 self._voice_len += FRAME_SAMPLES
                 if self._voice_len >= ENROLL_SAMPLES:

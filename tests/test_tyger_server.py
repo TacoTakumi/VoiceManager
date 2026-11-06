@@ -376,7 +376,10 @@ class _SilentFactory:
         return _F()
 
 
-def _feed_app(prefilter_factory):
+LISTEN_HOPS = 20
+
+
+def _feed_app(prefilter_factory, listen_hops=LISTEN_HOPS):
     import numpy as np
     from fastapi.testclient import TestClient
     from voicemanager.pipeline.tyger import server
@@ -386,7 +389,9 @@ def _feed_app(prefilter_factory):
     voiced = lambda: (rng.uniform(-0.1, 0.1, wire.HOP_SAMPLES) * 32768).astype("<i2").tobytes()
     agent = (rng.uniform(-0.3, 0.3, wire.HOP_SAMPLES) * 32768).astype("<i2").tobytes()
     sent = []
-    for i in range(12):        # 3.84 s of voice while listening: enough to enroll
+    # 6.4 s of voice while listening: the first 2 s calibrate the session's gate,
+    # and the pre-filter takes its 3 s voice sample after that.
+    for i in range(listen_hops):
         sent.append((voiced(), bytes(wire.HOP_SAMPLES * 2), wire.MODE_LISTENING))
     for i in range(3):
         sent.append((voiced(), agent, wire.MODE_SPEAKING))
@@ -408,8 +413,15 @@ def test_with_no_prefilter_the_scorer_sees_every_hop_as_sent():
 def test_with_a_prefilter_speaking_hops_reach_the_scorer_filtered_with_a_silent_agent():
     sent, seen = _feed_app(_SilentFactory())
     assert len(seen) == len(sent)
-    assert seen[:12] == sent[:12]                  # listening hops: unchanged
-    for (u, a, m), (su, _sa, _sm) in zip(seen[12:], sent[12:]):
+    assert seen[:LISTEN_HOPS] == sent[:LISTEN_HOPS]          # listening hops: unchanged
+    for (u, a, m), (su, _sa, _sm) in zip(seen[LISTEN_HOPS:], sent[LISTEN_HOPS:]):
         assert m == wire.MODE_SPEAKING
         assert a == bytes(wire.HOP_SAMPLES * 2)
         assert u != su and len(u) == wire.HOP_SAMPLES * 2
+
+
+def test_the_pre_filter_takes_no_voice_sample_before_the_session_calibrates():
+    # 12 listening hops (3.84 s) hold 3 s of voice, but the first 2 s only set the
+    # session's gate, so the sample is not complete and speaking hops pass unchanged.
+    sent, seen = _feed_app(_SilentFactory(), listen_hops=12)
+    assert seen == sent

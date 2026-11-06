@@ -280,6 +280,59 @@ def test_reset_reaches_the_scorer():
 
 # --- the sidecar server wraps sessions only when asked ---------------------------------
 
+class FakeGate:
+    """Stands in for the session's turn rules as the pre-filter's gate source."""
+
+    def __init__(self, calibrated=False, voice_gate_db=-42.0):
+        self.calibrated = calibrated
+        self.voice_gate_db = voice_gate_db
+
+
+def _level_hop(db, seed):
+    """A hop of noise whose 80 ms frames sit near ``db`` dBFS."""
+    rms = 10.0 ** (db / 20.0)
+    return _pcm(np.random.default_rng(seed).standard_normal(HOP_SAMPLES) * rms)
+
+
+def test_the_voice_sample_waits_for_calibration_and_uses_the_calibrated_gate():
+    gate = FakeGate(calibrated=False, voice_gate_db=-42.0)
+    inner = RecordingScorer()
+    factory = FakeFactory()
+    wrapped = prefilter.PrefilterSessionScorer(inner, factory, floor_db=FLOOR_DB,
+                                               voice_gate_db=GATE_DB, key="s1",
+                                               gate_source=gate)
+    # A room at -46 dB: over the configured -50 dB gate, under the calibrated -42 dB.
+    room = [_level_hop(-46.0, 900 + i) for i in range(12)]           # 3.84 s
+    for hop in room:                                                   # before calibration
+        _run(wrapped, hop, _quiet_hop(), MODE_LISTENING)
+    loud = [_voiced_hop(950 + i) for i in range(12)]
+    for hop in loud:                                                   # voice, still before
+        _run(wrapped, hop, _quiet_hop(), MODE_LISTENING)
+    assert factory.enrolled == []
+    gate.calibrated = True
+    for hop in room:                                                   # the room, after
+        _run(wrapped, hop, _quiet_hop(), MODE_LISTENING)
+    assert factory.enrolled == []
+    fed = _enroll(wrapped, start_seed=1000)
+    assert np.array_equal(factory.enrolled[0],
+                          np.concatenate([_floats(h) for h in fed])[:ENROLL])
+
+
+def test_without_a_gate_source_the_fixed_gate_applies_from_the_start():
+    wrapped, _inner, factory = _wrap()
+    for i in range(12):
+        _run(wrapped, _level_hop(-46.0, 1100 + i), _quiet_hop(), MODE_LISTENING)
+    assert len(factory.enrolled) == 1
+
+
+def test_the_server_gives_each_session_s_pre_filter_its_rules_as_gate_source():
+    from voicemanager.pipeline.tyger import server
+    gate = FakeGate()
+    wrapped = server.session_scorer(RecordingScorer(), key="k", prefilter_factory=FakeFactory(),
+                                    floor_db=FLOOR_DB, voice_gate_db=GATE_DB, gate_source=gate)
+    assert wrapped._gate_source is gate
+
+
 def test_the_server_wraps_a_session_only_with_a_prefilter():
     from voicemanager.pipeline.tyger import server
     inner = RecordingScorer()

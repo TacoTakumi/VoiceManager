@@ -105,13 +105,17 @@ class Session:
 
 def session_scorer(inner: "scorer.SessionScorer", key: str,
                    prefilter_factory: "prefilter.FilterFactory | None",
-                   floor_db: float, voice_gate_db: float) -> "scorer.SessionScorer":
+                   floor_db: float, voice_gate_db: float,
+                   gate_source: "rules.TurnRules | None" = None) -> "scorer.SessionScorer":
     """The scorer a new session uses: ``inner`` itself, or ``inner`` behind the
-    experimental pre-filter when a filter factory is given."""
+    experimental pre-filter when a filter factory is given. ``gate_source`` is the
+    session's turn rules: the pre-filter takes its voice sample only after they
+    calibrate the gate, with that gate."""
     if prefilter_factory is None:
         return inner
     return prefilter.PrefilterSessionScorer(inner, prefilter_factory, floor_db=floor_db,
-                                            voice_gate_db=voice_gate_db, key=key)
+                                            voice_gate_db=voice_gate_db, key=key,
+                                            gate_source=gate_source)
 
 
 def process_hop(session: Session, hop: "wire.Hop") -> list:
@@ -200,9 +204,11 @@ def create_app(settings: "rules.TurnRuleSettings | None" = None,
             return
         key = ws.query_params.get("session") or str(index)
         progress = ws.query_params.get(wire.PROGRESS_PARAM) == "1"
-        session = Session(key, rules.TurnRules(rule_settings),
+        turn_rules = rules.TurnRules(rule_settings, key=key)
+        session = Session(key, turn_rules,
                           session_scorer(active.new_session(key, index), key, prefilter_factory,
-                                         prefilter_floor_db, rule_settings.voice_gate_db))
+                                         prefilter_floor_db, rule_settings.voice_gate_db,
+                                         gate_source=turn_rules))
         app.state.sessions += 1
         logger.info("session %s opened", key)
         try:
