@@ -2,7 +2,7 @@
 
 A local server for streaming speech-to-text (STT) and text-to-speech (TTS) over one WebSocket. A client sends 16 kHz mono PCM and gets interim and final transcripts back. On the same socket it sends text and gets PCM audio back. STT and TTS run at the same time (full duplex).
 
-The WebSocket protocol is the contract. Clients can be written in any language. This repo ships one Python client, `voicemanager.client`, and full client integration docs in [docs/client-integration.md](docs/client-integration.md).
+The WebSocket protocol is the contract. Clients can be written in any language. This repo ships one Python client, `voicemanager.client`, and full client integration docs in [docs/client-integration.md](docs/client-integration.md). [docs/architecture.md](docs/architecture.md) shows the processes and the data flow in diagrams.
 
 ## Built for conversation
 
