@@ -12,7 +12,10 @@ hear the user's barge-in as it does on headphones.
   scorer unchanged. The voice is collected from listening-mode hops only (no reply
   plays, so no echo), frame by frame, keeping the 80 ms frames whose energy is
   above the voice gate, in arrival order. At 3 s the filter is built once from
-  exactly those samples.
+  exactly those samples. Before enrollment a speaking-mode hop's frames come back
+  with a yield of 0, so no barge fires: without the filter the scorer hears the
+  reply's echo on the raw mic, and an agent that speaks first (before the user has
+  said 3 s) would otherwise stop its own reply on that echo.
 * After enrollment every hop's user audio goes through the filter, in order, so the
   filter's state follows the stream. A speaking-mode hop then reaches the scorer
   with the filter's output as its user channel, plus white noise at the floor
@@ -97,7 +100,11 @@ class PrefilterSessionScorer:
         if self._filter is None:
             if mode != MODE_SPEAKING:
                 self._collect(_to_float(user))
-            return self._inner.score_hop(user, agent, mode)
+                return self._inner.score_hop(user, agent, mode)
+            # No voice sample yet, so the scorer hears the raw mic, echo and all. On
+            # speakers that echo can score as a barge, so no barge until enrollment.
+            return (frame._replace(yield_prob=0.0)
+                    for frame in self._inner.score_hop(user, agent, mode))
         filtered = self._next_output(_to_float(user))
         if mode != MODE_SPEAKING:
             return self._inner.score_hop(user, agent, mode)

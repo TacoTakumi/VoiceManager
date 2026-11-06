@@ -4,6 +4,16 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1]
+
+### Fixed
+
+- Experimental pre-filter (`VM_TYGER_PREFILTER=voxlock`): no barge fires until the
+  connection has its 3 s voice sample. Before that, Tyger heard the raw mic, so on
+  speakers an agent that speaks first (before the user has said 3 s) could stop
+  its own reply on its echo, and the held echo went to STT as a user turn. The
+  user can now cut into replies only after they have spoken for about 3 s.
+
 ## [0.6.0]
 
 ### Added

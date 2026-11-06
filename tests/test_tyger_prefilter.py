@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from voicemanager.pipeline.tyger import prefilter
+from voicemanager.pipeline.tyger.scorer import FrameScore
 from voicemanager.pipeline.tyger.wire import HOP_SAMPLES, MODE_LISTENING, MODE_SPEAKING
 
 FRAME = 1280
@@ -32,9 +33,14 @@ class RecordingScorer:
     def reset(self):
         self.resets += 1
 
+    def __init__(self, yield_prob=0.9):
+        self.hops = []
+        self.resets = 0
+        self.yield_prob = yield_prob
+
     def score_hop(self, user, agent, mode):
         self.hops.append((bytes(user), bytes(agent), mode))
-        return iter([("frame", i) for i in range(4)])
+        return iter([FrameScore(0.1 * i, self.yield_prob, -20.0) for i in range(4)])
 
 
 class FakeFilter:
@@ -131,7 +137,34 @@ def test_hops_before_enrollment_reach_the_scorer_unchanged():
 
 def test_the_scorer_frames_pass_through():
     wrapped, _inner, _f = _wrap()
-    assert _run(wrapped, _voiced_hop(1), _quiet_hop(), MODE_LISTENING) == [("frame", i) for i in range(4)]
+    assert _run(wrapped, _voiced_hop(1), _quiet_hop(), MODE_LISTENING) == [
+        FrameScore(0.1 * i, 0.9, -20.0) for i in range(4)]
+
+
+def test_no_barge_before_enrollment_and_a_barge_after_it():
+    """Before the voice sample exists the scorer hears the raw mic, echo and all, so
+    a speaking hop's yield is held at 0 and the turn rules see no barge. After
+    enrollment the same scores reach the rules unchanged and the barge fires."""
+    from voicemanager.pipeline.tyger import rules, server
+
+    def barges(session):
+        hop = server.wire.unpack_hop(server.wire.pack_hop(
+            MODE_SPEAKING, (session.hops + 1) * HOP_SAMPLES, _voiced_hop(500), _agent_hop()))
+        return [e for e in server.process_hop(session, hop)
+                if isinstance(e, server.wire.BargeEvent)]
+
+    wrapped, inner, _f = _wrap()
+    session = server.Session("s1", rules.TurnRules(rules.TurnRuleSettings()), wrapped)
+    assert inner.yield_prob > rules.TurnRuleSettings().barge_threshold
+    before = [barges(session) for _ in range(4)]
+    assert before == [[]] * 4
+    assert [f.yield_prob for f in _run(wrapped, _voiced_hop(1), _agent_hop(), MODE_SPEAKING)] \
+        == [0.0] * 4
+
+    _enroll(wrapped)
+    session = server.Session("s1", rules.TurnRules(rules.TurnRuleSettings()), wrapped)
+    after = [e for _ in range(4) for e in barges(session)]
+    assert len(after) == 1
 
 
 def test_enrollment_takes_exactly_3_s_of_voiced_listening_audio_in_order():
