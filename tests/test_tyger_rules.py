@@ -445,3 +445,85 @@ def test_licence_and_notice_sit_next_to_the_vendored_rules():
     assert "tyger-s2s" in notice and "97d011d" in notice
     assert "rules.py" in notice and "session.py" in notice
     assert "modified" in notice.lower()
+
+
+# --- voice gate calibration -----------------------------------------------------------
+
+def _room(levels):
+    """Listening frames at the given energies, endpoint head quiet."""
+    return [(L, 0.1, 0.0, db) for db in levels]
+
+
+def _p20(levels):
+    import numpy as np
+    return float(np.percentile(levels, 20))
+
+
+@pytest.mark.parametrize("levels, expected_gate", [
+    ([-51.0 + 0.1 * (i % 7) for i in range(25)], None),   # a quiet room: p20 + 8
+    ([-70.0] * 25, -50.0),                                  # under the configured gate
+    ([-30.0 + i * 0.2 for i in range(25)], -38.0),          # over the cap
+])
+def test_the_gate_is_set_once_from_25_listening_frames(levels, expected_gate):
+    engine = TurnRules()
+    run(_room(levels[:24]), engine=engine)
+    assert not engine.calibrated and engine.voice_gate_db == -50.0
+    run(_room(levels[24:]), engine=engine)
+    if expected_gate is None:
+        expected_gate = _p20(levels) + 8.0
+    assert engine.calibrated
+    assert engine.voice_gate_db == pytest.approx(expected_gate)
+    run(_room([-20.0] * 50), engine=engine)          # later frames never move it
+    assert engine.voice_gate_db == pytest.approx(expected_gate)
+
+
+def test_speaking_frames_do_not_count_toward_calibration():
+    engine = TurnRules()
+    frames = []
+    for i in range(25):
+        frames += speak(3, db=-10.0)                 # the reply's echo, loud
+        frames += _room([-51.0])
+    run(frames, engine=engine)
+    assert engine.calibrated and engine.voice_gate_db == pytest.approx(-43.0)
+
+
+def test_a_frame_between_the_two_gates_is_voice_before_calibration_only():
+    # -45 dB: over the configured -50 dB gate, under the calibrated -43 dB one.
+    # Before calibration it keeps a spoken turn open; after, it is silence.
+    # 20 listening frames, all before calibration: 15 of them at -45 dB would end
+    # the turn by silence if they were quiet.
+    before = run(listen(5) + _room([-45.0] * 15))
+    assert before == []
+    engine = TurnRules()
+    run(_room([-51.0] * 25), engine=engine)
+    after = run(listen(10) + _room([-45.0] * 15), engine=engine)
+    assert after == [(24, EndpointEvent(by="silence", mic_sample=end_of(24)))]
+
+
+def test_a_room_over_the_configured_gate_ends_turns_by_silence_after_calibration():
+    room = _room([-49.0] * 25)
+    speech = listen(10)
+    quiet = _room([-49.0] * 40)
+    events = run(room + speech + quiet)
+    ends = [i for i, e in events if e.by == "silence"]
+    assert ends and ends[0] - (len(room) + len(speech) - 1) <= 16
+    # With the gate pinned at -50 dB the room counts as voice and the turn never ends.
+    pinned = TurnRuleSettings(gate_margin_db=0.0, gate_max_db=-50.0)
+    assert run(room + speech + quiet + _room([-49.0] * 200), pinned) == []
+
+
+def test_turn_ends_and_mode_changes_keep_the_calibrated_gate():
+    engine = TurnRules()
+    events = run(_room([-49.0] * 25) + listen(10) + _room([-49.0] * 20), engine=engine)
+    assert any(e.by == "silence" for _i, e in events)
+    run(speak(10) + _room([-49.0] * 30), engine=engine)
+    assert engine.voice_gate_db == pytest.approx(-41.0)
+
+
+def test_gate_settings_defaults_and_checks():
+    s = TurnRuleSettings()
+    assert s.gate_margin_db == 8.0 and s.gate_max_db == -38.0
+    with pytest.raises(ValueError, match="gate_max_db"):
+        TurnRuleSettings(voice_gate_db=-40.0, gate_max_db=-45.0)
+    with pytest.raises(ValueError, match="gate_margin_db"):
+        TurnRuleSettings(gate_margin_db=-1.0)

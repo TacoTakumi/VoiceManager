@@ -18,6 +18,12 @@ dB and the mode (``listening``: no reply plays, ``speaking``: a reply plays).
   threshold for the debounce frames. Its onset is where the user's current stretch
   of speech began (by frame energy, through pauses of up to ``onset_gap_frames``),
   since the head takes a second or more to be sure.
+* The voice gate is calibrated once per session. Until the session has heard
+  ``CALIBRATION_FRAMES`` listening-mode frames (2 s), the configured gate applies;
+  then the gate becomes the 20th percentile of those frames' energies plus
+  ``gate_margin_db``, no lower than the configured gate and no higher than
+  ``gate_max_db``. Speaking-mode frames carry the reply's echo and do not count.
+  Turn ends and mode changes keep the calibrated gate.
 * The head's decisions count only after ``warmup_frames`` frames of fresh context:
   after the first hop, every switch of mode and every endpoint. The silence
   fallback reads only energy, so it needs no warm-up.
@@ -67,6 +73,9 @@ HOP_FRAMES = HOP_SAMPLES // FRAME_SAMPLES       # 4 frames per wire hop
 
 _MODES = (MODE_LISTENING, MODE_SPEAKING)
 
+CALIBRATION_FRAMES = 25                         # 2 s of listening frames set the gate
+CALIBRATION_PERCENTILE = 20.0                   # the room level among those frames
+
 
 @dataclass(frozen=True)
 class TurnRuleSettings:
@@ -77,7 +86,9 @@ class TurnRuleSettings:
     barge_debounce_frames: int = 2        # ... for this many frames in a row
     warmup_frames: int = 6                # frames of fresh context before the heads count
     min_speech_ms: float = 350.0          # voiced audio a turn needs before it can end
-    voice_gate_db: float = -50.0          # a frame above this energy is voiced
+    voice_gate_db: float = -50.0          # the gate before calibration, and the lowest one
+    gate_margin_db: float = 8.0           # the calibrated gate sits this far above the room
+    gate_max_db: float = -38.0            # ... and never above this
     silence_fallback_ms: float = 1200.0   # quiet that ends a spoken turn the head has not
     onset_gap_frames: int = 8             # a longer pause ends a stretch of speech (640 ms)
     onset_max_ms: float = 4000.0          # a barge's onset reaches back at most this far
@@ -100,6 +111,11 @@ class TurnRuleSettings:
         for name in ("silence_fallback_ms", "onset_max_ms"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
+        if self.gate_margin_db < 0:
+            raise ValueError(f"gate_margin_db must be >= 0, got {self.gate_margin_db}")
+        if self.gate_max_db < self.voice_gate_db:
+            raise ValueError(f"gate_max_db ({self.gate_max_db}) must be at or above "
+                             f"voice_gate_db ({self.voice_gate_db})")
 
     @property
     def silence_fallback_frames(self) -> int:
@@ -125,11 +141,37 @@ class FrameResult(NamedTuple):
 class TurnRules:
     """One session's turn state and its rules. Instances share nothing."""
 
-    def __init__(self, settings: TurnRuleSettings | None = None) -> None:
+    def __init__(self, settings: TurnRuleSettings | None = None, key: str = "") -> None:
         self.settings = settings if settings is not None else TurnRuleSettings()
+        self._key = key
         self._seed: deque[bool] = deque(maxlen=self.settings.barge_seed_frames)
+        # The session's voice gate. It is set once and outlives every turn.
+        self._gate = self.settings.voice_gate_db
+        self._calibration: list[float] = []
+        self._calibrated = False
         self._pending_reset = True      # the first hop starts the heads' context
         self._clear()
+
+    @property
+    def voice_gate_db(self) -> float:
+        """The gate this session uses now: the configured one until calibration."""
+        return self._gate
+
+    @property
+    def calibrated(self) -> bool:
+        return self._calibrated
+
+    def _calibrate(self, energy_db: float) -> None:
+        self._calibration.append(float(energy_db))
+        if len(self._calibration) < CALIBRATION_FRAMES:
+            return
+        s = self.settings
+        room = _percentile(self._calibration, CALIBRATION_PERCENTILE)
+        self._gate = min(max(room + s.gate_margin_db, s.voice_gate_db), s.gate_max_db)
+        self._calibrated = True
+        self._calibration = []
+        logger.info("session %s calibrated the voice gate: room %.1f dB, gate %.1f dB",
+                    self._key, room, self._gate)
 
     # --- state -----------------------------------------------------------------
 
@@ -198,7 +240,9 @@ class TurnRules:
         it, as a change of mode here is applied the same way.
         """
         self._enter(mode)
-        voiced = energy_db > self.settings.voice_gate_db
+        voiced = energy_db > self._gate
+        if mode == MODE_LISTENING and not self._calibrated:
+            self._calibrate(energy_db)
         if mode == MODE_SPEAKING:
             return self._speaking_frame(yield_prob, voiced, mic_sample)
         return self._listening_frame(p_end, voiced, mic_sample)
@@ -261,3 +305,13 @@ class TurnRules:
         self._ep_run = 0
         self._silent_run = 0
         return FrameResult([EndpointEvent(by=by, mic_sample=mic_sample)], True)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    """The q-th percentile, interpolated between the two nearest ranks (numpy's
+    default), without numpy: the rules use the standard library only."""
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * q / 100.0
+    low = math.floor(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
