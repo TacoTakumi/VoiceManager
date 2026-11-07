@@ -23,7 +23,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Setting `VM_TTS_CLAUSE_WORD_GRACE_MS` (250). The end of the held text counts as
   a word end once no new frame arrived for this long. 0 makes every frame end a
   word end, the behaviour before this release. A client that sends whole words
-  with no trailing space gets each count or time cut at most this much later.
+  with no trailing space gets each count cut, and the first-piece deadline cut,
+  at most this much later. The margin cut does not wait: it cuts at the last
+  whitespace, so the last word can start the next piece.
 
 ## [0.8.0]
 

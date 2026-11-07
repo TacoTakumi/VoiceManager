@@ -541,8 +541,10 @@ def test_time_trigger_keeps_the_partial_last_word_held(chunker, clock):
     t0 = clock.now
     chunker.feed("one two", now=t0)
     chunker.feed(" thr", now=t0 + 0.55)  # still inside its word grace at 0.6 s
-    assert chunker.poll(now=t0 + 0.6) == ["one two "]
-    assert chunker.held_text == "thr"
+    assert chunker.poll(now=t0 + 0.6) == []  # the deadline waits up to the grace
+    chunker.feed("ee", now=t0 + 0.7)  # the word is still arriving at 0.85 s
+    assert chunker.poll(now=t0 + 0.85) == ["one two "]
+    assert chunker.held_text == "three"
 
 
 def test_time_trigger_waits_for_the_word_grace_without_whitespace(clock):
@@ -597,6 +599,77 @@ def test_the_count_trigger_counts_the_last_word_once_its_grace_passed(clock):
     chunker.feed("one two three four", now=0.0)
     assert chunker.poll(now=0.1) == []
     assert chunker.poll(now=0.25) == ["one two three four"]
+
+
+# --- the first-piece deadline waits up to the grace for a word still arriving -----
+
+
+def test_first_piece_deadline_waits_for_a_word_inside_its_grace(clock):
+    # A whole-word client that puts the space before each word: the deadline
+    # falls inside the grace of "there", so the cut waits for its grace to end.
+    chunker = ClauseChunker(first_piece_deadline_ms=300, word_grace_ms=250, clock=clock)
+    chunker.feed("Hello", now=0.0)
+    chunker.feed(" there", now=0.2)
+    assert chunker.poll(now=0.3) == []
+    assert chunker.next_deadline(now=0.3) == pytest.approx(0.45)
+    pieces = chunker.poll(now=0.45)
+    assert len(pieces) == 1
+    assert pieces[0].strip() == "Hello there"
+
+
+def test_first_piece_deadline_waits_at_most_the_grace(clock):
+    # Frames keep arriving inside the grace: the cut comes at deadline + grace,
+    # at the last whitespace.
+    chunker = ClauseChunker(first_piece_words=10, first_piece_deadline_ms=300,
+                            word_grace_ms=250, clock=clock)
+    for frame, at in [("Hello", 0.0), (" there", 0.2), (" my", 0.4), (" friend", 0.5)]:
+        chunker.feed(frame, now=at)
+        assert chunker.poll(now=at) == []
+    assert chunker.next_deadline(now=0.5) == pytest.approx(0.55)
+    assert chunker.poll(now=0.55) == ["Hello there my "]
+    assert chunker.held_text == "friend"
+
+
+def test_first_piece_deadline_cuts_at_once_after_whitespace(clock):
+    chunker = ClauseChunker(first_piece_deadline_ms=300, word_grace_ms=250, clock=clock)
+    chunker.feed("Hello", now=0.0)
+    chunker.feed(" there ", now=0.2)
+    assert chunker.next_deadline(now=0.2) == pytest.approx(0.3)
+    assert chunker.poll(now=0.29) == []
+    assert chunker.poll(now=0.3) == ["Hello there "]
+
+
+def test_margin_trigger_does_not_wait_for_the_grace(clock):
+    chunker = ClauseChunker(word_grace_ms=250, clock=clock)
+    chunker.record_audio(0.5, now=0.0)
+    chunker.feed("One two", now=0.0)
+    chunker.feed(" three", now=0.1)
+    assert 0.0 < chunker.unplayed_estimate(now=0.1) < chunker.unplayed_margin_ms / 1000.0
+    assert chunker.poll(now=0.1) == ["One two "]
+    assert chunker.held_text == "three"
+
+
+def test_first_piece_wait_after_the_audio_ran_out_with_no_margin(clock):
+    # With no margin the first-piece deadline takes over once the audio has run
+    # out; it waits for the grace there too, and next_deadline names that time.
+    chunker = ClauseChunker(first_piece_deadline_ms=300, unplayed_margin_ms=0,
+                            word_grace_ms=250, clock=clock)
+    chunker.record_audio(0.5, now=0.0)
+    chunker.feed("Hello", now=0.0)
+    chunker.feed(" there", now=0.4)
+    assert chunker.next_deadline(now=0.4) == pytest.approx(0.55)
+    assert chunker.poll(now=0.5) == []
+    assert chunker.poll(now=0.55) == ["Hello "]
+
+
+def test_first_piece_wait_when_the_last_word_completes_the_count(clock):
+    chunker = ClauseChunker(first_piece_words=3, first_piece_deadline_ms=300,
+                            word_grace_ms=250, clock=clock)
+    chunker.feed("one two", now=0.0)
+    chunker.feed(" three", now=0.2)
+    assert chunker.next_deadline(now=0.2) == pytest.approx(0.45)
+    assert chunker.poll(now=0.3) == []
+    assert chunker.poll(now=0.45) == ["one two three"]
 
 
 def test_count_trigger_counts_only_complete_words(clock):

@@ -8,10 +8,15 @@ using how much audio of the request is still unplayed:
 - First-piece rule, used while the unplayed-audio estimate is 0 (nothing is
   playing yet, or the audio already sent has run out): send at a clause mark, when
   ``first_piece_words`` words are held, or ``first_piece_deadline_ms`` after the
-  first held word arrived, whichever comes first.
+  first held word arrived, whichever comes first. When the deadline comes while
+  the held text ends in a word still inside its word grace (see below), the cut
+  waits until that grace ends, so the word goes with the piece, or for at most
+  ``word_grace_ms`` past the deadline, when frames keep arriving; the cut is then
+  at the last whitespace.
 - Later-piece rule, used while audio is still playing: send at a clause mark, when
   ``later_piece_words`` words are held, or when the unplayed estimate drops below
-  ``unplayed_margin_ms``, whichever comes first.
+  ``unplayed_margin_ms``, whichever comes first. The margin trigger does not wait
+  for a word inside its grace: it cuts at the last whitespace at once.
 
 A clause mark is a cut point only when the held text from its start through the mark
 holds at least ``mark_min_words`` words (whitespace-separated tokens). A mark after
@@ -211,9 +216,12 @@ class ClauseChunker:
         at or before ``now`` means a trigger is already due: call ``poll``. While no
         whitespace follows a held word, the time is no earlier than the end of the
         word grace of the newest frame, because no trigger can cut before then. When
-        a partial last word would complete the active word count, the time is no
-        later than the end of its grace, when the count trigger fires. The answer
-        can change after ``feed`` or ``record_audio``, so ask again after each.
+        the first-piece deadline governs and the held text ends in a partial word,
+        the time is the earlier of the end of its grace and the deadline plus
+        ``word_grace_ms``, because the first-piece cut waits until then. When a
+        partial last word would complete the active word count, the time is no later
+        than the end of its grace, when the count trigger fires. The answer can
+        change after ``feed`` or ``record_audio``, so ask again after each.
         """
         held = "".join(text for text, _ in self._frames)
         if not _is_spoken(held):
@@ -228,6 +236,14 @@ class ClauseChunker:
             # would hold no letter or digit); once it ends, a met word count cuts at
             # once.
             return grace_end if count_met else max(deadline, grace_end)
+        if held[boundary:] and (self.unplayed_estimate(now) == 0.0
+                                or self.unplayed_margin_ms == 0):
+            # The first-piece deadline waits for the partial last word: until its
+            # grace ends (all held text goes) or for at most the grace (the cut is
+            # at the last whitespace), whichever comes first.
+            first_deadline = first_word_at + self.first_piece_deadline_ms / 1000.0
+            grace = self.word_grace_ms / 1000.0
+            deadline = max(deadline, min(grace_end, first_deadline + grace))
         if held[boundary:] and count_met:
             # The partial last word completes the word count once its grace has
             # passed, so wake then rather than wait for the time trigger.
@@ -338,7 +354,7 @@ class ClauseChunker:
             self._take(cut)
             return held[:cut]
         end = self._word_end(held, now)
-        if end is not None and self._count_or_time_due(held[:end], now):
+        if end is not None and self._count_or_time_due(held[:end], end < len(held), now):
             # A word end before the grace holds a letter or digit (``_word_boundary``);
             # after the grace it is the end of the held text, which holds one too.
             self._take(end)
@@ -351,14 +367,20 @@ class ClauseChunker:
             return self.first_piece_words
         return self.later_piece_words
 
-    def _count_or_time_due(self, complete: str, now: float) -> bool:
-        """True when a word-count or time trigger fires for the complete words held."""
+    def _count_or_time_due(self, complete: str, partial: bool, now: float) -> bool:
+        """True when a word-count or time trigger fires for the complete words held.
+
+        ``partial`` is True when held text after ``complete`` is a word still inside
+        its grace; the first-piece deadline then waits up to the grace for it.
+        """
         if len(complete.split()) >= self._count_threshold(now):
             return True
         estimate = self.unplayed_estimate(now)
         if estimate == 0.0:
             first_word_at = self._first_word_at()
             deadline = first_word_at + self.first_piece_deadline_ms / 1000.0
+            if partial:
+                deadline += self.word_grace_ms / 1000.0
             return now >= deadline - _EPS
         return estimate < self.unplayed_margin_ms / 1000.0 - _EPS
 
