@@ -608,3 +608,20 @@ def test_the_handler_passes_the_word_grace(monkeypatch, fresh_settings):
             _receive_until_audio_end(ws)
     # The setting reaches the chunker; the default would be 250.
     assert [chunker.word_grace_ms for chunker in built] == [0]
+
+
+def test_the_shared_pipeline_sends_each_piece_without_its_whitespace():
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, clause_first_words=2, **_NO_TIMER)
+        await pipe.feed_text("one two ", False, ws, "r1", chunking="clause")
+        await pipe.feed_text(" three four,", False, ws, "r1")
+        await pipe.feed_text(" five", False, ws, "r1")
+        await _finish(pipe, ws)
+        # The chunker keeps the client's whitespace on each piece; the engine
+        # gets every piece with that whitespace removed.
+        for text in engine.texts:
+            assert text == text.strip()
+        assert engine.texts == ["one two", "three four,", "five"]
+
+    asyncio.run(run())

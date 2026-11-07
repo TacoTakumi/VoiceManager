@@ -72,3 +72,13 @@ def test_a_sentence_request_logs_no_engine_request_line(cls, caplog):
     engine = asyncio.run(_run(cls, "sentence", ["Well, I think so. Yes."]))
     assert engine.texts
     assert _lines(caplog) == []
+
+
+def test_the_logged_text_has_no_surrounding_whitespace(caplog):
+    caplog.set_level(logging.INFO)
+    engine = asyncio.run(_run(TTSStreamPipeline, "clause",
+                              ["Well, I think so, ", " yes it is."]))
+    lines = _lines(caplog)
+    assert len(lines) == len(engine.texts) >= 2
+    for line, text in zip(lines, engine.texts):
+        assert line.endswith(f"text={text.strip()!r}")

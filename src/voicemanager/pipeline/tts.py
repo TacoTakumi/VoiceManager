@@ -739,7 +739,10 @@ class TTSStreamPipeline:
                 if sentence is None:
                     break  # No more sentences
 
-                if not sentence.strip():
+                # A clause piece keeps the client's whitespace so the pieces join
+                # back to the client's text; the engine gets it without that.
+                sentence = sentence.strip()
+                if not sentence:
                     continue
 
                 # Send audio_start before first sentence audio
