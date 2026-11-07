@@ -23,9 +23,10 @@ dB and the mode (``listening``: no reply plays, ``speaking``: a reply plays).
   then the gate becomes the 20th percentile of those frames' energies plus
   ``gate_margin_db``, no lower than the configured gate and no higher than
   ``gate_max_db``. Speaking-mode frames carry the reply's echo and do not count.
-  Turn ends and mode changes keep the calibrated gate.
+  Turn ends, mode changes and listening boundaries keep the calibrated gate.
 * The head's decisions count only after ``warmup_frames`` frames of fresh context:
-  after the first hop, every switch of mode and every endpoint. The silence
+  after the first hop, every switch of mode, every endpoint and every listening
+  boundary (``boundary``: the client stopped listening). The silence
   fallback reads only energy, so it needs no warm-up.
 
 When the heads' context must start over the engine says so (``begin_hop`` returns
@@ -224,6 +225,19 @@ class TurnRules:
         return False
 
     # --- driving -----------------------------------------------------------------
+
+    def boundary(self) -> None:
+        """A listening boundary: the client stopped listening, so the turn so far
+        is over and nothing from it carries on.
+
+        The turn state goes back to that of a fresh session (a new turn in
+        listening, every run at zero, no barge latched) and the heads' context
+        starts over at the next hop: ``begin_hop`` then returns True, as for a
+        session's first hop. The voice gate stays: a calibrated gate is kept,
+        and the calibration frames heard so far still count toward one.
+        """
+        self._clear()
+        self._pending_reset = True
 
     def begin_hop(self, mode: str) -> bool:
         """Before a hop's frames are scored: apply a pending reset or a mode change.

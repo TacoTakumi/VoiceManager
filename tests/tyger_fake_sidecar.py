@@ -18,7 +18,10 @@ Two ways to use it:
   pushes events to the i-th session at any time and ``drop(i)`` closes it with
   code 1011. ``sessions`` holds a ``FakeSession`` per connection with its key,
   path, unpacked hops and any bad messages. ``ready = False`` makes /health 503.
-  A message that is not a hop gets an error event line, as from the real sidecar.
+  A message that is not a hop gets an error event line, as from the real sidecar,
+  except the listening-boundary control (``wire.is_boundary_control``): like the
+  real sidecar the fake answers nothing to it, and records it in the session's
+  ``boundaries`` as the number of hops the session had sent before it.
 
   Progress lines (``wire.ScoredEvent``): by default the fake sends none, like a
   sidecar that does not report progress, whatever the session asks. With
@@ -88,6 +91,7 @@ class FakeSession:
     path: str
     hops: list = field(default_factory=list)       # wire.Hop, in order
     bad: list = field(default_factory=list)        # messages that were not hops
+    boundaries: list = field(default_factory=list)  # hops sent before each boundary
     sent: list = field(default_factory=list)       # events sent to it, in order
     closed: bool = False
     ws: object = None
@@ -222,6 +226,10 @@ class FakeTygerSidecar:
             if progress:
                 await self._send(session, [wire.ScoredEvent(mic_sample=0)])
             async for message in ws:
+                if wire.is_boundary_control(message):
+                    with self._lock:
+                        session.boundaries.append(len(session.hops))
+                    continue
                 try:
                     hop = wire.unpack_hop(message) if isinstance(message, bytes) else None
                 except ValueError as exc:

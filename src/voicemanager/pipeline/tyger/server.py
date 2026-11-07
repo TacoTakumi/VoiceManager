@@ -16,8 +16,13 @@ Wire protocol (``wire`` has the formats):
   four 80 ms frames with the session's scorer, feeds them through the session's
   turn rules, and sends the hop's events, if any, as one text message of event
   lines (endpoint, barge).
-- A message that is not a valid hop, or a hop the scorer fails on, gets one error
-  event line, and the session goes on with the next hop.
+- The server may send the listening-boundary control as a text message
+  (``wire.BOUNDARY_CONTROL``) when the client stops listening. The sidecar answers
+  nothing: the session's turn rules drop the turn so far but keep the calibrated
+  voice gate, and the scorer's context starts over at the session's next hop. It
+  applies after every hop sent before it, and touches no other session.
+- A message that is not a valid hop or the boundary control, or a hop the scorer
+  fails on, gets one error event line, and the session goes on with the next hop.
 - A session that asked for progress gets a scored line at 0 when it opens, and one
   at the hop's mic_sample last in the message of every valid hop, scored or failed,
   so each hop then gets a message.
@@ -229,8 +234,9 @@ def create_app(settings: "rules.TurnRuleSettings | None" = None,
 async def _serve_session(ws: WebSocket, session: Session, executor: ThreadPoolExecutor,
                          progress: bool = False) -> None:
     """Receive hops in order; each is scored before the next is read, so a
-    session's events keep the order of its hops. With ``progress``, each valid
-    hop's message ends with its scored line."""
+    session's events keep the order of its hops, and a boundary control applies
+    between the hops it came between. With ``progress``, each valid hop's message
+    ends with its scored line."""
     loop = asyncio.get_running_loop()
     while True:
         try:
@@ -241,6 +247,15 @@ async def _serve_session(ws: WebSocket, session: Session, executor: ThreadPoolEx
             return
         data = message.get("bytes")
         if data is None:
+            if wire.is_boundary_control(message.get("text")):
+                # No hop of this session is being scored now (each is awaited
+                # before the next message is read), so the rules change here
+                # after every hop sent before the boundary. The scorer's reset
+                # waits for the next hop's begin_hop, on the scoring thread.
+                session.rules.boundary()
+                logger.info("session %s: listening boundary after %d hops",
+                            session.key, session.hops)
+                continue
             events: list = [wire.ErrorEvent("expected a binary hop, got a text message")]
         else:
             try:
