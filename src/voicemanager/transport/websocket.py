@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 websocket_router = APIRouter()
 
+# Seconds before the session inactivity close that the timeout_warning frame is sent.
+WARNING_LEAD = 30
+
+
+def _cap(limit: float | None, cap: float) -> float:
+    """The receive-wait timeout under ``cap``; ``limit`` None means no deadline yet."""
+    return cap if limit is None else min(limit, cap)
+
 
 def _is_chunking_only_fault(exc: ValidationError) -> bool:
     """True when every validation error of a tts_stream frame is on its chunking field.
@@ -839,7 +847,15 @@ async def websocket_endpoint(websocket: WebSocket):
             elapsed = time.monotonic() - last_activity
             remaining = timeout - elapsed
 
-            if remaining <= 0:
+            # A stopped connection is exempt from the session inactivity timeout: a
+            # client that stopped listening may wait hours for its own wake word and
+            # send nothing. It neither warns nor closes, and its receive wait has no
+            # session deadline (the caps below still apply). The listen_start that ends
+            # the stop is a received frame, so the timer restarts from it with
+            # warning_sent cleared.
+            if listen.stopped:
+                wait_for = None
+            elif remaining <= 0:
                 # Timeout expired - close connection.
                 # Flush any held/stitched nemotron text as the confirmed
                 # final BEFORE closing. The finally-block teardown runs after close()
@@ -868,9 +884,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception:
                     pass
                 break
-
-            WARNING_LEAD = 30
-            if remaining <= WARNING_LEAD:
+            elif remaining <= WARNING_LEAD:
                 wait_for = remaining
             else:
                 wait_for = remaining - WARNING_LEAD
@@ -887,21 +901,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     tts_stream_last_frame = None
                     await tts_session.flush_timeout()
                     continue
-                effective_timeout = min(wait_for, idle_left)
+                effective_timeout = _cap(wait_for, idle_left)
             # While a speculative endpoint is held, cap the receive timeout to
             # the hold window so a client that stops sending audio still gets its confirmed
             # final within a bounded wall-clock time (via this same receive-timeout path),
             # never only at session close. The audio clock still drives confirmation
             # while audio keeps arriving; this is the silent-client backstop.
             if hold_machine is not None and hold_machine.is_holding:
-                effective_timeout = min(effective_timeout, settings.stt_endpoint_hold_ms / 1000.0)
+                effective_timeout = _cap(effective_timeout,
+                                         settings.stt_endpoint_hold_ms / 1000.0)
             # While an audio.cpp utterance is un-flushed, cap the receive timeout to the
             # silence window so a gap in inbound audio wakes the loop at the endpoint threshold
             # (below) instead of only at session close - the mid-session FLUSH that surfaces
             # per-utterance partials + a final. Bounded like the nemotron hold's silent-client
             # backstop; while audio keeps arriving each frame returns before this elapses.
             if stt_engine_type == "audiocpp" and audiocpp_last_audio is not None:
-                effective_timeout = min(effective_timeout, settings.audiocpp_silence_ms / 1000.0)
+                effective_timeout = _cap(effective_timeout,
+                                         settings.audiocpp_silence_ms / 1000.0)
 
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=effective_timeout)
@@ -952,7 +968,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     pipeline, _emit, session_id=session_id)
                                 audiocpp_last_audio = None
                         continue
-                if remaining > WARNING_LEAD and not warning_sent:
+                if not listen.stopped and remaining > WARNING_LEAD and not warning_sent:
                     # A receive timeout stopped implying
                     # "the client has been quiet for the whole pre-warning leg" once the
                     # audio.cpp silence cap (and the TTS-flush/hold caps) made sub-second

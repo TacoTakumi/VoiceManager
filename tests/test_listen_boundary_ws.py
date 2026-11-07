@@ -17,14 +17,19 @@ real /ws/stream handler:
   turn_engine opt-in after it still succeeds, and the turn engine's own mic count
   agrees with mic_sample;
 * a tts request while stopped is synthesized and sent as usual;
-* an unknown client frame type still gets no error frame.
+* an unknown client frame type still gets no error frame;
+* a stopped connection is exempt from the session inactivity timeout: it gets no
+  timeout_warning and is not closed, while the other receive caps (the tts_stream
+  idle flush) still run; after listen_start the timeout runs again from that frame.
 
 The STT is a whisper stand-in that answers every fed frame with one final, the TTS
 a fake engine, and the turn-engine sidecar the in-process FakeTygerSidecar.
 TestClient without ``with client:`` skips the lifespan. No GPU, no model, no live
 server, no audio hardware.
 """
+import asyncio
 import io
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 
@@ -387,3 +392,122 @@ def test_a_turn_engine_session_that_never_stops_counts_the_same(
         assert errors(frames) == []
         assert "listen_stopped" not in _types(frames)
         assert _stop(ws)[-1] == _stopped(turn_engines[0]._feed.mic_samples) == _stopped(2200)
+
+
+# --- the session inactivity timeout ---------------------------------------------------
+
+# A short session timeout and warning lead, so the warning comes 1 s after the last
+# frame and the close 1 s later. The lead is a module constant of the handler.
+TIMEOUT = 2
+LEAD = 1
+# Scheduling slack on the timing bounds: the receive loop and the test client hand
+# off through threads.
+SLACK = 0.5
+
+
+@pytest.fixture
+def short_timeout(monkeypatch, whispers):
+    monkeypatch.setenv("VM_SESSION_TIMEOUT", str(TIMEOUT))
+    monkeypatch.setenv("VM_TTS_STREAM_FLUSH_TIMEOUT", "1")
+    monkeypatch.setattr(ws_module, "WARNING_LEAD", LEAD, raising=False)
+    cfg._settings = None
+    yield
+    cfg._settings = None
+
+
+def _is_warning(f) -> bool:
+    return isinstance(f, dict) and f.get("error_type") == "timeout_warning"
+
+
+def _read_timeout_close(ws, since: float) -> None:
+    """Read the warning, the timeout error and the 1001 close, each not early."""
+    warning = ws.receive_json()
+    assert _is_warning(warning), warning
+    assert time.monotonic() - since >= TIMEOUT - LEAD - 0.1
+    closing = ws.receive_json()
+    assert closing.get("error_type") == "timeout", closing
+    assert time.monotonic() - since >= TIMEOUT - 0.1
+    closed = ws.receive()
+    assert closed["type"] == "websocket.close" and closed["code"] == 1001, closed
+    assert time.monotonic() - since <= TIMEOUT + SLACK
+
+
+def test_session_timeout_still_warns_and_closes_a_listening_connection(
+        classic, short_timeout):
+    """A connection that never sends listen_stop times out as before."""
+    with authkit.ws_connect(classic, "/ws/stream") as ws:
+        _ready(ws)
+        _send_and_read_final(ws, _pcm(64))
+        _read_timeout_close(ws, time.monotonic())
+
+
+def test_session_timeout_does_not_fire_while_stopped(classic, short_timeout):
+    with authkit.ws_connect(classic, "/ws/stream") as ws:
+        _ready(ws)
+        _send_and_read_final(ws, _pcm(64))
+        assert _stop(ws) == [_stopped(64)]
+        time.sleep(TIMEOUT + 0.3)
+        # Nothing came while stopped: no warning, no timeout error, no close.
+        assert barrier(ws) == []
+        assert _stop(ws) == [_stopped(64)]
+
+
+def test_session_timeout_runs_again_from_listen_start(classic, whispers, short_timeout):
+    """A warning sent before the stop does not carry over; the timer starts at
+    listen_start, so the next warning and the close are measured from it."""
+    with authkit.ws_connect(classic, "/ws/stream") as ws:
+        _ready(ws)
+        assert _is_warning(ws.receive_json())     # warned while listening
+        assert _stop(ws) == [_stopped(0)]
+        time.sleep(TIMEOUT + 0.3)
+        ws.send_json(START)
+        _read_timeout_close(ws, time.monotonic())
+
+
+def test_session_timeout_exemption_keeps_the_tts_stream_idle_flush(
+        whispers, executor, short_timeout):
+    """While stopped, an open tts_stream request is still flushed by its idle cap."""
+    client = _classic_client(executor)
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        _ready(ws)
+        assert _stop(ws) == [_stopped(0)]
+        ws.send_json({"type": "tts_stream", "request_id": "r1", "text": "Hello there",
+                      "flush": True})
+        sent = time.monotonic()
+        frames = recv_until(ws, is_type("audio_end"))
+        assert time.monotonic() - sent <= 1 + SLACK
+        assert not any(_is_warning(f) for f in frames), frames
+        assert errors(frames) == []
+        time.sleep(TIMEOUT + 0.3 - (time.monotonic() - sent))
+        assert barrier(ws) == []
+
+
+class _RecordingAsyncio:
+    """The handler's asyncio, recording the timeout of every receive wait."""
+
+    def __init__(self) -> None:
+        self.timeouts: list = []
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+    async def wait_for(self, awaitable, timeout):
+        self.timeouts.append(timeout)
+        return await asyncio.wait_for(awaitable, timeout)
+
+
+def test_session_timeout_leg_is_off_while_stopped_so_the_wait_blocks(
+        classic, short_timeout, monkeypatch):
+    """While stopped and with no other cap armed, the receive waits with no deadline
+    and the loop does not spin."""
+    shim = _RecordingAsyncio()
+    monkeypatch.setattr(ws_module, "asyncio", shim)
+    with authkit.ws_connect(classic, "/ws/stream") as ws:
+        _ready(ws)
+        assert _stop(ws) == [_stopped(0)]
+        time.sleep(0.3)
+        before = len(shim.timeouts)
+        time.sleep(TIMEOUT)
+        assert len(shim.timeouts) == before
+        assert shim.timeouts[-1] is None
+        assert barrier(ws) == []
