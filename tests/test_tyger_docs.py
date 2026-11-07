@@ -200,9 +200,14 @@ def test_the_readme_names_the_install_and_the_setup_step():
     assert "VM_TYGER_PREFILTER=voxlock" in README
 
 
+def _release_section(version):
+    """The CHANGELOG section of the release that shipped these settings."""
+    start = CHANGELOG.index(f"## [{version}]")
+    return CHANGELOG[start:CHANGELOG.index("## [", start + 4)]
+
+
 def test_the_changelog_has_the_prefilter_under_the_next_version():
-    newest = CHANGELOG[CHANGELOG.index("## ["):]
-    newest = newest[:newest.index("## [", 4)]
+    newest = _release_section("0.8.0")
     assert "VM_TYGER_PREFILTER" in newest and "xperimental" in newest
 
 
@@ -210,7 +215,6 @@ def test_the_changelog_has_the_prefilter_under_the_next_version():
 def test_the_calibrated_gate_settings_are_documented(name):
     assert name in README and name in GUIDE
     assert f"# {name}=" in ENV_EXAMPLE
-    newest = CHANGELOG[CHANGELOG.index("## ["):]
-    newest = newest[:newest.index("## [", 4)]
+    newest = _release_section("0.8.0")
     assert name in newest
 
