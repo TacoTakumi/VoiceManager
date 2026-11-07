@@ -24,6 +24,18 @@ All fields are little-endian::
 
 A hop is exactly 20496 bytes. Anything else is rejected with ValueError.
 
+Server to sidecar, control: one text message holding one JSON object with a
+``control`` key. The one control defined is the listening boundary::
+
+    {"control": "boundary"}
+
+The server sends it when the client stops listening on the session (it stopped
+sending mic audio). It tells the sidecar to drop the session's turn state built from
+the hops before it; the session's WebSocket stays open. ``is_boundary_control``
+recognises it: surrounding whitespace and unknown keys are allowed, as for event
+lines. Any other text message (not JSON, not an object, more than one line, no
+``control`` key, an unknown or ill-typed control) is not a control message.
+
 Sidecar to server: text messages holding event lines, one JSON object per line
 (a message may hold more than one line; blank lines are skipped)::
 
@@ -71,6 +83,13 @@ ENDPOINT_BY: tuple[str, ...] = ("model", "silence")
 
 #: The session URL's query parameter that asks for progress lines, set to "1".
 PROGRESS_PARAM = "progress"
+
+#: The key that marks a server-to-sidecar text message as a control message.
+CONTROL_KEY = "control"
+#: The control value for a listening boundary on the session.
+CONTROL_BOUNDARY = "boundary"
+#: The boundary control message exactly as the server sends it.
+BOUNDARY_CONTROL = json.dumps({CONTROL_KEY: CONTROL_BOUNDARY}, separators=(",", ":"))
 
 _INT64_MAX = 2**63 - 1
 _BIG_ENDIAN_HOST = sys.byteorder != "little"
@@ -215,6 +234,34 @@ def _check_sample_index(name: str, value) -> None:
         raise ValueError(f"{name} must be an int, got {type(value).__name__}")
     if not 0 <= value <= _INT64_MAX:
         raise ValueError(f"{name} must be in 0..2**63-1, got {value}")
+
+
+# --- control messages -------------------------------------------------------------
+
+def format_boundary_control() -> str:
+    """The listening-boundary control as one JSON text message, without a newline."""
+    return BOUNDARY_CONTROL
+
+
+def is_boundary_control(message) -> bool:
+    """Whether one text message is the listening-boundary control.
+
+    Never raises: a binary message, a malformed text message or an unknown control
+    is simply not the boundary control.
+    """
+    if not isinstance(message, str):
+        return False
+    text = message.strip()
+    if not text or "\n" in text:
+        return False
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    value = obj.get(CONTROL_KEY)
+    return type(value) is str and value == CONTROL_BOUNDARY
 
 
 # --- event lines ----------------------------------------------------------------

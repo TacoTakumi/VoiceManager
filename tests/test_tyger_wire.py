@@ -32,12 +32,17 @@ from voicemanager.pipeline.tyger.wire import (
     MODE_LISTENING,
     MODE_SPEAKING,
     SAMPLE_RATE,
+    BOUNDARY_CONTROL,
+    CONTROL_BOUNDARY,
+    CONTROL_KEY,
     VERSION,
     BargeEvent,
     EndpointEvent,
     ErrorEvent,
     Hop,
+    format_boundary_control,
     format_event,
+    is_boundary_control,
     pack_hop,
     parse_event_line,
     parse_events,
@@ -306,6 +311,67 @@ def test_format_event_rejects_invalid_events():
         format_event("endpoint")
 
 
+# --- control messages -------------------------------------------------------------
+
+def test_boundary_control_constants():
+    assert CONTROL_KEY == "control"
+    assert CONTROL_BOUNDARY == "boundary"
+    assert json.loads(BOUNDARY_CONTROL) == {"control": "boundary"}
+
+
+def test_format_boundary_control_is_one_json_line():
+    text = format_boundary_control()
+    assert text == BOUNDARY_CONTROL
+    assert "\n" not in text
+    assert json.loads(text) == {"control": "boundary"}
+
+
+def test_boundary_control_is_recognised():
+    assert is_boundary_control(format_boundary_control()) is True
+    assert is_boundary_control(BOUNDARY_CONTROL) is True
+
+
+def test_boundary_control_allows_whitespace_and_unknown_keys():
+    assert is_boundary_control(' {"control": "boundary"}\n') is True
+    assert is_boundary_control('{"control": "boundary", "reason": "listen_stop"}') is True
+
+
+@pytest.mark.parametrize("message", [
+    "",
+    "   ",
+    "not json",
+    "[]",
+    '"boundary"',
+    "null",
+    "{}",
+    '{"event": "boundary"}',                                     # not the control key
+    '{"control": "reset"}',                                      # unknown control
+    '{"control": "Boundary"}',
+    '{"control": true}',
+    '{"control": ["boundary"]}',
+    '{"control": null}',
+    '{"control": "boundary"}\n{"control": "boundary"}',          # two messages in one
+    format_event(EndpointEvent(by="model", mic_sample=5120)),    # an event line
+])
+def test_other_text_is_not_the_boundary_control(message):
+    assert is_boundary_control(message) is False
+
+
+@pytest.mark.parametrize("message", [
+    BOUNDARY_CONTROL.encode(),
+    bytearray(BOUNDARY_CONTROL.encode()),
+    None,
+    {"control": "boundary"},
+])
+def test_non_text_is_not_the_boundary_control(message):
+    assert is_boundary_control(message) is False
+
+
+def test_a_hop_is_not_the_boundary_control():
+    zeros = bytes(2 * HOP_SAMPLES)
+    assert is_boundary_control(pack_hop(MODE_LISTENING, 5120, zeros, zeros)) is False
+
+
 # --- stdlib-only import ----------------------------------------------------------
 
 def test_wire_module_imports_with_the_standard_library_alone(tmp_path):
@@ -334,6 +400,7 @@ def test_wire_module_imports_with_the_standard_library_alone(tmp_path):
         assert hop.mode == module.MODE_SPEAKING and hop.mic_sample == 5120
         line = module.format_event(module.BargeEvent(onset_mic_sample=1, mic_sample=2))
         assert module.parse_event_line(line).mic_sample == 2
+        assert module.is_boundary_control(module.format_boundary_control())
         print("ok")
     """))
     result = subprocess.run(

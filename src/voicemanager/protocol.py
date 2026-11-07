@@ -31,6 +31,13 @@ class MessageType(str, enum.Enum):
     playback = "playback"
     barge = "barge"
     turn_end = "turn_end"
+    # Listening-boundary frames: a client that stops sending mic audio sends
+    # listen_stop and the server acks with listen_stopped; listen_start resumes
+    # listening on the same connection and gets no ack. A client that never sends
+    # listen_stop sees none of them.
+    listen_stop = "listen_stop"
+    listen_start = "listen_start"
+    listen_stopped = "listen_stopped"
 
 
 class HandshakeMessage(BaseModel):
@@ -257,6 +264,41 @@ class TurnEndMessage(BaseModel):
     text: str
     mic_sample: int
     by: Literal["model", "silence"]
+
+
+# --- listening boundary ----------------------------------------------------------
+#
+# A client may stop listening (it stops sending mic audio, for example when the user
+# ends a conversation) and later start again on the same connection. At the boundary
+# the server drops the transcription and turn state built from the audio before it,
+# so nothing from before the stop reaches the client after it. The frames add no
+# error types.
+
+
+class ListenStopMessage(BaseModel):
+    """Client report that it stopped sending mic audio on this connection.
+
+    The bare {"type": "listen_stop"} frame; the server answers listen_stopped.
+    """
+    type: Literal["listen_stop"] = "listen_stop"
+
+
+class ListenStartMessage(BaseModel):
+    """Client report that it starts sending mic audio again on this connection.
+
+    The bare {"type": "listen_start"} frame. The server sends no answer.
+    """
+    type: Literal["listen_start"] = "listen_start"
+
+
+class ListenStoppedMessage(BaseModel):
+    """Server answer to a listen_stop.
+
+    ``mic_sample`` is how many mic samples the server accepted on the connection at
+    the boundary. Integers are strict: a string, float or bool is a malformed frame.
+    """
+    type: Literal["listen_stopped"] = "listen_stopped"
+    mic_sample: int = Field(ge=0, strict=True)
 
 
 # Audio format specification for handshake

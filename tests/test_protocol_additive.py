@@ -63,6 +63,10 @@ _TURN_MESSAGE_TYPES = frozenset({"turn_start", "turn_started"})
 _TURN_ENGINE_MESSAGE_TYPES = frozenset({
     "turn_engine", "turn_engine_ready", "playback", "barge", "turn_end",
 })
+# The listening-boundary frames, added later still: listen_stop and listen_start are
+# client->server; listen_stopped answers a listen_stop. A client that never sends
+# listen_stop sees none of them.
+_LISTEN_MESSAGE_TYPES = frozenset({"listen_stop", "listen_start", "listen_stopped"})
 
 # Every error_type the server sent before the turn engine. The turn engine reuses
 # invalid_request for bad frames and adds only its three own types.
@@ -258,6 +262,9 @@ def test_legacy_session_trace_is_additive_and_opt_in(monkeypatch):
     # and neither does the (client-only) turn_start type.
     assert "turn_started" not in types
     assert "turn_start" not in types
+    # Nor does any listening-boundary frame: listen_stopped answers only a
+    # listen_stop, which a legacy client never sends.
+    assert not _LISTEN_MESSAGE_TYPES & set(types)
 
     # Every server frame type is a pre-project type -- nothing outside today's
     # set, and every one is a known enum member.
@@ -286,12 +293,15 @@ def test_legacy_session_trace_is_additive_and_opt_in(monkeypatch):
 # --- structural proofs backing the trace ------------------------------------
 
 def test_project_added_only_the_two_turn_message_types():
-    # The enum grew by EXACTLY the two turn control frames and the five opt-in
-    # turn-engine frames and nothing else, so a future non-additive frame type (a
-    # retraction, a mode negotiation) trips here.
+    # The enum grew by EXACTLY the two turn control frames, the five opt-in
+    # turn-engine frames and the three listening-boundary frames and nothing else, so
+    # a future non-additive frame type (a retraction, a mode negotiation) trips here.
     current = {m.value for m in MessageType}
     assert current - _LEGACY_MESSAGE_TYPES == set(
-        _TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES)
+        _TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES | _LISTEN_MESSAGE_TYPES)
+    # The three additions are separate sets: no type is counted twice.
+    assert not _TURN_MESSAGE_TYPES & _TURN_ENGINE_MESSAGE_TYPES
+    assert not _LISTEN_MESSAGE_TYPES & (_TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES)
     # ...and nothing pre-existing was removed or renamed either.
     assert _LEGACY_MESSAGE_TYPES <= current
 
@@ -387,3 +397,15 @@ def test_turn_engine_fields_are_opt_in_only():
                   protocol.PlaybackMessage, protocol.BargeMessage,
                   protocol.TurnEndMessage):
         assert model.model_fields["type"].default in _TURN_ENGINE_MESSAGE_TYPES
+
+
+def test_listen_frames_are_opt_in_only():
+    # The listening-boundary frames are new models: no existing model gained one of
+    # their types, and none is in the set a legacy session may see.
+    assert not _LISTEN_MESSAGE_TYPES & _LEGACY_MESSAGE_TYPES
+    for model in (protocol.ListenStopMessage, protocol.ListenStartMessage,
+                  protocol.ListenStoppedMessage):
+        assert model.model_fields["type"].default in _LISTEN_MESSAGE_TYPES
+    # The two client frames carry nothing but their type, so no field is required.
+    for model in (protocol.ListenStopMessage, protocol.ListenStartMessage):
+        assert list(model.model_fields) == ["type"]
