@@ -370,6 +370,131 @@ def test_playback_while_stopped_is_quiet_and_tracks_no_reply_and_barge_works_aft
         assert len(errors(barrier(ws))) == 1
 
 
+# --- opting in while stopped ------------------------------------------------------
+
+_OPT_IN = {"type": "turn_engine", "engine": "tyger"}
+_STOPPED_AT_ZERO = {"type": "listen_stopped", "mic_sample": 0}
+
+
+def _stopped_and_opted_in(ws, c, tyger, order: str) -> None:
+    """Get the connection stopped at mic_sample 0 and opted in, in the given order.
+
+    opt_in_first:   opt in, then listen_stop (the boundary goes to the sidecar)
+    stop_first:     listen_stop before any audio, then opt in while stopped
+    stop_again:     as stop_first, then a second listen_stop while stopped
+    refused_first:  listen_stop, a refused opt-in, then a good one while stopped
+    lost_first:     listen_stop, an opt-in whose sidecar cannot be reached, then a
+                    good one while stopped
+    """
+    assert ws.receive_json()["type"] == "ready"
+    if order == "opt_in_first":
+        ws.send_json(_OPT_IN)
+        assert ws.receive_json() == {"type": "turn_engine_ready", "engine": "tyger"}
+        ws.send_json(STOP)
+        assert ws.receive_json() == _STOPPED_AT_ZERO
+        assert tyger.wait_for(lambda: len(tyger.sessions) == 1)
+        return
+    ws.send_json(STOP)
+    assert ws.receive_json() == _STOPPED_AT_ZERO
+    if order == "refused_first":
+        ws.send_json({"type": "turn_engine", "engine": "nope"})
+        (error,) = errors(barrier(ws))
+        assert error["error_type"] == "invalid_request"
+    elif order == "lost_first":
+        sidecar = c.app.state.turn_engine_sidecar
+        url, sidecar.url = sidecar.url, "ws://127.0.0.1:1/"
+        ws.send_json(_OPT_IN)
+        (error,) = errors(barrier(ws))
+        assert error["error_type"] == "turn_engine_unavailable"
+        sidecar.url = url
+    ws.send_json(_OPT_IN)
+    assert ws.receive_json() == {"type": "turn_engine_ready", "engine": "tyger"}
+    assert tyger.wait_for(lambda: len(tyger.sessions) == 1)
+    if order == "stop_again":
+        ws.send_json(STOP)
+        assert ws.receive_json() == _STOPPED_AT_ZERO
+
+
+@pytest.mark.parametrize("order", ["opt_in_first", "stop_first", "stop_again",
+                                   "refused_first", "lost_first"])
+def test_a_reply_sent_while_stopped_is_not_tracked_whatever_the_order_of_stop_and_opt_in(
+        tyger, client, made, dispatched, order):
+    """A wall console connects, stops listening, opts in and waits for its wake word.
+    The goodbye it speaks while stopped is not tracked, whether the stop came before
+    or after the opt-in: its playback frames are dropped quietly, it holds no mic
+    audio after listen_start and is no barge candidate. A reply after listen_start
+    holds and barges as usual."""
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _stopped_and_opted_in(ws, c, tyger, order)
+        mic = _Mic(ws)
+        speak(ws, "r2")                                  # a goodbye while stopped
+        ws.send_json(_start("r2", 0))
+        ws.send_json(_stop("r2", 0, 2400))
+        ws.send_json(_start("r2", 0))                    # a repeat: still no answer
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=0, mic_sample=0))
+        assert errors(frames) == [] and _of_type(frames, "barge") == []
+
+        ws.send_json(START)
+        ws.send_json(_start("r2", 0))                    # late, for the goodbye
+        ws.send_json(_stop("r2", 100, 2400))
+        fed = len(made[0].feeds)
+        post = mic.send(_POST_VALUE, 2 * FRAME)
+        frames = barrier(ws)
+        assert errors(frames) == []
+        # The goodbye holds no mic audio: the post-start frames go straight on.
+        assert b"".join(made[0].feeds[fed:]) == post
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=10, mic_sample=FRAME))
+        assert _of_type(frames, "barge") == []           # no reply is in play
+
+        # A reply after listen_start is tracked as usual: held, then barged.
+        speak(ws, "r3")
+        at = mic.at
+        ws.send_json(_start("r3", at))
+        mic.send(_POST_VALUE, 2 * FRAME)
+        assert errors(barrier(ws)) == []
+        assert b"".join(made[0].feeds[fed:]) == post     # r3 holds the mic
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=at + 100, mic_sample=at + FRAME))
+        assert [(f["request_id"], f["mic_sample"]) for f in _of_type(frames, "barge")] \
+            == [("r3", at + FRAME)]
+        assert errors(frames) == []
+        session = tyger.sessions[0]
+        # Only a stop on an opted-in session sends the sidecar a boundary; a session
+        # opened while stopped has nothing from before the stop to fence off.
+        want = [0] if order == "opt_in_first" else []
+        assert tyger.wait_for(lambda: session.boundaries == want), session.boundaries
+        assert len(tyger.sessions) == 1
+
+
+def test_a_fresh_session_follows_a_stop_and_start_before_its_opt_in(
+        tyger, client, made, dispatched):
+    """A stop and a start before the opt-in leave the connection listening: a reply
+    after the opt-in is tracked and holds the mic as usual."""
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json(STOP)
+        assert ws.receive_json() == _STOPPED_AT_ZERO
+        ws.send_json(START)
+        ws.send_json(_OPT_IN)
+        assert ws.receive_json() == {"type": "turn_engine_ready", "engine": "tyger"}
+        assert tyger.wait_for(lambda: len(tyger.sessions) == 1)
+        mic = _Mic(ws)
+        first = mic.send(_POST_VALUE, FRAME)
+        speak(ws, "r1")
+        ws.send_json(_start("r1", FRAME))
+        mic.send(_POST_VALUE, 2 * FRAME)
+        assert errors(barrier(ws)) == []
+        assert made[0].fed == first                      # r1 holds the mic
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=FRAME + 100,
+                                         mic_sample=2 * FRAME))
+    assert [(f["request_id"], f["mic_sample"]) for f in _of_type(frames, "barge")] \
+        == [("r1", 2 * FRAME)]
+    assert errors(frames) == []
+
+
 # --- the mic hold -----------------------------------------------------------------
 
 def test_held_pre_stop_audio_is_not_released_by_a_playback_start_after_listen_start(

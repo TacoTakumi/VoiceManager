@@ -238,7 +238,11 @@ listen_stopped answer goes out. Nothing from the audio before the stop crosses i
   stopped is dropped quietly too; replies sent from then on work as usual.
 
 A connection that never stops listening is not touched. A lost session only drops
-what its hold keeps.
+what its hold keeps. A connection that stops before it opts in (a wall console that
+waits for its wake word) has nothing to fence off: no mic audio, no reply, no sidecar
+session. Its hop feed only records the stop, so an opt-in while stopped starts
+stopped and gets no boundary control; a reply sent before the listen_start is not
+kept, as above.
 
 Losing the sidecar
 ------------------
@@ -1197,8 +1201,14 @@ class TurnEngineSession:
             handle.cancel()
         self._timers.clear()
         self._finals.clear()
+        if self.engine is None:
+            # Not opted in (yet): the feed holds no mic audio, no reply and no hop,
+            # and no sidecar session is open. It only records the stop, so an opt-in
+            # while stopped starts stopped: a reply sent then is not tracked.
+            self._feed.listen_boundary()
+            return
         if not self.active:
-            return  # never opted in, or lost: no sidecar to tell
+            return  # lost: no sidecar to tell
         boundary = self._feed.mic_samples
         self._boundary = boundary
         if self._hop_queue is not None:
