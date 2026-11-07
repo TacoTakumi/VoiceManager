@@ -17,6 +17,7 @@ implementation of it. Every symbol named here exists in current source - see
 - [The endpoint-hold consumption model](#the-endpoint-hold-consumption-model)
 - [Turn-taking protocol surface](#turn-taking-protocol-surface)
 - [Turn engine](#turn-engine)
+- [Listening boundary: stop and start listening on one connection](#listening-boundary-stop-and-start-listening-on-one-connection)
 - [WebSocket message-schema reference](#websocket-message-schema-reference)
 - [Client method reference](#client-method-reference)
   - [Full duplex: `duplex()`](#full-duplex-duplex)
@@ -1109,6 +1110,62 @@ If the turn engine's sidecar exits or the server loses its link to it, each opte
 
 The connection stays without a turn engine: a new opt-in on it gets `invalid_request`. The server starts the sidecar again on its own; to use the turn engine again, open **a new connection** and opt in. While the sidecar is starting again, that opt-in gets `turn_engine_unavailable`.
 
+## Listening boundary: stop and start listening on one connection
+
+A client that stops sending mic audio (the user stops listening, a conversation ends, the client goes idle until its own wake word) can tell the server so, and keep the connection open. Three frame types are added to `MessageType`: `listen_stop` and `listen_start` go from client to server, `listen_stopped` goes from server to client. Their fields and examples are in the [message-schema reference](#websocket-message-schema-reference): [`listen_stop`](#listen_stop---listenstopmessage), [`listen_start`](#listen_start---listenstartmessage) and [`listen_stopped`](#listen_stopped---listenstoppedmessage). The models are in `protocol.py`.
+
+A connection starts listening. A client that never sends these frames sees no change. Older servers drop the frames silently, as they drop any unknown frame type, so a client can send them to any server version.
+
+```text
+client -> binary mic PCM ...
+client -> { "type": "listen_stop" }                         (the client stopped its mic)
+                                 server -> { "type": "listen_stopped", "mic_sample": 482560 }
+                  ... no mic audio, for as long as the client likes ...
+client -> { "type": "listen_start" }                        (no answer)
+client -> binary mic PCM ...
+```
+
+### The frames and the stopped state
+
+- Send `listen_stop` when the client stops sending mic audio. The server answers with one `listen_stopped` while it handles that frame, before it reads the next one. Its `mic_sample` is the number of mic samples the server accepted on the connection: every binary mic frame it took, from the first one (a WAV header on the first frame is not counted), and none it dropped while stopped. The client may compare it with its own count of samples sent.
+- Send `listen_start` before the first audio after a stop. It gets no answer. The client need not wait for `listen_stopped` before it sends `listen_start` and audio: the server handles the frames of a connection in order.
+- While stopped, binary mic frames are dropped with no error. They are not counted, not checked as the first audio frame, and not sent to the STT or the turn engine.
+- Both frames are idempotent. A second `listen_stop` while stopped answers again with the same `mic_sample`; a `listen_start` while listening does nothing.
+- Neither frame ever sends an `error` frame, and extra fields are ignored. An unknown frame type still gets no answer, as before.
+- `mic_sample` keeps counting across a stop and a start: it is not reset. So the `mic_sample` values of `playback`, `barge` and `turn_end` frames stay on the connection's count. A client that counts the samples it sent counts only the audio it really sent, not the time it was stopped.
+- A `listen_stop` may come before the first audio frame of the connection (it then answers `mic_sample` 0). A `turn_engine` opt-in after it, sent before the first audio frame, still succeeds.
+
+### What the server does at `listen_stop`
+
+On a `listen_stop` that stops a listening connection, the server cuts the transcription at the boundary before it sends `listen_stopped`. Nothing made from audio before the stop reaches the client after the answer:
+
+- Every transcription frame (partial or final) from audio before the stop that has not been sent yet is dropped.
+- The STT engine's open utterance is discarded, so it does not go on into the first utterance after `listen_start`. On the `audiocpp` engine the answer can wait for one tail decode of the open utterance: the server reads that decode and discards it.
+- On a connection that opted in to the turn engine, the pending finals are dropped, so the next `turn_end` holds only text from audio after `listen_start`. The partial hop of mic audio is dropped, the mic hold drops what it keeps, and every turn-engine event at or before the boundary is ignored: no `turn_end` and no `barge` goes out for audio before the stop.
+
+The server keeps the rest of the connection's state. The turn engine's voice gate calibration and the VoxLock enrollment of the [experimental pre-filter](#barge-in-on-speakers-the-experimental-pre-filter) are kept, so the user does not calibrate or speak the 3 s voice sample again. The turn engine opt-in and the `turn_id` counter are kept too.
+
+Edge case: a `barge` the server was already handling when the `listen_stop` arrived can still arrive after `listen_stopped`. It names a reply the client already stopped and cancelled, so ignore it, as for any `barge` for a request that is not current.
+
+### TTS while stopped
+
+`listen_stop` does not cancel TTS. A `tts` or `tts_stream` request while stopped is synthesized as usual, for example a spoken goodbye. On a turn-engine connection, `playback` frames while stopped are dropped with no answer, and a reply begun while stopped is not tracked for barge, even if it plays on after `listen_start`. After `listen_start`, a late `playback` frame for a reply the server forgot at the boundary is dropped with no answer too. Replies begun after `listen_start` work as usual.
+
+### Stopping in the middle of a reply
+
+To stop a reply that plays and then stop listening, send the frames in this order:
+
+1. `playback` `stop` for the reply that played, with its `mic_sample` and `reply_sample` (turn-engine connections only).
+2. `tts_cancel` for the open `request_id`, if the server is still sending it.
+3. Stop the mic: send no more binary mic frames.
+4. `listen_stop`.
+
+The `playback` `stop` goes first because a `playback` frame sent while stopped is dropped.
+
+### The session timeout
+
+A stopped connection is exempt from `VM_SESSION_TIMEOUT`: it gets no `timeout_warning` and no `1001` close, however long it stays stopped. After `listen_start` the inactivity timer runs again from that frame. The `VM_TTS_STREAM_FLUSH_TIMEOUT` idle flush of an open `tts_stream` request still runs while stopped.
+
 ## WebSocket message-schema reference
 
 All WebSocket **text** frames are JSON objects with a `type` field that routes
@@ -1122,6 +1179,10 @@ envelope - see [Binary frames](#binary-frames) at the end of this section.
 The turn-engine frames (`turn_engine`, `turn_engine_ready`, `playback`, `barge`
 and `turn_end`) are documented with their fields and examples in
 [Turn engine frames](#turn-engine-frames).
+
+The listen frames (`listen_stop`, `listen_start` and `listen_stopped`) are listed
+below with their neighbours; what they do is in
+[Listening boundary](#listening-boundary-stop-and-start-listening-on-one-connection).
 
 `MessageType` also declares `audio_chunk`, which is **reserved and currently
 unused**: no frame of that type is ever sent in either direction. STT input and
@@ -1199,6 +1260,20 @@ turn's id. The server owns the turn counter.
 | `type` | string | `"turn_started"` | Frame discriminator. |
 | `turn_id` | integer | *(required)* | The id of the turn just opened; filter subsequent utterances by it. |
 
+#### `listen_stopped` - `ListenStoppedMessage`
+
+The server's answer to every `listen_stop`, sent while it handles that frame. See
+[Listening boundary](#listening-boundary-stop-and-start-listening-on-one-connection).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"listen_stopped"` | Frame discriminator. |
+| `mic_sample` | integer >= 0 | *(required)* | The mic samples the server accepted on the connection at the stop (a WAV header on the first frame is not counted; frames dropped while stopped are not counted). A JSON integer: the model refuses a string, a float or a boolean. |
+
+```json
+{ "type": "listen_stopped", "mic_sample": 482560 }
+```
+
 #### `error` - `ErrorMessage`
 
 Sent before the server closes on a protocol violation, and for non-fatal notices
@@ -1256,6 +1331,34 @@ server replies with a `turn_started` ack.
 
 ```json
 { "type": "turn_start" }
+```
+
+#### `listen_stop` - `ListenStopMessage`
+
+Report that the client stopped sending mic audio. The server answers with
+`listen_stopped`. A bare frame with no other fields; extra fields are ignored. See
+[Listening boundary](#listening-boundary-stop-and-start-listening-on-one-connection).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"listen_stop"` | Frame discriminator. |
+
+```json
+{ "type": "listen_stop" }
+```
+
+#### `listen_start` - `ListenStartMessage`
+
+Report that the client starts sending mic audio again. Send it before the first
+audio after a `listen_stop`. The server sends no answer. A bare frame with no
+other fields; extra fields are ignored.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"listen_start"` | Frame discriminator. |
+
+```json
+{ "type": "listen_start" }
 ```
 
 ### Binary frames
@@ -1427,7 +1530,7 @@ before the socket drops.
 |---|---|---|---|
 | `1008` | *(none)* | No valid bearer token. The server closes with `1008` **before** accepting the upgrade, so the client never receives a `1008` frame - it sees an **HTTP 403** handshake rejection instead. | Fix the token; do not retry with the same one. `VoiceManagerClient` surfaces this as `AuthenticationError`, not a close event. |
 | `1003` | `invalid_audio_format` | The first binary frame was not 16 kHz mono 16-bit PCM (nor a WAV container). | Send correctly formatted PCM (see [Binary frames](#binary-frames)); reconnect. |
-| `1001` | `timeout` | Inactivity: no traffic for `VM_SESSION_TIMEOUT` seconds. A `timeout_warning` `error` frame arrives ~30s ahead of the close. | Keep the session active or reconnect; heed the `timeout_warning`. |
+| `1001` | `timeout` | Inactivity: no traffic for `VM_SESSION_TIMEOUT` seconds. A `timeout_warning` `error` frame arrives ~30s ahead of the close. A connection that stopped listening (`listen_stop`) is exempt until its `listen_start`. | Keep the session active or reconnect; heed the `timeout_warning`. |
 | `1011` | `server_error` | An unexpected server-side exception in the connection handler. | Reconnect; if it persists, inspect the server logs. |
 | `1011` | `stt_backend_fault` | audio.cpp engine only. The STT sidecar process faulted mid-session (a runtime fault in the native model, or the process died). The backend was serving and broke; the VoiceManager server itself is unaffected, as are other sessions. | Reconnect - a fresh session gets a fresh sidecar, so a retry usually succeeds. |
 | `1011` | `tts_backend_fault` | audio.cpp TTS engine only. This session's TTS sidecar process died mid-request. Per-session sidecar means per-session blast radius: only this session closes. | Reconnect - a fresh session gets a fresh sidecar, so a retry usually succeeds. |
@@ -1481,7 +1584,7 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_VIBEVOICE_VOICE` | `Carter` | Default preset voice when neither the request nor the token names a voice (VibeVoice). |
 | `VM_AUDIOCPP_TTS_VOICE` | `designed_female_s101` | Default preset voice when neither the request nor the token names a voice (audiocpp); the full `VM_AUDIOCPP_TTS_*` set is documented [in its section](#the-audiocpp-tts-engine-presets-per-model-sample-rate-one-request-batching). |
 | `VM_STT_ENDPOINT_HOLD_MS` | `1000` | Speculative endpoint-hold window; `> 0` enables provisional `endpoint` frames, `0` disables them (immediate finals). |
-| `VM_SESSION_TIMEOUT` | `300` | Inactivity seconds before a `1001` close (with a ~30s `timeout_warning`). |
+| `VM_SESSION_TIMEOUT` | `300` | Inactivity seconds before a `1001` close (with a ~30s `timeout_warning`). A stopped connection (after `listen_stop`) is exempt. |
 | `VM_TTS_STREAM_FLUSH_TIMEOUT` | `10` | Idle seconds before a streaming reply auto-flushes and completes with `reason: "complete"`. The clock starts at the last `tts_stream` frame of the request, so microphone audio on the same socket does not hold it off. |
 | `VM_TTS_CLAUSE_FIRST_WORDS` | `3` | Clause mode: words held before the first piece is sent, if no clause mark comes first. |
 | `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` | `300` | Clause mode: milliseconds after the first held word before the first piece is sent. |

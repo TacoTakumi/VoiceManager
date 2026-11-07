@@ -4,6 +4,35 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0]
+
+### Added
+
+- A listening boundary on one connection. A client sends `listen_stop` when it
+  stops sending mic audio (stop listening, end of a conversation, idle) and
+  `listen_start` before its first audio after the stop. The server answers each
+  `listen_stop` with `listen_stopped`, whose `mic_sample` is the count of mic
+  samples it accepted on the connection; `listen_start` gets no answer. Both
+  frames are idempotent and never send an `error` frame. A connection starts
+  listening, so a client that never sends them sees no change, and older servers
+  drop them silently. See "Listening boundary" in `docs/client-integration.md`.
+- While stopped, mic frames are dropped with no error and are not counted. At the
+  stop the server drops every transcription from audio before it that is not sent
+  yet and discards the STT engine's open utterance, on every STT engine. On a
+  turn-engine connection it also drops the pending finals, the partial hop and the
+  mic hold, and sends no `turn_end` or `barge` for audio before the stop.
+- A stopped connection is exempt from `VM_SESSION_TIMEOUT`: no `timeout_warning`,
+  no `1001` close. After `listen_start` the timer runs again from that frame.
+- The Tyger turn engine keeps the connection's calibrated voice gate
+  (`VM_TYGER_GATE_MARGIN_DB`, `VM_TYGER_GATE_MAX_DB`) and, with the experimental
+  pre-filter (`VM_TYGER_PREFILTER=voxlock`), its VoxLock enrollment across a
+  stop and a start, so the user does not calibrate or give the 3 s voice sample
+  again. The turn-engine opt-in and the `turn_id` counter are kept too.
+- `listen_stop` does not cancel TTS: a `tts` or `tts_stream` request while stopped
+  is synthesized (for example a spoken goodbye). On a turn-engine connection,
+  `playback` frames while stopped are dropped with no answer, and a reply begun
+  while stopped is not tracked for barge.
+
 ## [0.7.0]
 
 ### Added
