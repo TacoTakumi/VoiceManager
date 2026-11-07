@@ -7,8 +7,10 @@ differs from the session's own logs a warning; no ack in time (an older server) 
 closed connection returns None and the session stays stopped; a late ack after a
 timeout does not answer the next listen_stop; while stopped send_audio sends and counts
 nothing; listen_start sends the frame and audio flows and counts again; both refuse on
-a closed session; a reconnect starts listening again; and a session that never calls
-them is unchanged.
+a closed session; a reconnect starts listening again; closing a stopped session sends
+listen_start, so the one-sided methods and the next session listen again, while closing
+a listening session sends nothing and closing on a gone connection raises nothing; and
+a session that never calls them is unchanged.
 """
 import asyncio
 import json
@@ -16,6 +18,7 @@ import logging
 from unittest.mock import AsyncMock
 
 import pytest
+import websockets
 
 from voicemanager.client import VoiceManagerClient, VoiceManagerError
 from voicemanager.protocol import (
@@ -81,6 +84,20 @@ def _sent(client: VoiceManagerClient) -> list:
     return out
 
 
+def _server_mic_sample(sent: list) -> int:
+    """The mic samples a server counts from these frames: audio sent while listening."""
+    listening, count = True, 0
+    for frame in sent:
+        if isinstance(frame, bytes):
+            if listening:
+                count += len(frame) // 2
+        elif frame.get("type") == "listen_stop":
+            listening = False
+        elif frame.get("type") == "listen_start":
+            listening = True
+    return count
+
+
 def _stopped(mic_sample: int) -> dict:
     return ListenStoppedMessage(mic_sample=mic_sample).model_dump()
 
@@ -105,7 +122,7 @@ def test_listen_stop_sends_the_frame_and_returns_the_acks_mic_sample(caplog):
         assert asyncio.run(run()) == 160
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     sent = _sent(client)
-    assert sent == [CHUNK, {"type": "listen_stop"}]
+    assert sent == [CHUNK, {"type": "listen_stop"}, {"type": "listen_start"}]  # closing the stopped session
     ListenStopMessage.model_validate(sent[1])
 
 
@@ -139,7 +156,7 @@ def test_listen_stop_returns_none_and_stays_stopped_when_no_ack_comes():
             client._ws.end()
             return count, listening
     assert asyncio.run(run()) == (None, False)
-    assert _sent(client) == [{"type": "listen_stop"}]
+    assert _sent(client) == [{"type": "listen_stop"}, {"type": "listen_start"}]  # closing the stopped session
 
 
 def test_listen_stop_returns_none_when_the_connection_closes_while_waiting():
@@ -192,7 +209,8 @@ def test_listen_stop_while_stopped_still_sends_the_frame():
             ws.end()
             return first, second
     assert asyncio.run(run()) == (0, 0)
-    assert _sent(client) == [{"type": "listen_stop"}, {"type": "listen_stop"}]
+    assert _sent(client) == [
+        {"type": "listen_stop"}, {"type": "listen_stop"}, {"type": "listen_start"}]  # closing the stopped session
 
 
 def test_listen_stop_refuses_on_a_closed_session():
@@ -224,7 +242,7 @@ def test_send_audio_while_stopped_sends_and_counts_nothing():
             ws.end()
             return session.mic_sample
     assert asyncio.run(run()) == 160
-    assert _sent(client) == [CHUNK, {"type": "listen_stop"}]
+    assert _sent(client) == [CHUNK, {"type": "listen_stop"}, {"type": "listen_start"}]  # closing the stopped session
 
 
 # --- listen_start ----------------------------------------------------------------------
@@ -311,3 +329,130 @@ def test_a_session_that_never_calls_them_is_unchanged():
     assert asyncio.run(run()) == 320
     sent = _sent(client)
     assert sent == [CHUNK, CHUNK]
+
+
+# --- closing a stopped session ---------------------------------------------------------
+
+def _close_stopped_session(client: VoiceManagerClient, ws: _FakeServerWS):
+    """Send audio, stop listening, and close the session."""
+    async def run():
+        session = client.duplex()
+        await session.send_audio(CHUNK)
+        assert await session.listen_stop() == 160
+        await session.close()
+    return run()
+
+
+def test_stream_stt_after_closing_a_stopped_session_sends_audio_the_server_counts():
+    ws = _FakeServerWS({"listen_stop": lambda: [_stopped(160)]})
+    client = _client(ws)
+
+    async def chunks():
+        yield CHUNK
+        ws.end()  # the reader then ends the results, so stream_stt returns at once
+
+    async def run():
+        _start_reader(client)
+        await _close_stopped_session(client, ws)
+        await asyncio.wait_for(client.stream_stt(chunks()), 2.0)
+    asyncio.run(run())
+    sent = _sent(client)
+    assert sent == [CHUNK, {"type": "listen_stop"}, {"type": "listen_start"}, CHUNK]
+    assert client._mic_bytes // 2 == _server_mic_sample(sent) == 320
+
+
+def test_stream_stt_live_after_closing_a_stopped_session_sends_audio_the_server_counts():
+    ws = _FakeServerWS({"listen_stop": lambda: [_stopped(160)]})
+    client = _client(ws)
+
+    async def chunks():
+        yield CHUNK
+        ws.end()
+
+    async def run():
+        _start_reader(client)
+        await _close_stopped_session(client, ws)
+
+        async def drain():
+            return [frame async for frame in client.stream_stt_live(chunks())]
+        await asyncio.wait_for(drain(), 2.0)
+    asyncio.run(run())
+    sent = _sent(client)
+    assert sent == [CHUNK, {"type": "listen_stop"}, {"type": "listen_start"}, CHUNK]
+    assert client._mic_bytes // 2 == _server_mic_sample(sent) == 320
+
+
+def test_a_new_session_after_closing_a_stopped_one_starts_listening():
+    ws = _FakeServerWS({"listen_stop": lambda: [_stopped(160)]})
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        await _close_stopped_session(client, ws)
+        async with client.duplex() as session:
+            listening = session.listening
+            await session.send_audio(CHUNK)
+            mic_sample = session.mic_sample
+        ws.end()
+        return listening, mic_sample
+    assert asyncio.run(run()) == (True, 320)
+    sent = _sent(client)
+    assert sent == [CHUNK, {"type": "listen_stop"}, {"type": "listen_start"}, CHUNK]
+    assert _server_mic_sample(sent) == 320
+
+
+def test_closing_a_listening_session_sends_no_extra_frame():
+    ws = _FakeServerWS({"listen_stop": lambda: [_stopped(160)]})
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            await session.send_audio(CHUNK)
+        async with client.duplex() as session:
+            await session.listen_stop()
+            await session.listen_start()
+        ws.end()
+    asyncio.run(run())
+    assert _sent(client) == [CHUNK, {"type": "listen_stop"}, {"type": "listen_start"}]
+
+
+def test_closing_a_closed_session_again_sends_nothing_and_leaves_a_new_session_stopped():
+    ws = _FakeServerWS({"listen_stop": lambda: [_stopped(0)]})
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        first = client.duplex()
+        await first.close()
+        second = client.duplex()
+        await second.listen_stop()
+        await first.close()
+        listening = second.listening
+        ws.end()
+        return listening
+    assert asyncio.run(run()) is False
+    assert _sent(client) == [{"type": "listen_stop"}]
+
+
+@pytest.mark.parametrize("gone", ["send_fails", "disconnected"])
+def test_closing_a_stopped_session_on_a_gone_connection_raises_nothing(gone, monkeypatch):
+    client = _client()
+    connects = []
+
+    async def _record_connect():
+        connects.append(1)
+        raise OSError("down")
+    monkeypatch.setattr(client, "_connect", _record_connect)
+
+    async def run():
+        session = client.duplex()
+        assert await session.listen_stop(timeout=0.01) is None
+        if gone == "send_fails":
+            client._ws.send.side_effect = websockets.exceptions.ConnectionClosed(None, None)
+        else:
+            await client._disconnect()
+        await session.close()
+        return session.listening, session.closed, client._duplex
+    assert asyncio.run(run()) == (True, True, None)
+    assert connects == []  # closing does not reconnect; the next send does

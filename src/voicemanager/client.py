@@ -198,6 +198,8 @@ class DuplexSession:
     counting them, and TTS goes on as usual. ``await session.listen_start()`` before
     the next audio listens again; ``listening`` tells which state the session is in.
     A connection starts listening, and so does the new connection of a reconnect.
+    ``close()`` on a stopped session sends listen_start, so the connection listens
+    again for the one-sided methods and the next session.
     """
 
     def __init__(self, client: "VoiceManagerClient") -> None:
@@ -211,10 +213,33 @@ class DuplexSession:
         await self.close()
 
     async def close(self) -> None:
-        """End the session; the client's one-sided methods work again."""
+        """End the session; the client's one-sided methods work again.
+
+        Closing a stopped session (see ``listen_stop``) sends listen_start, so the
+        connection listens again: audio from ``stream_stt``, ``stream_stt_live`` or a
+        new session reaches STT and is counted as the server counts it. Closing a
+        session that is listening sends nothing. If the connection is already gone
+        the frame is not sent and nothing is raised; the client still counts as
+        listening, as the new connection of a reconnect does. Closing a session
+        again does nothing.
+        """
+        if self.closed:
+            return
+        client = self._client
         self.closed = True
-        if self._client._duplex is self:
-            self._client._duplex = None
+        if client._duplex is self:
+            client._duplex = None
+        if not client._listen_stopped:
+            return
+        client._listen_stopped = False
+        if client._ws is None:
+            return
+        try:
+            await client._ws.send(json.dumps({"type": "listen_start"}))
+        except websockets.exceptions.ConnectionClosed:
+            # The next send finds the closed connection and reconnects, and a new
+            # connection listens; closing the session does not reconnect itself.
+            client._logger.debug("Connection gone; listen_start not sent on close")
 
     async def send_audio(self, pcm: bytes) -> None:
         """Send one binary frame of 16 kHz mono 16-bit PCM to STT.

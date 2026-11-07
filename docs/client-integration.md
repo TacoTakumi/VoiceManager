@@ -1444,12 +1444,12 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `DuplexSession.turn_ends` | `()` | `AsyncIterator[dict]` | Yield each `turn_end` frame of an opted-in connection. |
 | `DuplexSession.listen_stop` | `(timeout=5.0)` | `int \| None` | Stop listening: the session stops first, so `send_audio` drops frames from then on, then it sends `listen_stop` and returns the `mic_sample` of `listen_stopped`. Logs a warning when that count differs from `mic_sample`. Returns `None`, still stopped, when no answer comes within `timeout` (a server older than 0.8.0) or the connection closes. Sends the frame again when already stopped. |
 | `DuplexSession.listen_start` | `()` | `None` | Send `listen_start` and listen again; returns at once (the server sends no answer). Sends the frame again when already listening. |
-| `DuplexSession.listening` | property | `bool` | `False` between a `listen_stop` and the next `listen_start`. While stopped, `send_audio` sends and counts nothing, so `mic_sample` keeps matching the server's count. A reconnect starts listening. |
+| `DuplexSession.listening` | property | `bool` | `False` between a `listen_stop` and the next `listen_start`. While stopped, `send_audio` sends and counts nothing, so `mic_sample` keeps matching the server's count. A reconnect starts listening, and so does `close()`. |
+| `DuplexSession.close` | `()` | `None` | End the session; the one-sided methods work again. Closing a stopped session sends `listen_start`, so `stream_stt`, `stream_stt_live` and the next session listen and count as the server does; closing a listening session sends nothing. If the connection is already gone nothing is sent or raised (the reconnect listens). A second `close()` does nothing. |
 
 On an opted-in connection, `DuplexSession.audio` also yields `("barge", frame)`,
 before that request's `audio_end` (reason `"interrupted"`), and drops any PCM of
 the barged request.
-| `DuplexSession.close` | `()` | `None` | End the session; the one-sided methods work again. |
 
 A classic turn loop in outline (the full version, with supersede on a revised
 endpoint and barge-in, is `scripts/voice_agent.py classic`):
