@@ -452,6 +452,51 @@ def test_chunker_keeps_working_after_drain(chunker, clock):
     assert chunker.poll() == ["new "]
 
 
+@pytest.mark.parametrize("first, held", [
+    ("most frequent use.", "\n\n"),  # a whitespace-only frame after the cut piece
+    ("most frequent use. ", ""),  # the " " left after a mark cut
+])
+def test_drain_keeping_unspoken_text_holds_it_for_the_next_piece(chunker, first, held):
+    frames = [first, held, "One: software work."]
+    pieces = []
+    chunker.feed(first)
+    pieces += chunker.poll()
+    assert pieces == ["most frequent use."]
+    if held:
+        chunker.feed(held)
+        assert chunker.poll() == []
+    # A flush leaves the request open: the held whitespace is not dropped...
+    assert chunker.drain(keep_unspoken=True) == []
+    chunker.feed("One: software work.")
+    pieces += chunker.poll()
+    # ...it starts the next piece, so no two words run together.
+    leading = first[len("most frequent use."):] + held
+    assert pieces[-1] == leading + "One: software work."
+    pieces += chunker.drain()
+    assert "".join(pieces) == "".join(frames)
+
+
+def test_drain_keeping_unspoken_text_keeps_held_punctuation(chunker):
+    chunker.feed("(")
+    assert chunker.drain(keep_unspoken=True) == []
+    chunker.feed("as noted) we go on.")
+    assert chunker.poll() == ["(as noted) we go on."]
+
+
+def test_drain_keeping_unspoken_text_sends_spoken_text_whole(chunker):
+    chunker.feed(" two words ")
+    assert chunker.drain(keep_unspoken=True) == [" two words "]
+    assert chunker.drain() == []
+
+
+def test_default_drain_drops_held_text_with_nothing_to_speak(chunker):
+    chunker.feed(". ")
+    assert chunker.drain() == []
+    # Nothing is left held: the next text does not start with the dropped ". ".
+    chunker.feed("word")
+    assert chunker.drain() == ["word"]
+
+
 # --- token streams: count and time triggers cut at a word boundary ----------------
 
 

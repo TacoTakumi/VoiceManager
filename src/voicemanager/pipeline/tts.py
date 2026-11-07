@@ -641,7 +641,9 @@ class TTSStreamPipeline:
         """feed_text for a clause request: hold the text and send what the rule cuts.
 
         done and flush both send everything held as one piece; done then ends the
-        request with the sentinel (one audio_end), flush leaves it open.
+        request with the sentinel (one audio_end), flush leaves it open. Held text
+        with nothing to speak (whitespace or punctuation only) is dropped at done
+        but kept at a flush, where it starts the next piece of the open request.
         """
         chunker = self._clause_chunker
         chunker.feed(chunk)
@@ -652,7 +654,8 @@ class TTSStreamPipeline:
                 await self._sentence_queue.put(piece)
             await self._sentence_queue.put(None)
             return
-        for piece in chunker.drain() if flush else chunker.poll():
+        pieces = chunker.drain(keep_unspoken=True) if flush else chunker.poll()
+        for piece in pieces:
             await self._sentence_queue.put(piece)
         self._wake_clause_timer()
 

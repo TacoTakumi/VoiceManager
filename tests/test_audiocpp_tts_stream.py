@@ -523,3 +523,50 @@ def test_clause_pieces_merged_while_busy_get_no_inserted_space() -> None:
     texts = [r["text"] for r in fake.requests]
     _assert_clean(texts)
     assert texts == ["Hi there friend,", SPOKEN]
+
+
+def test_clause_pieces_merged_across_a_whitespace_only_flush_keep_the_space() -> None:
+    """A flush while only whitespace is held keeps that whitespace, so two pieces
+    merged into one request around it do not run together ("use.One:")."""
+    from voicemanager.pipeline.audiocpp_tts import AudioCppTTSStreamPipeline
+
+    with FakeTtsSidecar(gate_after_first=True) as fake:
+        engine = _external_engine(fake)
+        ws = _FakeWS()
+
+        async def scenario() -> None:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pipeline = TTSPipeline(engine=engine, executor=executor)
+                stream = AudioCppTTSStreamPipeline(
+                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0)
+
+                async def feed(chunk: str, done: bool = False, flush: bool = False) -> None:
+                    await stream.feed_text(chunk=chunk, done=done, websocket=ws,
+                                           request_id="c1", chunking="clause",
+                                           flush=flush)
+
+                # The first piece goes out at its clause mark; the fake holds it.
+                await feed("Hi there friend,")
+                await _await_requests(fake, 1)
+
+                await feed("most frequent use.")  # cut at its mark, queued
+                await feed("\n\n")
+                await feed("", flush=True)  # only the "\n\n" is held
+                await feed("One: software work.")
+                await feed("", done=True)
+                assert len(fake.requests) == 1, \
+                    "nothing new may dispatch while a request is synthesizing"
+
+                fake.proceed.set()
+                task = stream.synthesis_task
+                assert task is not None
+                await asyncio.wait_for(task, timeout=10.0)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            engine.dispose()
+
+    texts = [r["text"] for r in fake.requests]
+    _assert_clean(texts)
+    assert texts == ["Hi there friend,", "most frequent use. One: software work."]

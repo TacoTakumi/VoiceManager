@@ -40,8 +40,10 @@ the next piece; whitespace at a word end closes the piece before it. Only text t
 holds a letter or digit is spoken, so no piece is text without one (a lone "." or
 "&"). A cut whose piece would hold no letter or digit does not happen: that text
 stays held and starts the next piece. Held text with no letter or digit has no
-deadline, and ``drain`` drops it, so the only text a request can lose is a tail
-with nothing to speak in it.
+deadline, and ``drain`` drops it at done and at the flush timeout, so the only
+text a request can lose is a tail with nothing to speak in it. A flush leaves the
+request open, so its ``drain(keep_unspoken=True)`` keeps such text held to start
+the next piece.
 
 The unplayed-audio estimate is a play cursor: the clock time at which the audio sent
 so far ends. Each audio chunk extends playback from the later of the cursor and now
@@ -53,7 +55,8 @@ clock (seconds, ``time.monotonic`` by default) or an explicit ``now`` argument. 
 caller feeds text with ``feed``, reports each audio chunk it sends with
 ``record_audio``, calls ``poll`` after each event and sends the pieces it returns,
 and arms a timer for ``next_deadline`` so a time trigger is not missed. ``drain``
-empties the buffer for done and flush. One chunker serves one request.
+sends all held text for done and flush (a flush keeps text with nothing to speak
+held). One chunker serves one request.
 """
 from collections.abc import Callable
 import time
@@ -231,16 +234,29 @@ class ClauseChunker:
             return min(deadline, grace_end)
         return deadline
 
-    def drain(self) -> list[str]:
+    def drain(self, keep_unspoken: bool = False) -> list[str]:
         """Remove and return all held text as one piece, exactly as received.
 
-        Use it for done and flush, which send everything held at once. Returns []
-        when the held text holds no letter or digit (nothing, whitespace or only
-        punctuation); that text is dropped.
+        Use it for done, flush and the flush timeout, which send everything held at
+        once. When the held text holds no letter or digit (nothing, whitespace or
+        only punctuation), it returns [] and:
+
+        - with ``keep_unspoken`` False (done, the flush timeout: the request ends),
+          drops that text;
+        - with ``keep_unspoken`` True (a flush: the request stays open), keeps it
+          held, so it starts the next piece and the words around it do not run
+          together ("use." + "\\n\\n" + "One:").
+
+        Held text with a letter or digit is always removed and returned whole,
+        whitespace included.
         """
         text = "".join(text for text, _ in self._frames)
+        if not _is_spoken(text):
+            if not keep_unspoken:
+                self._frames.clear()
+            return []
         self._frames.clear()
-        return [text] if _is_spoken(text) else []
+        return [text]
 
     def unplayed_estimate(self, now: float | None = None) -> float:
         """Return the estimated unplayed audio in seconds, floored at 0.

@@ -625,3 +625,46 @@ def test_the_shared_pipeline_sends_each_piece_without_its_whitespace():
         assert engine.texts == ["one two", "three four,", "five"]
 
     asyncio.run(run())
+
+
+# --- a flush keeps held text with nothing to speak --------------------------
+
+@pytest.mark.parametrize("held, rest, expected", [
+    ("\n\n", "One: software work.", "One: software work."),
+    (" (", "as noted) we go on.", "(as noted) we go on."),
+])
+def test_a_flush_with_only_unspoken_text_held_loses_nothing(held, rest, expected):
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, **_NO_TIMER)
+        await pipe.feed_text("most frequent use.", False, ws, "r1", chunking="clause")
+        await _until(lambda: engine.texts == ["most frequent use."])
+        await pipe.feed_text(held, False, ws, "r1")
+        await pipe.feed_text("", False, ws, "r1", flush=True)
+        await pipe.feed_text(rest, False, ws, "r1")
+        await _finish(pipe, ws)
+        assert engine.texts == ["most frequent use.", expected]
+        assert len(ws.audio_ends()) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cls", PIPELINES)
+@pytest.mark.parametrize("ending", ["done", "flush_timeout"])
+def test_the_end_of_a_request_drops_held_text_with_nothing_to_speak(cls, ending):
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, cls, **_NO_TIMER)
+        await pipe.feed_text("most frequent use.", False, ws, "r1", chunking="clause")
+        await _until(lambda: engine.texts == ["most frequent use."])
+        await pipe.feed_text(". ", False, ws, "r1")
+        if ending == "done":
+            await pipe.feed_text("", True, ws, "r1")
+        else:
+            await pipe.flush_timeout(ws, "r1")
+        await asyncio.wait_for(pipe.synthesis_task, 2.0)
+        # The ". " tail holds nothing to speak: no engine request for it.
+        assert engine.texts == ["most frequent use."]
+        assert len(ws.audio_ends()) == 1
+
+    asyncio.run(run())
