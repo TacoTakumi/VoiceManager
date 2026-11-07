@@ -584,6 +584,7 @@ async def websocket_endpoint(websocket: WebSocket):
             clause_later_words=settings.tts_clause_later_words,
             clause_margin_ms=settings.tts_clause_margin_ms,
             clause_mark_min_words=settings.tts_clause_mark_min_words,
+            clause_word_grace_ms=settings.tts_clause_word_grace_ms,
             **stream_kwargs,
         )
 

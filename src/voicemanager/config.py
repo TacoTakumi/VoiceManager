@@ -372,12 +372,16 @@ class Settings(BaseSettings):
     # comes first; a later piece goes out at such a mark, after this many words,
     # or once less than the margin of audio is still unplayed, whichever comes
     # first (the unplayed audio is estimated from a play cursor, so a playback
-    # gap is not counted as audio played).
+    # gap is not counted as audio played). A word-count or time cut falls at the
+    # last word end: a word ends at whitespace, and the end of the held text counts
+    # as a word end once no new frame arrived for word_grace_ms, so a word split
+    # across LLM tokens is not cut in two (0 = every frame end is a word end).
     tts_clause_first_words: int = Field(default=3, gt=0)          # VM_TTS_CLAUSE_FIRST_WORDS
     tts_clause_first_deadline_ms: int = Field(default=300, gt=0)  # VM_TTS_CLAUSE_FIRST_DEADLINE_MS
     tts_clause_later_words: int = Field(default=12, gt=0)         # VM_TTS_CLAUSE_LATER_WORDS
     tts_clause_margin_ms: int = Field(default=1000, gt=0)         # VM_TTS_CLAUSE_MARGIN_MS
     tts_clause_mark_min_words: int = Field(default=3, gt=0)       # VM_TTS_CLAUSE_MARK_MIN_WORDS
+    tts_clause_word_grace_ms: int = Field(default=250, ge=0)      # VM_TTS_CLAUSE_WORD_GRACE_MS
 
     # Settings that hold a file or directory path. A relative value resolves
     # against resolve_home(), so it means the same file from any directory.

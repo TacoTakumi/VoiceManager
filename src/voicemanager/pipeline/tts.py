@@ -458,6 +458,7 @@ class TTSStreamPipeline:
         clause_later_words: int = 12,
         clause_margin_ms: int = 1000,
         clause_mark_min_words: int = 3,
+        clause_word_grace_ms: int = 250,
         clause_clock: Callable[[], float] = time.monotonic,
     ):
         self._tts_pipeline = tts_pipeline
@@ -483,6 +484,7 @@ class TTSStreamPipeline:
             "later_piece_words": clause_later_words,
             "unplayed_margin_ms": clause_margin_ms,
             "mark_min_words": clause_mark_min_words,
+            "word_grace_ms": clause_word_grace_ms,
         }
         self._clause_clock = clause_clock
         # Per-request clause state: None on a sentence request.

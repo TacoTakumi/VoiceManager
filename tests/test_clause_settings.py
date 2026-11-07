@@ -17,11 +17,16 @@ CASES = [
     ("VM_TTS_CLAUSE_MARK_MIN_WORDS", "tts_clause_mark_min_words", 3, 5),
 ]
 
+# The word grace may be 0 (every frame end is a word end), so it is not in CASES,
+# whose settings all reject 0.
+GRACE_ENV = "VM_TTS_CLAUSE_WORD_GRACE_MS"
+
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for env, _, _, _ in CASES:
         monkeypatch.delenv(env, raising=False)
+    monkeypatch.delenv(GRACE_ENV, raising=False)
 
 
 @pytest.mark.parametrize("env,field,default,override", CASES)
@@ -49,3 +54,26 @@ def test_env_example_lists_all_names():
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     for env, _, default, _ in CASES:
         assert f"# {env}={default}" in text
+
+
+def test_word_grace_default_when_unset():
+    assert Settings(_env_file=None).tts_clause_word_grace_ms == 250
+
+
+@pytest.mark.parametrize("value", [0, 400])
+def test_word_grace_env_override(monkeypatch, value):
+    monkeypatch.setenv(GRACE_ENV, str(value))
+    assert Settings(_env_file=None).tts_clause_word_grace_ms == value
+
+
+def test_word_grace_negative_rejected(monkeypatch):
+    monkeypatch.setenv(GRACE_ENV, "-1")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_env_example_lists_the_word_grace():
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    assert f"# {GRACE_ENV}=250" in text

@@ -194,6 +194,20 @@ def test_the_default_margin_and_mark_minimum(cls):
         await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
         assert pipe._clause_chunker.unplayed_margin_ms == 1000
         assert pipe._clause_chunker.mark_min_words == 3
+        assert pipe._clause_chunker.word_grace_ms == 250
+        await _finish(pipe, ws)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cls", PIPELINES)
+@pytest.mark.parametrize("grace", [0, 40])
+def test_the_word_grace_is_passed_to_the_chunker(cls, grace):
+    async def run():
+        engine, ws = _Engine(), _WS()
+        pipe = _pipe(engine, cls, clause_word_grace_ms=grace, **_NO_TIMER)
+        await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
+        assert pipe._clause_chunker.word_grace_ms == grace
         await _finish(pipe, ws)
 
     asyncio.run(run())
@@ -562,3 +576,35 @@ def test_the_handler_passes_the_mark_minimum(monkeypatch, fresh_settings):
             _receive_until_audio_end(ws)
     # A minimum of 1 cuts at "Yes,"; the default of 3 would send "Yes, I" whole.
     assert engine.texts == ["Yes,", "I"]
+
+
+def test_the_handler_passes_the_word_grace(monkeypatch, fresh_settings):
+    import voicemanager.pipeline.tts as tts_mod
+
+    built = []
+
+    class _Recording(tts_mod.ClauseChunker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(tts_mod, "ClauseChunker", _Recording)
+    monkeypatch.setattr("voicemanager.transport.websocket.STTPipeline", _FakeSTT)
+    monkeypatch.setenv("VM_TTS_CLAUSE_WORD_GRACE_MS", "0")
+    monkeypatch.setenv("VM_TTS_CLAUSE_FIRST_DEADLINE_MS", "60000")
+    engine = _Engine()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        app = create_app()
+        app.state.stt_engine_type = "whisper"
+        app.state.session_registry = SessionRegistry()
+        app.state.tts_engine_type = "openvoice"
+        app.state.tts_engine = engine
+        app.state.tts_executor = executor
+        client = TestClient(app)
+        with authkit.ws_connect(client, "/ws/stream") as ws:
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_json({"type": "tts_stream", "request_id": "r1", "text": "Hi",
+                          "chunking": "clause", "done": True})
+            _receive_until_audio_end(ws)
+    # The setting reaches the chunker; the default would be 250.
+    assert [chunker.word_grace_ms for chunker in built] == [0]
