@@ -19,11 +19,11 @@ from voicemanager.pipeline.tts_session import TTSSession
 from voicemanager.protocol import (
     HandshakeMessage, ErrorMessage, TranscriptionMessage, AUDIO_FORMAT_SPEC,
     TTSRequestMessage, TTSCancelMessage, TTSStreamMessage, TurnStartedMessage,
-    CHUNKING_MODES,
+    ListenStoppedMessage, CHUNKING_MODES,
 )
 from voicemanager.session import SessionRegistry, SessionEntry
 from voicemanager.transport.endpoint_hold import EndpointHoldMachine
-from voicemanager.transport.turn_engine import TurnEngineSession
+from voicemanager.transport.turn_engine import TurnEngineSession, _wav_payload_offset
 from voicemanager.transport.turns import TurnTracker
 
 logger = logging.getLogger(__name__)
@@ -287,6 +287,37 @@ def _is_valid_audio(data: bytes) -> bool:
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
         return True
     return len(data) % 2 == 0
+
+
+class ListenState:
+    """The connection's listening boundary: stopped or listening, and the mic count.
+
+    A connection starts listening. A listen_stop frame stops it and a listen_start
+    frame starts it again; while stopped, binary mic frames are dropped. The count is
+    the mic samples accepted on the connection, the mic_sample a listen_stopped frame
+    carries. It counts the way the turn engine's hop feed does (bytes / 2 over every
+    accepted frame, past a WAV header on the first one), so the two agree for the
+    same audio.
+    """
+
+    def __init__(self) -> None:
+        self.stopped = False
+        self._frames = 0
+        self._mic_bytes = 0
+
+    @property
+    def mic_samples(self) -> int:
+        """Mic samples accepted on the connection so far."""
+        return self._mic_bytes // 2
+
+    def accept(self, data: bytes) -> None:
+        """Count one accepted (not dropped) binary mic frame."""
+        if self._frames == 0:
+            offset = _wav_payload_offset(data)
+            if offset is not None:
+                data = data[offset:]
+        self._frames += 1
+        self._mic_bytes += len(data)
 
 
 @websocket_router.websocket("/ws/stream")
@@ -752,6 +783,33 @@ async def websocket_endpoint(websocket: WebSocket):
             await _finalize_audiocpp_utterance(pipeline, _emit, session_id=session_id)
             audiocpp_last_audio = None
 
+    # The listening boundary. The flag and the count live here; everything a
+    # listen_stop does to the connection is in _apply_listen_stop below.
+    listen = ListenState()
+
+    async def _apply_listen_stop() -> None:
+        """Stop listening and answer listen_stopped with the count at the boundary.
+
+        The answer goes out while the listen_stop frame is handled, before the next
+        frame is read: the client does not wait for it, and a listen_start or audio
+        may follow right behind. A listen_stop while stopped answers again with the
+        same count. TTS is not touched: a reply keeps playing, and tts requests while
+        stopped are synthesized as usual.
+        """
+        if not listen.stopped:
+            listen.stopped = True
+            logger.info("Listening stopped: session=%s mic_sample=%d",
+                        session_id, listen.mic_samples)
+        await websocket.send_text(
+            ListenStoppedMessage(mic_sample=listen.mic_samples).model_dump_json())
+
+    def _apply_listen_start() -> None:
+        """Listen again. No answer; a listen_start while listening does nothing."""
+        if listen.stopped:
+            listen.stopped = False
+            logger.info("Listening started: session=%s mic_sample=%d",
+                        session_id, listen.mic_samples)
+
     try:
         loop = asyncio.get_event_loop()
         first_frame_validated = False
@@ -929,6 +987,14 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.get("bytes") is not None:
                 data = msg["bytes"]
 
+                # Stopped: the frame is dropped before anything looks at it. It is not
+                # validated (so it is not the first audio frame and cannot fail as
+                # one), not counted, and fed to neither the turn engine nor the STT.
+                if listen.stopped:
+                    logger.debug("Dropped mic frame while stopped: session=%s (%d bytes)",
+                                 session_id, len(data))
+                    continue
+
                 # Validate first binary frame
                 if not first_frame_validated:
                     if not _is_valid_audio(data):
@@ -943,6 +1009,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         return
                     first_frame_validated = True
                     logger.debug("First audio frame validated for session %s (%d bytes)", session_id, len(data))
+                listen.accept(data)
 
                 # An opted-in session copies every mic frame to its turn engine, ahead
                 # of the STT routing (whose idle gate may skip the frame). This only
@@ -1154,6 +1221,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Only an opted-in session handles playback frames; on any other
                     # connection the frame is dropped unanswered, as it always was.
                     await turn_engine.handle_playback(parsed)
+
+                elif msg_type == "listen_stop":
+                    # Both listen frames are bare and idempotent and never answer with
+                    # an error, so they are not validated: extra fields are ignored.
+                    await _apply_listen_stop()
+
+                elif msg_type == "listen_start":
+                    _apply_listen_start()
+
+                # Any other frame type is dropped unanswered, as it always was.
 
     except WebSocketDisconnect:
         logger.info("Client disconnected: session_id=%s", session_id)
