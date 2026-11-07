@@ -92,14 +92,14 @@ def test_mark_after_one_word_waits_for_the_deadline(chunker, clock):
     clock.advance(0.599)
     assert chunker.poll() == []
     clock.advance(0.001)
-    assert chunker.poll() == ["Yes, I"]
+    assert chunker.poll() == ["Yes, I "]
 
 
 def test_mark_after_one_word_waits_for_the_word_count(chunker):
     chunker.feed("Yes, I")
     assert chunker.poll() == []
     chunker.feed(" can hear ")
-    assert chunker.poll() == ["Yes, I can hear"]
+    assert chunker.poll() == ["Yes, I can hear "]
 
 
 def test_short_mark_stays_inside_the_piece_cut_at_a_later_mark(chunker):
@@ -110,7 +110,7 @@ def test_short_mark_stays_inside_the_piece_cut_at_a_later_mark(chunker):
 
 def test_short_mark_then_word_count_sends_all_held_text(chunker):
     chunker.feed("Stop! Do not mix ")
-    assert chunker.poll() == ["Stop! Do not mix"]
+    assert chunker.poll() == ["Stop! Do not mix "]
     assert chunker.held_text == ""
 
 
@@ -132,7 +132,7 @@ def test_mark_min_words_of_one_cuts_at_any_mark(clock):
 
 def test_first_piece_four_words_without_mark_dispatches(chunker):
     chunker.feed("one two three four ")
-    assert chunker.poll() == ["one two three four"]
+    assert chunker.poll() == ["one two three four "]
 
 
 def test_first_piece_three_words_without_mark_is_held(chunker):
@@ -144,7 +144,7 @@ def test_first_piece_three_words_without_mark_is_held(chunker):
 def test_first_piece_two_words_dispatch_after_600_ms(chunker, clock):
     chunker.feed("two words ")
     clock.advance(0.6)
-    assert chunker.poll() == ["two words"]
+    assert chunker.poll() == ["two words "]
 
 
 def test_first_piece_two_words_not_dispatched_at_599_ms(chunker, clock):
@@ -161,7 +161,7 @@ def test_first_piece_deadline_counts_from_first_held_word(chunker, clock):
     clock.advance(0.199)
     assert chunker.poll() == []
     clock.advance(0.001)
-    assert chunker.poll() == ["one two"]
+    assert chunker.poll() == ["one two "]
 
 
 def test_whitespace_only_frame_does_not_start_the_deadline(chunker, clock):
@@ -171,14 +171,14 @@ def test_whitespace_only_frame_does_not_start_the_deadline(chunker, clock):
     clock.advance(0.5)
     assert chunker.poll() == []
     clock.advance(0.1)
-    assert chunker.poll() == ["word"]
+    assert chunker.poll() == ["   word "]
 
 
 def test_poll_accepts_explicit_now(clock):
     chunker = ClauseChunker(clock=clock)
     chunker.feed("two words ", now=10.0)
     assert chunker.poll(now=10.599) == []
-    assert chunker.poll(now=10.6) == ["two words"]
+    assert chunker.poll(now=10.6) == ["two words "]
 
 
 # --- later pieces: audio playing --------------------------------------------------
@@ -204,7 +204,7 @@ def test_later_piece_twelve_words_dispatch(chunker, clock):
     play_earlier_piece(chunker, 5.0)
     words = " ".join(f"w{i}" for i in range(12))
     chunker.feed(words + " ")
-    assert chunker.poll() == [words]
+    assert chunker.poll() == [words + " "]
 
 
 def test_later_piece_eleven_words_are_held(chunker, clock):
@@ -220,7 +220,7 @@ def test_later_piece_dispatches_when_unplayed_drops_below_margin(chunker, clock)
     clock.advance(2.0)  # unplayed is exactly 1.0 s: not below the margin
     assert chunker.poll() == []
     clock.advance(0.01)
-    assert chunker.poll() == ["two words"]
+    assert chunker.poll() == ["two words "]
 
 
 def test_later_piece_five_words_with_two_seconds_unplayed_are_held(chunker, clock):
@@ -244,7 +244,7 @@ def test_first_piece_rule_returns_once_audio_has_run_out(chunker, clock):
     clock.advance(2.0)
     assert chunker.unplayed_estimate() == 0.0
     chunker.feed("one two three four ")
-    assert chunker.poll() == ["one two three four"]
+    assert chunker.poll() == ["one two three four "]
 
 
 # --- the unplayed-audio estimate --------------------------------------------------
@@ -301,7 +301,7 @@ def test_later_piece_rule_applies_to_audio_sent_after_a_gap():
     clock.now = 7.0  # exactly 1 s left: not below the margin
     assert chunker.poll() == []
     clock.now = 7.01
-    assert chunker.poll() == ["one two three four five"]
+    assert chunker.poll() == ["one two three four five "]
 
 
 def test_record_audio_rejects_negative_duration(chunker):
@@ -319,7 +319,7 @@ def test_cut_at_clause_mark_keeps_following_words_held(chunker, clock):
     clock.advance(0.599)
     assert chunker.poll() == []
     clock.advance(0.001)
-    assert chunker.poll() == ["It creates"]
+    assert chunker.poll() == [" It creates "]
 
 
 def test_cut_is_at_the_last_clause_mark(chunker):
@@ -336,12 +336,12 @@ def test_remainder_deadline_counts_from_its_own_arrival(chunker, clock):
     clock.advance(0.3)  # 0.6 s since "one", 0.3 s since "four"
     assert chunker.poll() == []
     clock.advance(0.3)
-    assert chunker.poll() == ["four"]
+    assert chunker.poll() == [" four "]
 
 
 def test_remainder_can_trigger_its_own_word_count(chunker):
     chunker.feed("Well, all right. one two three four ")
-    assert chunker.poll() == ["Well, all right.", "one two three four"]
+    assert chunker.poll() == ["Well, all right.", " one two three four "]
     assert chunker.held_text == ""
 
 
@@ -373,9 +373,10 @@ def test_text_in_two_frames_is_sent_exactly(chunker):
     assert chunker.poll() == ["Do not mix them."]
 
 
-def test_only_surrounding_whitespace_is_trimmed(chunker):
+def test_whitespace_is_kept_exactly(chunker):
     chunker.feed("  \"Hi\" -- it's  me;\n")
-    assert chunker.poll() == ["\"Hi\" -- it's  me;"]
+    assert chunker.poll() == ["  \"Hi\" -- it's  me;"]
+    assert chunker.drain() == []  # the "\n" after the mark has nothing to speak
 
 
 def test_word_split_across_frames_is_joined_as_received(chunker):
@@ -420,7 +421,7 @@ def test_next_deadline_later_piece_follows_the_play_cursor_after_a_gap():
 def test_next_deadline_then_poll_dispatches(chunker, clock):
     chunker.feed("two words ")
     clock.now = chunker.next_deadline()
-    assert chunker.poll() == ["two words"]
+    assert chunker.poll() == ["two words "]
     assert chunker.next_deadline() is None
 
 
@@ -429,7 +430,7 @@ def test_next_deadline_then_poll_dispatches(chunker, clock):
 
 def test_drain_returns_all_held_text(chunker):
     chunker.feed(" two words ")
-    assert chunker.drain() == ["two words"]
+    assert chunker.drain() == [" two words "]
     assert chunker.held_text == ""
     assert chunker.next_deadline() is None
 
@@ -448,21 +449,26 @@ def test_chunker_keeps_working_after_drain(chunker, clock):
     clock.advance(0.599)
     assert chunker.poll() == []
     clock.advance(0.001)
-    assert chunker.poll() == ["new"]
+    assert chunker.poll() == ["new "]
 
 
 # --- token streams: count and time triggers cut at a word boundary ----------------
 
 
 def _assert_pieces_end_at_word_or_mark(full: str, pieces: list[str]) -> None:
-    """Each piece is found in order in ``full`` and ends at a word boundary or a mark."""
+    """Each piece follows the one before in ``full`` and ends at a word boundary or a mark.
+
+    A piece may end with the whitespace that closed its last word, so the check is
+    made at the end of its text with trailing whitespace removed.
+    """
     pos = 0
     for piece in pieces:
-        start = full.index(piece, pos)
-        end = start + len(piece)
-        assert end == len(full) or full[end].isspace() or piece[-1] in CLAUSE_MARKS, (
+        assert full.startswith(piece, pos), f"piece {piece!r} is not next in {full!r}"
+        end = pos + len(piece.rstrip())
+        assert (end == len(full) or full[end].isspace()
+                or full[end - 1] in CLAUSE_MARKS), (
             f"piece {piece!r} ends inside a word of {full!r}")
-        pos = end
+        pos += len(piece)
 
 
 def test_margin_trigger_with_streamed_tokens_never_splits_a_word(chunker, clock):
@@ -480,17 +486,17 @@ def test_margin_trigger_with_streamed_tokens_never_splits_a_word(chunker, clock)
         polled.extend(chunker.poll(now=now))
     assert polled  # the margin trigger did fire
     _assert_pieces_end_at_word_or_mark("".join(frames), polled)
-    assert not any(p.endswith("subsystem") for p in polled)
+    assert not any(p.rstrip().endswith("subsystem") for p in polled)
     pieces = polled + chunker.drain()
     assert any("subsystems." in p for p in pieces)
-    assert " ".join(pieces) == "span several subsystems. Six categories"
+    assert "".join(pieces) == "".join(frames)
 
 
 def test_time_trigger_keeps_the_partial_last_word_held(chunker, clock):
     t0 = clock.now
     chunker.feed("one two", now=t0)
     chunker.feed(" thr", now=t0 + 0.55)  # still inside its word grace at 0.6 s
-    assert chunker.poll(now=t0 + 0.6) == ["one two"]
+    assert chunker.poll(now=t0 + 0.6) == ["one two "]
     assert chunker.held_text == "thr"
 
 
@@ -526,7 +532,7 @@ def test_whitespace_ends_a_word_before_the_word_grace(clock):
     chunker.feed("subsystem", now=0.0)
     chunker.feed(" ", now=0.05)
     assert chunker.next_deadline(now=0.05) == pytest.approx(0.1)
-    assert chunker.poll(now=0.1) == ["subsystem"]
+    assert chunker.poll(now=0.1) == ["subsystem "]
 
 
 def test_word_grace_of_zero_ends_a_word_at_every_frame_end(clock):
@@ -553,14 +559,14 @@ def test_count_trigger_counts_only_complete_words(clock):
     chunker.feed("one two three fou")
     assert chunker.poll() == []
     chunker.feed("r ")
-    assert chunker.poll() == ["one two three four"]
+    assert chunker.poll() == ["one two three four "]
     assert chunker.held_text == ""
 
 
 def test_count_trigger_ignores_the_partial_last_word(clock):
     chunker = ClauseChunker(first_piece_words=4, clock=clock)
     chunker.feed("one two three four fi")
-    assert chunker.poll() == ["one two three four"]
+    assert chunker.poll() == ["one two three four "]
     assert chunker.held_text == "fi"
 
 
@@ -618,3 +624,117 @@ def test_next_deadline_wakes_at_the_grace_for_a_one_word_count_without_whitespac
     assert chunker.poll(now=0.0) == []
     assert chunker.next_deadline(now=0.0) == pytest.approx(0.25)
     assert chunker.poll(now=0.25) == ["one"]
+
+
+# --- pieces keep whitespace; no piece is only punctuation -------------------------
+
+
+def _is_spoken(text: str) -> bool:
+    return any(c.isalnum() for c in text)
+
+
+def _poll_under_margin(chunker: ClauseChunker, t0: float, frames: list[str]) -> list[str]:
+    """Feed ``frames`` a few ms apart with the later-piece margin trigger active."""
+    chunker.record_audio(0.5, now=t0)
+    pieces: list[str] = []
+    for i, frame in enumerate(frames):
+        now = t0 + 0.005 * i
+        assert 0.0 < chunker.unplayed_estimate(now) < chunker.unplayed_margin_ms / 1000.0
+        chunker.feed(frame, now=now)
+        pieces.extend(chunker.poll(now=now))
+    return pieces
+
+
+def test_joined_pieces_equal_the_joined_frames_under_the_margin_trigger(chunker, clock):
+    frames = ["most frequent use.", "\n\n", "One", ":", " software work."]
+    polled = _poll_under_margin(chunker, clock.now, frames)
+    assert polled  # the margin trigger did cut
+    pieces = polled + chunker.drain()
+    assert "".join(pieces) == "".join(frames)
+
+
+def test_whitespace_only_frame_after_a_cut_is_kept(chunker):
+    chunker.feed("most frequent use.")
+    assert chunker.poll() == ["most frequent use."]
+    chunker.feed("\n\n")
+    assert chunker.poll() == []
+    assert not chunker.has_held
+    assert chunker.next_deadline() is None
+    chunker.feed("One more thing.")
+    assert chunker.poll() == ["\n\nOne more thing."]
+
+
+def test_whitespace_kept_after_a_cut_does_not_start_the_deadline(chunker, clock):
+    chunker.feed("most frequent use.")
+    assert chunker.poll() == ["most frequent use."]
+    chunker.feed("\n\n")
+    clock.advance(0.5)
+    chunker.feed("word ")
+    clock.advance(0.5)
+    assert chunker.poll() == []
+    clock.advance(0.1)
+    assert chunker.poll() == ["\n\nword "]
+
+
+def test_trailing_mark_frame_joins_the_words_before_it(chunker, clock):
+    pieces: list[str] = []
+    for frame in ["Standing", " by", "."]:
+        chunker.feed(frame)
+        pieces.extend(chunker.poll())
+        clock.advance(0.005)
+    pieces.extend(chunker.drain())
+    assert len(pieces) == 1
+    assert pieces[0].strip() == "Standing by."
+
+
+def test_a_mark_after_its_words_were_sent_is_not_a_piece_of_its_own(chunker, clock):
+    chunker.feed("Acknowledged. Standing by")
+    assert chunker.poll() == []
+    clock.advance(0.6)
+    assert chunker.poll() == ["Acknowledged. Standing by"]
+    chunker.feed(".")
+    assert chunker.poll() == []
+    assert chunker.next_deadline() is None
+    assert chunker.drain() == []
+
+
+def test_margin_trigger_never_sends_a_punctuation_only_piece(chunker, clock):
+    frames = ["Tom ", "& ", "Jerry "]
+    polled = _poll_under_margin(chunker, clock.now, frames)
+    pieces = polled + chunker.drain()
+    assert all(_is_spoken(p) for p in pieces), pieces
+    assert "".join(pieces) == "".join(frames)
+
+
+def test_punctuation_only_mark_cut_stays_held(clock):
+    chunker = ClauseChunker(mark_min_words=1, clock=clock)
+    chunker.feed("... ")
+    assert chunker.poll() == []
+    chunker.feed("Then go.")
+    assert chunker.poll() == ["... Then go."]
+
+
+def test_drain_drops_punctuation_only_text(chunker):
+    chunker.feed(". ")
+    assert chunker.drain() == []
+    assert chunker.held_text == ""
+
+
+def test_next_deadline_is_none_for_punctuation_only_held_text(chunker, clock):
+    chunker.feed("& ")
+    assert chunker.next_deadline() is None
+    clock.advance(5.0)
+    assert chunker.poll() == []
+    assert chunker.next_deadline() is None
+
+
+def test_next_deadline_does_not_loop_on_a_punctuation_only_cut(chunker, clock):
+    # The first-piece deadline of "&" is long past when the word arrives, but the
+    # only word end is after "&", so no deadline is due before the word grace ends.
+    t0 = clock.now
+    chunker.feed("& ", now=t0)
+    chunker.feed("Jerry", now=t0 + 5.0)
+    deadline = chunker.next_deadline(now=t0 + 5.0)
+    assert deadline == pytest.approx(t0 + 5.25)
+    assert chunker.poll(now=t0 + 5.1) == []
+    assert chunker.poll(now=deadline) == ["& Jerry"]

@@ -31,8 +31,17 @@ last word, while a token stream sends the rest of a word within a few millisecon
 Text after the last word end may be a partial word and stays held. The word count
 counts only the words before the last word end, and neither trigger fires while no
 word end follows a word. With ``word_grace_ms`` of 0 every frame end is a word end.
-``drain`` still sends all held text. A piece is the held text exactly as received,
-with only surrounding whitespace trimmed.
+``drain`` still sends all held text.
+
+A piece is a slice of the held text exactly as received, whitespace included: a
+cut never trims, drops or adds a character, so the pieces of a request joined end
+to end equal its frames joined end to end. Whitespace after a clause mark starts
+the next piece; whitespace at a word end closes the piece before it. Only text that
+holds a letter or digit is spoken, so no piece is text without one (a lone "." or
+"&"). A cut whose piece would hold no letter or digit does not happen: that text
+stays held and starts the next piece. Held text with no letter or digit has no
+deadline, and ``drain`` drops it, so the only text a request can lose is a tail
+with nothing to speak in it.
 
 The unplayed-audio estimate is a play cursor: the clock time at which the audio sent
 so far ends. Each audio chunk extends playback from the later of the cursor and now
@@ -79,16 +88,23 @@ def _last_clause_cut(text: str, min_words: int = 1) -> int | None:
     return None
 
 
+def _is_spoken(text: str) -> bool:
+    """True when ``text`` holds a letter or digit, so an engine has something to say."""
+    return any(c.isalnum() for c in text)
+
+
 def _word_boundary(text: str) -> int | None:
     """Return the index just past the last whitespace in ``text``, or None.
 
     The text before that index holds only complete words; the text after it may be a
-    word still arriving. None when no whitespace follows a word, so ``text`` holds no
-    complete word.
+    word still arriving. None when the text before the last whitespace holds no
+    letter or digit, so ``text`` holds no complete word worth a piece of its own.
+    A shorter prefix holds no more than a longer one, so only the last whitespace
+    needs the check.
     """
     for i in range(len(text) - 1, -1, -1):
         if text[i].isspace():
-            return i + 1 if text[:i].strip() else None
+            return i + 1 if _is_spoken(text[:i]) else None
     return None
 
 
@@ -173,6 +189,8 @@ class ClauseChunker:
 
         Call it after every ``feed``, every ``record_audio`` and when the time from
         ``next_deadline`` is reached. The returned text is removed from the buffer.
+        Each piece is the held text exactly as received, whitespace included, and
+        holds a letter or digit.
         """
         now = self._now(now)
         pieces: list[str] = []
@@ -185,7 +203,8 @@ class ClauseChunker:
     def next_deadline(self, now: float | None = None) -> float | None:
         """Return the clock time at which a time trigger fires, or None.
 
-        None means no text is held, so only a new ``feed`` can produce a piece. A time
+        None means no text with a letter or digit is held (only whitespace or
+        punctuation, or nothing), so only a new ``feed`` can produce a piece. A time
         at or before ``now`` means a trigger is already due: call ``poll``. While no
         whitespace follows a held word, the time is no earlier than the end of the
         word grace of the newest frame, because no trigger can cut before then. When
@@ -193,17 +212,18 @@ class ClauseChunker:
         later than the end of its grace, when the count trigger fires. The answer
         can change after ``feed`` or ``record_audio``, so ask again after each.
         """
-        first_word_at = self._first_word_at()
-        if first_word_at is None:
-            return None
-        deadline = self._trigger_deadline(first_word_at, now)
         held = "".join(text for text, _ in self._frames)
+        if not _is_spoken(held):
+            return None
+        first_word_at = self._first_word_at()
+        deadline = self._trigger_deadline(first_word_at, now)
         grace_end = self._frames[-1][1] + self.word_grace_ms / 1000.0
         boundary = _word_boundary(held)
         count_met = len(held.split()) >= self._count_threshold(now)
         if boundary is None:
-            # No trigger can cut before the grace ends; once it ends, a met word
-            # count cuts at once.
+            # No trigger can cut before the grace ends (a cut before the last word
+            # would hold no letter or digit); once it ends, a met word count cuts at
+            # once.
             return grace_end if count_met else max(deadline, grace_end)
         if held[boundary:] and count_met:
             # The partial last word completes the word count once its grace has
@@ -212,13 +232,15 @@ class ClauseChunker:
         return deadline
 
     def drain(self) -> list[str]:
-        """Remove and return all held text as one piece ([] if nothing is held).
+        """Remove and return all held text as one piece, exactly as received.
 
-        Use it for done and flush, which send everything held at once.
+        Use it for done and flush, which send everything held at once. Returns []
+        when the held text holds no letter or digit (nothing, whitespace or only
+        punctuation); that text is dropped.
         """
-        text = self.held_text
+        text = "".join(text for text, _ in self._frames)
         self._frames.clear()
-        return [text] if text else []
+        return [text] if _is_spoken(text) else []
 
     def unplayed_estimate(self, now: float | None = None) -> float:
         """Return the estimated unplayed audio in seconds, floored at 0.
@@ -232,7 +254,11 @@ class ClauseChunker:
 
     @property
     def held_text(self) -> str:
-        """The held text with surrounding whitespace trimmed."""
+        """The held text with surrounding whitespace trimmed, for inspection.
+
+        Unlike the pieces from ``poll`` and ``drain``, which keep whitespace exactly
+        as received, this is stripped.
+        """
         return "".join(text for text, _ in self._frames).strip()
 
     @property
@@ -269,7 +295,11 @@ class ClauseChunker:
         return _word_boundary(held)
 
     def _first_word_at(self) -> float | None:
-        """Arrival time of the frame that brought the first held word."""
+        """Arrival time of the frame that brought the first held word.
+
+        Whitespace-only frames, kept at the front after a cut, are skipped, so the
+        deadline counts from the frame that brought the first non-whitespace text.
+        """
         for text, at in self._frames:
             if not text.isspace():
                 return at
@@ -279,19 +309,24 @@ class ClauseChunker:
         """Cut one piece off the buffer if a trigger fires, else return None.
 
         A clause mark cuts after the mark; a word-count or time trigger cuts at the
-        last word end, leaving a partial last word held.
+        last word end, leaving a partial last word held. The piece is returned raw.
+        A mark cut whose piece holds no letter or digit does not happen; a shorter
+        cut at an earlier mark would hold none either, so the count and time
+        triggers decide.
         """
         held = "".join(text for text, _ in self._frames)
-        if not held.strip():
+        if not _is_spoken(held):
             return None
         cut = _last_clause_cut(held, self.mark_min_words)
-        if cut is not None:
+        if cut is not None and _is_spoken(held[:cut]):
             self._take(cut)
-            return held[:cut].strip()
+            return held[:cut]
         end = self._word_end(held, now)
         if end is not None and self._count_or_time_due(held[:end], now):
+            # A word end before the grace holds a letter or digit (``_word_boundary``);
+            # after the grace it is the end of the held text, which holds one too.
             self._take(end)
-            return held[:end].strip()
+            return held[:end]
         return None
 
     def _count_threshold(self, now: float | None) -> int:
@@ -312,7 +347,12 @@ class ClauseChunker:
         return estimate < self.unplayed_margin_ms / 1000.0 - _EPS
 
     def _take(self, cut: int) -> None:
-        """Drop the first ``cut`` characters of held text, keeping frame times."""
+        """Drop the first ``cut`` characters of held text, keeping frame times.
+
+        Whitespace-only frames left at the front are kept, so no whitespace is lost;
+        ``_first_word_at`` skips them, so the deadline still counts from the frame
+        that brought the first word.
+        """
         kept: list[tuple[str, float]] = []
         offset = 0
         for text, at in self._frames:
@@ -320,8 +360,4 @@ class ClauseChunker:
             if end > cut:
                 kept.append((text[max(cut - offset, 0):], at))
             offset = end
-        # Leading whitespace-only frames carry no word; drop them so the remainder's
-        # deadline counts from the frame that brought its first word.
-        while kept and kept[0][0].isspace():
-            kept.pop(0)
         self._frames = kept
