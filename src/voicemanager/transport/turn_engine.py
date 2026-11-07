@@ -207,6 +207,39 @@ the turn_end's text, and no other final can slip in between. Without ``end_turn`
 session calls ``send_turn_end`` directly. Silero still ends utterances and their finals
 still go out at once; for an opted-in session only turn_end ends the turn.
 
+The listening boundary
+----------------------
+
+When the client stops listening (a listen_stop on a listening connection), the
+handler calls ``listen_boundary`` before it resets the STT and before the
+listen_stopped answer goes out. Nothing from the audio before the stop crosses it:
+
+* the boundary is the hop feed's mic count at the stop. The whole hops still in the
+  feed are cut at once (with no wait for a late start) and queued, then the boundary
+  control (``wire.format_boundary_control``) is queued behind them on the same hop
+  queue, so the sidecar gets it after every hop before the stop and clears that
+  session's turn rules (its voice gate and VoxLock enrollment stay: the link is not
+  reopened). The partial hop after them is dropped, not padded. The next hop starts
+  at the boundary; the mic count goes on, so hop mic_samples stay on the
+  connection's count;
+* an endpoint or barge event at or before the boundary is ignored, whenever it comes
+  in, and ``send_turn_end`` sends nothing for one, so no turn_end and no barge frame
+  goes out for pre-stop audio after the answer;
+* the finals collected for the next turn_end are dropped: the first turn_end after
+  listen_start holds only finals from audio after it;
+* the mic hold drops everything it keeps and the start-wait timers are cancelled;
+  the handler makes a release or turn end queued before the stop do nothing (it
+  carries the listen epoch it was started in), so held pre-stop audio cannot reach
+  the reset STT;
+* every kept reply is forgotten. While stopped, playback frames are dropped quietly
+  (no barge can come with no mic audio) and a reply sent meanwhile (a spoken
+  goodbye) is not kept, so it holds no mic audio and is no barge candidate. After
+  listen_start a playback frame for a reply forgotten at the boundary or sent while
+  stopped is dropped quietly too; replies sent from then on work as usual.
+
+A connection that never stops listening is not touched. A lost session only drops
+what its hold keeps.
+
 Losing the sidecar
 ------------------
 
@@ -276,6 +309,8 @@ START_LOOKAHEAD_SAMPLES = wire.HOP_SAMPLES
 START_WAIT_SAMPLES = 2 * wire.SAMPLE_RATE
 #: How many replies a connection keeps the sent PCM of.
 MAX_KEPT_REPLIES = 4
+#: How many request ids not tracked across a listening boundary are remembered.
+MAX_QUIET_REPLIES = 64
 #: The most PCM kept per reply, in seconds at the reply's rate.
 MAX_REPLY_SECONDS = 120
 #: How many packed hops may wait for the sidecar link.
@@ -408,12 +443,21 @@ class HopFeed:
         self._mic = bytearray()       # mic PCM not yet in a hop
         self._mic_bytes = 0           # mic PCM bytes in, ever
         self._mic_frames = 0
-        self._hops = 0                # hops cut so far
+        self._cut_to = 0              # where the last hop ended, or the last boundary
+        self._listening = True        # False between a listening boundary and listen_start
+        # Request ids whose playback frames are dropped quietly: replies forgotten at a
+        # listening boundary and replies sent while stopped (oldest first, bounded).
+        self._quiet: collections.OrderedDict[str, None] = collections.OrderedDict()
 
     @property
     def mic_samples(self) -> int:
         """Samples of the mic stream received so far."""
         return self._mic_bytes // 2
+
+    @property
+    def listening(self) -> bool:
+        """False from a listening boundary until listen_start."""
+        return self._listening
 
     def reply(self, request_id: str) -> _Reply | None:
         return self._replies.get(request_id)
@@ -481,6 +525,12 @@ class HopFeed:
             rate = frame.get("sample_rate")
             if request_id in self._replies or type(rate) is not int or rate <= 0:
                 return []
+            if not self._listening:
+                # Sent while the mic is stopped (a spoken goodbye): no barge can come
+                # for it and it holds no mic audio, so it is not kept.
+                self._keep_quiet(request_id)
+                return []
+            self._quiet.pop(request_id, None)
             ended = [r for r in self._replies.values() if not r.done]
             for reply in ended:
                 reply.done = True
@@ -527,6 +577,11 @@ class HopFeed:
                     "'stop', an integer mic_sample >= 0 and, on 'stop' only, an integer "
                     "reply_sample >= 0; the frame was dropped.")
         reply = self._replies.get(msg.request_id)
+        if reply is None and msg.request_id in self._quiet:
+            logger.debug("Playback frame for a reply not tracked across a listening "
+                         "boundary dropped: session=%s request_id=%s", self._label,
+                         msg.request_id)
+            return None
         if reply is None:
             return (f"No reply with request_id {msg.request_id!r} was sent on this "
                     "connection; the frame was dropped.")
@@ -561,12 +616,14 @@ class HopFeed:
         self._mic_bytes += len(data)
         return data
 
-    def due_hops(self) -> list[_HopJob]:
-        """Cut every hop whose mic audio is in and that need not wait any longer."""
+    def due_hops(self, *, now: bool = False) -> list[_HopJob]:
+        """Cut every hop whose mic audio is in and that need not wait any longer.
+
+        ``now`` cuts every whole hop in, without the wait for a late start."""
         jobs = []
         while True:
-            end = (self._hops + 1) * wire.HOP_SAMPLES
-            wait = START_LOOKAHEAD_SAMPLES if self._awaiting_start() else 0
+            end = self._cut_to + wire.HOP_SAMPLES
+            wait = START_LOOKAHEAD_SAMPLES if not now and self._awaiting_start() else 0
             if self.mic_samples < end + wait:
                 return jobs
             jobs.append(self._cut(end))
@@ -584,7 +641,7 @@ class HopFeed:
         start = end - wire.HOP_SAMPLES
         user = bytes(self._mic[:wire.CHANNEL_BYTES])
         del self._mic[:wire.CHANNEL_BYTES]
-        self._hops += 1
+        self._cut_to = end
         speaking = False
         pieces = []
         # Oldest reply first, so a later reply's samples win where two overlap.
@@ -606,6 +663,39 @@ class HopFeed:
                 reply.pcm = None
         mode = wire.MODE_SPEAKING if speaking else wire.MODE_LISTENING
         return _HopJob(mode=mode, mic_sample=end, user=user, pieces=tuple(pieces))
+
+    # --- the listening boundary -----------------------------------------------------
+
+    def listen_boundary(self) -> list[_HopJob]:
+        """The mic stops at ``mic_samples``: the whole hops still to go, cut now.
+
+        Every whole hop in is cut at once, with the replies as they are; the partial
+        hop after them is dropped, and the next hop starts at the boundary (the mic
+        count goes on, so hop mic_samples stay on the connection's count). Every kept
+        reply is forgotten: a playback frame for it is dropped quietly from now on,
+        as is one for a reply sent while stopped."""
+        jobs = self.due_hops(now=True)
+        dropped = len(self._mic) // 2
+        self._mic.clear()
+        self._cut_to = self.mic_samples
+        for request_id in self._replies:
+            self._keep_quiet(request_id)
+        self._replies.clear()
+        self._listening = False
+        logger.debug("Listening boundary at mic_sample=%d: session=%s whole hops=%d "
+                     "partial hop samples dropped=%d", self.mic_samples, self._label,
+                     len(jobs), dropped)
+        return jobs
+
+    def listen_start(self) -> None:
+        """The mic is back: replies sent from now on are kept as usual."""
+        self._listening = True
+
+    def _keep_quiet(self, request_id: str) -> None:
+        self._quiet[request_id] = None
+        self._quiet.move_to_end(request_id)
+        while len(self._quiet) > MAX_QUIET_REPLIES:
+            self._quiet.popitem(last=False)
 
     @staticmethod
     def _piece(reply: _Reply, start: int, end: int) -> _Piece | None:
@@ -753,6 +843,12 @@ class MicHold:
         self._runs.clear()
         return out
 
+    def clear(self) -> int:
+        """Drop everything in the hold; the samples dropped."""
+        n = self.held_samples
+        self._runs.clear()
+        return n
+
     def _rules(self, now: int) -> list[tuple[int, float, str]]:
         """(from, to, kind) spans of the mic stream every kept reply holds or drops."""
         rules: list[tuple[int, float, str]] = []
@@ -860,6 +956,9 @@ class TurnEngineSession:
         self._generation = None       # the sidecar generation the link was opened on
         self._remove_listener: Callable[[], None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # The mic_sample of the last listening boundary: no event at or before it is
+        # acted on. None while the connection never stopped listening.
+        self._boundary: int | None = None
 
     @property
     def active(self) -> bool:
@@ -939,7 +1038,14 @@ class TurnEngineSession:
     # --- playback, the TTS audio tap and the mic stream ------------------------------
 
     async def handle_playback(self, frame: dict) -> None:
-        """Apply one playback frame, or answer it with an invalid_request error frame."""
+        """Apply one playback frame, or answer it with an invalid_request error frame.
+
+        While the mic is stopped every playback frame is dropped quietly: no barge
+        can come with no mic audio, so no reply is tracked."""
+        if not self._feed.listening:
+            logger.debug("Playback frame while stopped dropped: session=%s %s %s",
+                         self._label, frame.get("request_id"), frame.get("event"))
+            return
         refusal = self._feed.playback(frame)
         if refusal is not None:
             logger.info("Playback frame refused: session=%s (%s)", self._label, refusal)
@@ -1039,7 +1145,10 @@ class TurnEngineSession:
     def _queue_due_hops(self) -> None:
         if self._hop_queue is None:
             return
-        for job in self._feed.due_hops():
+        self._queue_hops(self._feed.due_hops())
+
+    def _queue_hops(self, jobs: list[_HopJob]) -> None:
+        for job in jobs:
             try:
                 self._hop_queue.put_nowait(job)
             except asyncio.QueueFull:
@@ -1062,6 +1171,9 @@ class TurnEngineSession:
                 link_down = True
                 continue
             try:
+                if isinstance(job, str):
+                    await ws.send(job)  # a control message, in order with the hops
+                    continue
                 hop = await asyncio.to_thread(_pack_hop, job)
                 await ws.send(hop)
             except websockets.exceptions.ConnectionClosed:
@@ -1074,6 +1186,50 @@ class TurnEngineSession:
         await self._send_text(
             ErrorMessage(error_type=error_type, message=message).model_dump_json())
 
+    # --- the listening boundary -----------------------------------------------------
+
+    def listen_boundary(self) -> None:
+        """The client stopped listening: see "The listening boundary" in the module
+        docstring. Call it on a real listening -> stopped change, before the answer
+        goes out and before the STT is reset; it never waits."""
+        dropped = self._hold.clear()  # pre-stop audio never reaches the STT after it
+        for handle in self._timers:
+            handle.cancel()
+        self._timers.clear()
+        self._finals.clear()
+        if not self.active:
+            return  # never opted in, or lost: no sidecar to tell
+        boundary = self._feed.mic_samples
+        self._boundary = boundary
+        if self._hop_queue is not None:
+            self._queue_hops(self._feed.listen_boundary())
+            self._queue_control(wire.format_boundary_control())
+        else:
+            self._feed.listen_boundary()
+        logger.info("Turn engine listening boundary: session=%s mic_sample=%d "
+                    "held samples dropped=%d", self._label, boundary, dropped)
+
+    def listen_start(self) -> None:
+        """The client listens again; replies sent from now on are tracked as usual."""
+        self._feed.listen_start()
+
+    def _queue_control(self, message: str) -> None:
+        """Queue a control message behind every hop already queued; it is never
+        dropped: on a full queue the oldest hop goes instead."""
+        queue = self._hop_queue
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            logger.warning("Turn engine hop queue full at a control message; dropped "
+                           "the oldest hop: session=%s", self._label)
+        queue.put_nowait(message)
+
+    def _before_boundary(self, mic_sample: int) -> bool:
+        """An event at mic_sample is about audio from before a listening boundary."""
+        return self._boundary is not None and mic_sample <= self._boundary
+
     # --- the turn end ---------------------------------------------------------------
 
     def note_final(self, text: str, turn_id: int) -> None:
@@ -1085,7 +1241,12 @@ class TurnEngineSession:
     async def send_turn_end(self, event: wire.EndpointEvent) -> bool:
         """Send the turn_end for every final since the previous one; False when none.
 
-        Nothing goes out once the sidecar is lost."""
+        Nothing goes out once the sidecar is lost, nor for an event at or before a
+        listening boundary (and the finals since the boundary stay for the next)."""
+        if self._before_boundary(event.mic_sample):
+            logger.debug("Turn end from before a listening boundary, nothing sent: "
+                         "session=%s mic_sample=%s", self._label, event.mic_sample)
+            return False
         finals, self._finals = self._finals, []
         if self._lost:
             logger.debug("Turn end after the turn engine was lost, nothing sent: "
@@ -1225,6 +1386,11 @@ class TurnEngineSession:
         logger.debug("Turn engine event: session=%s %s", self._label, event)
         if self._lost:
             return  # the session goes on as one that never opted in
+        if (isinstance(event, (wire.BargeEvent, wire.EndpointEvent))
+                and self._before_boundary(event.mic_sample)):
+            logger.debug("Turn engine event from before a listening boundary ignored: "
+                         "session=%s %s", self._label, event)
+            return
         if isinstance(event, wire.BargeEvent):
             await self._on_barge(event)
         elif isinstance(event, wire.ScoredEvent):

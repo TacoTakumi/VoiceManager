@@ -659,6 +659,12 @@ async def websocket_endpoint(websocket: WebSocket):
         send = _fenced_sink(epoch)
         try:
             async with stt_lock:
+                if epoch != listen.epoch:
+                    # Queued before a listen_stop: the STT was reset since, and the
+                    # audio the hold gives now is from after the stop. Do nothing.
+                    logger.debug("Turn end from before a listen_stop skipped: session=%s",
+                                 session_id)
+                    return
                 await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
                 if audiocpp_last_audio is not None:
                     await _finalize_audiocpp_utterance(pipeline, send, session_id=session_id)
@@ -674,9 +680,13 @@ async def websocket_endpoint(websocket: WebSocket):
         """Feed the STT the mic audio the hold lets go now, under stt_lock, in order.
 
         Its frames are fenced to ``epoch``, the listen epoch when the release came in.
+        A release queued before a listen_stop does nothing: the audio the hold gives
+        now is from after the stop and goes out with the next taker of this epoch.
         """
         try:
             async with stt_lock:
+                if epoch != listen.epoch:
+                    return
                 await _feed_audiocpp_stt(turn_engine.take_stt_audio(), _fenced_sink(epoch))
         except SidecarFault as exc:
             await _engine_stt_fault(exc)
@@ -884,13 +894,17 @@ async def websocket_endpoint(websocket: WebSocket):
         A real stop (listening -> stopped) also starts a new listen epoch, so the sink
         drops every frame still to come from audio fed before it, and discards the
         engine's open utterance. The discard is done before the answer goes out, so
-        the STT holds nothing from before the stop by then.
+        the STT holds nothing from before the stop by then. An opted-in session's turn
+        engine takes the boundary first, with no wait: its mic hold and pending finals
+        are dropped and the sidecar is told, so no turn_end or barge for pre-stop
+        audio goes out after the answer.
         """
         if not listen.stopped:
             listen.stopped = True
             listen.epoch += 1
             logger.info("Listening stopped: session=%s mic_sample=%d",
                         session_id, listen.mic_samples)
+            turn_engine.listen_boundary()
             await _discard_open_utterance()
         await websocket.send_text(
             ListenStoppedMessage(mic_sample=listen.mic_samples).model_dump_json())
@@ -899,6 +913,7 @@ async def websocket_endpoint(websocket: WebSocket):
         """Listen again. No answer; a listen_start while listening does nothing."""
         if listen.stopped:
             listen.stopped = False
+            turn_engine.listen_start()
             logger.info("Listening started: session=%s mic_sample=%d",
                         session_id, listen.mic_samples)
 
