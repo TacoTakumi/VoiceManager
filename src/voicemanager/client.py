@@ -190,6 +190,14 @@ class DuplexSession:
     follows. A turn_engine_lost error frame on ``errors()`` means the opt-in is
     gone and the session goes on as one that never opted in. A reconnect starts a
     new connection that has not opted in, with ``mic_sample`` back at 0.
+
+    Listening boundary: ``await session.listen_stop()`` when the mic stops (the user
+    stops listening, a conversation ends) keeps the connection open but stopped. It
+    returns the server's count of mic samples accepted, or None from a server older
+    than 0.8.0. While stopped, ``send_audio`` drops its frames without sending or
+    counting them, and TTS goes on as usual. ``await session.listen_start()`` before
+    the next audio listens again; ``listening`` tells which state the session is in.
+    A connection starts listening, and so does the new connection of a reconnect.
     """
 
     def __init__(self, client: "VoiceManagerClient") -> None:
@@ -209,9 +217,84 @@ class DuplexSession:
             self._client._duplex = None
 
     async def send_audio(self, pcm: bytes) -> None:
-        """Send one binary frame of 16 kHz mono 16-bit PCM to STT."""
+        """Send one binary frame of 16 kHz mono 16-bit PCM to STT.
+
+        While the session is stopped (see ``listen_stop``) the frame is dropped
+        here: it is not sent and not counted in ``mic_sample``, as the server
+        would not count it either.
+        """
+        if self._client._listen_stopped:
+            return
         await self._client._send_or_raise(pcm, STTError)
         self._client._mic_bytes += len(pcm)
+
+    @property
+    def listening(self) -> bool:
+        """True unless ``listen_stop`` stopped this connection and no ``listen_start`` followed."""
+        return not self._client._listen_stopped
+
+    async def listen_stop(self, timeout: float = 5.0) -> int | None:
+        """Stop listening on this connection and return the server's mic sample count.
+
+        The session is stopped first, so ``send_audio`` drops every frame from now
+        on. Then the listen_stop frame is sent and the call waits for listen_stopped,
+        whose ``mic_sample`` (the mic samples the server accepted on the connection)
+        it returns. If that differs from ``self.mic_sample`` a warning names both
+        counts. Calling it while already stopped still sends the frame; the server
+        answers again with the same count.
+
+        Returns None when no answer comes within ``timeout`` (a server older than
+        0.8.0 drops the frame) or the connection closes first; the session stays
+        stopped either way. If the send itself fails the client reconnects, and the
+        new connection listens.
+
+        Raises:
+            VoiceManagerError: The session is closed (nothing is sent), or the
+                connection was lost while sending the frame.
+        """
+        client = self._client
+        if self.closed:
+            raise VoiceManagerError("the duplex session is closed")
+        client._listen_stopped = True
+        client._listen_stops_sent += 1
+        number = client._listen_stops_sent
+        waiter = asyncio.get_running_loop().create_future()
+        # Registered before the send: the answer may land before the send returns.
+        client._listen_waiters[number] = waiter
+        try:
+            await client._send_or_raise(
+                json.dumps({"type": "listen_stop"}), VoiceManagerError)
+            try:
+                async with asyncio.timeout(timeout):
+                    server_count = await waiter
+            except TimeoutError:
+                client._logger.debug("No listen_stopped within %ss", timeout)
+                return None
+        finally:
+            if client._listen_waiters.get(number) is waiter:
+                del client._listen_waiters[number]
+        if server_count is not None and server_count != self.mic_sample:
+            client._logger.warning(
+                "listen_stopped mic_sample %s differs from the %d samples this "
+                "session sent", server_count, self.mic_sample)
+        return server_count
+
+    async def listen_start(self) -> None:
+        """Listen again on this connection: send listen_start and return at once.
+
+        The server sends no answer. ``send_audio`` sends and counts frames again
+        from now on. Calling it while already listening still sends the frame,
+        which the server ignores.
+
+        Raises:
+            VoiceManagerError: The session is closed (nothing is sent), or the
+                connection was lost while sending the frame.
+        """
+        client = self._client
+        if self.closed:
+            raise VoiceManagerError("the duplex session is closed")
+        client._listen_stopped = False
+        await client._send_or_raise(json.dumps({"type": "listen_start"}), VoiceManagerError)
 
     @property
     def mic_sample(self) -> int:
@@ -401,6 +484,16 @@ class VoiceManagerClient:
         # Bytes of mic audio sent on this connection. Half of it is the mic_sample
         # a playback frame reports, and any of it bars a later opt-in.
         self._mic_bytes: int = 0
+        # Listening boundary state for this connection: whether a DuplexSession
+        # stopped listening (send_audio then drops its frames), how many listen_stop
+        # frames were sent and how many listen_stopped answers came in. The server
+        # answers every listen_stop once and in order, so the Nth answer belongs to
+        # the Nth frame; _listen_waiters maps a pending call's number to its future,
+        # and an answer that finds no waiter (its call timed out) is dropped.
+        self._listen_stopped: bool = False
+        self._listen_stops_sent: int = 0
+        self._listen_acks_seen: int = 0
+        self._listen_waiters: dict[int, asyncio.Future] = {}
 
         self.session_id: str | None = None
         self._audio_format: dict = {}
@@ -529,11 +622,15 @@ class VoiceManagerClient:
         self._turn_queue = asyncio.Queue()
         self._turn_end_queue = asyncio.Queue()
         # A fresh connection carries no pending cancellations, has not opted in to
-        # a turn engine, and has sent no mic audio.
+        # a turn engine, has sent no mic audio, and listens.
         self._cancelled_tts = set()
         self._turn_engine_sent = None
         self.turn_engine = None
         self._mic_bytes = 0
+        self._listen_stopped = False
+        self._listen_stops_sent = 0
+        self._listen_acks_seen = 0
+        self._listen_waiters = {}
 
         delays = [1, 2, 4]
         for attempt, delay in enumerate(delays):
@@ -592,6 +689,8 @@ class VoiceManagerClient:
                         await self._tts_queue.put(frame)
                     elif ftype == "turn_engine_ready":
                         self._on_turn_engine_ready(frame)
+                    elif ftype == "listen_stopped":
+                        self._on_listen_stopped(frame)
                     elif ftype == "error":
                         error_type = frame.get("error_type", "")
                         if error_type == "timeout_warning":
@@ -622,6 +721,9 @@ class VoiceManagerClient:
             if waiter is not None and not waiter.done():
                 waiter.set_exception(
                     TurnEngineError("Connection lost waiting for turn_engine_ready"))
+            for listen_waiter in self._listen_waiters.values():
+                if not listen_waiter.done():
+                    listen_waiter.set_result(None)
             await self._stt_queue.put(None)
             await self._tts_queue.put(None)
             await self._turn_queue.put(None)
@@ -640,6 +742,16 @@ class VoiceManagerClient:
         waiter = self._turn_engine_waiter
         if waiter is not None and not waiter.done():
             waiter.set_result(engine)
+
+    def _on_listen_stopped(self, frame: dict) -> None:
+        """Hand a listen_stopped answer to the listen_stop call it answers, if it waits."""
+        self._listen_acks_seen += 1
+        waiter = self._listen_waiters.get(self._listen_acks_seen)
+        if waiter is None or waiter.done():
+            # The answer to a listen_stop whose call already timed out.
+            self._logger.debug("Ignoring a listen_stopped that answers no waiting call")
+            return
+        waiter.set_result(frame.get("mic_sample"))
 
     # ------------------------------------------------------------------
     # Full duplex

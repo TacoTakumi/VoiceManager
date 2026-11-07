@@ -1114,7 +1114,7 @@ The connection stays without a turn engine: a new opt-in on it gets `invalid_req
 
 A client that stops sending mic audio (the user stops listening, a conversation ends, the client goes idle until its own wake word) can tell the server so, and keep the connection open. Three frame types are added to `MessageType`: `listen_stop` and `listen_start` go from client to server, `listen_stopped` goes from server to client. Their fields and examples are in the [message-schema reference](#websocket-message-schema-reference): [`listen_stop`](#listen_stop---listenstopmessage), [`listen_start`](#listen_start---listenstartmessage) and [`listen_stopped`](#listen_stopped---listenstoppedmessage). The models are in `protocol.py`.
 
-A connection starts listening. A client that never sends these frames sees no change. Older servers drop the frames silently, as they drop any unknown frame type, so a client can send them to any server version.
+A connection starts listening. A client that never sends these frames sees no change. The Python client sends them with `DuplexSession.listen_stop()` and `DuplexSession.listen_start()`; while stopped its `send_audio` drops frames without sending or counting them. Older servers drop the frames silently, as they drop any unknown frame type, so a client can send them to any server version.
 
 ```text
 client -> binary mic PCM ...
@@ -1442,6 +1442,9 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `DuplexSession.playback_start` | `(request, mic_sample=None)` | `None` | Send `playback` `start` for a `TTSRequest` or `request_id`; `mic_sample` defaults to `mic_sample` now. |
 | `DuplexSession.playback_stop` | `(request, mic_sample=None, *, reply_sample)` | `None` | Send `playback` `stop`, with `reply_sample` in samples of the reply at its `audio_start` rate. |
 | `DuplexSession.turn_ends` | `()` | `AsyncIterator[dict]` | Yield each `turn_end` frame of an opted-in connection. |
+| `DuplexSession.listen_stop` | `(timeout=5.0)` | `int \| None` | Stop listening: the session stops first, so `send_audio` drops frames from then on, then it sends `listen_stop` and returns the `mic_sample` of `listen_stopped`. Logs a warning when that count differs from `mic_sample`. Returns `None`, still stopped, when no answer comes within `timeout` (a server older than 0.8.0) or the connection closes. Sends the frame again when already stopped. |
+| `DuplexSession.listen_start` | `()` | `None` | Send `listen_start` and listen again; returns at once (the server sends no answer). Sends the frame again when already listening. |
+| `DuplexSession.listening` | property | `bool` | `False` between a `listen_stop` and the next `listen_start`. While stopped, `send_audio` sends and counts nothing, so `mic_sample` keeps matching the server's count. A reconnect starts listening. |
 
 On an opted-in connection, `DuplexSession.audio` also yields `("barge", frame)`,
 before that request's `audio_end` (reason `"interrupted"`), and drops any PCM of

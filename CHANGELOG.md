@@ -32,6 +32,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is synthesized (for example a spoken goodbye). On a turn-engine connection,
   `playback` frames while stopped are dropped with no answer, and a reply begun
   while stopped is not tracked for barge.
+- Python client: `DuplexSession.listen_stop()` stops listening and returns the
+  `mic_sample` of `listen_stopped` (`None` from an older server, or when no answer
+  comes in time), `DuplexSession.listen_start()` listens again, and the
+  `DuplexSession.listening` property tells the state. While stopped, `send_audio`
+  sends and counts nothing, so `mic_sample` keeps matching the server's count.
 
 ## [0.7.0]
 
