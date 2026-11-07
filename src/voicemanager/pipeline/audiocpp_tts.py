@@ -38,6 +38,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import struct
 import shutil
@@ -1080,7 +1081,15 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                             break
                         parts.append(queued)
 
-                text = " ".join(p.strip() for p in parts if p and p.strip())
+                if clause:
+                    # Clause pieces carry the client's whitespace, so a word split
+                    # across pieces ("subsystem" + "s.") or a mark right after a
+                    # word ("categories" + ",") must not get a space: join them
+                    # as received and make each whitespace run one space.
+                    text = re.sub(r"\s+", " ", "".join(p for p in parts if p)).strip()
+                else:
+                    # split_sentences returns stripped sentences: they need the space.
+                    text = " ".join(p.strip() for p in parts if p and p.strip())
                 if not text:
                     continue
 

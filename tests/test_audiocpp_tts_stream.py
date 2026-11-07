@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -410,3 +411,115 @@ def test_coalesce_window_never_delays_the_first_sentence() -> None:
     assert fake.requests[0]["text"] == S1
     assert elapsed < 2.0, (
         f"first sentence waited {elapsed:.2f}s - the window must never gate it")
+
+
+# --- clause pieces keep the client's spacing in the engine request -------------------
+
+#: An LLM token stream: a word split across tokens ("subsystem" + "s."), a paragraph
+#: break, marks right after a word (" categories" + ",") and a no-space join
+#: (" CAS" + "-" + "1").
+TOKENS = ["subsystem", "s.", "\n\n", "Six", " categories", ",", " including", " CAS",
+          "-", "1"]
+SPOKEN = "subsystems. Six categories, including CAS-1"
+
+
+def _assert_clean(texts: list[str]) -> None:
+    """No engine request text starts or ends with whitespace or holds a whitespace run."""
+    for text in texts:
+        assert text == text.strip(), f"edge whitespace in {text!r}"
+        assert not re.search(r"\s\s", text), f"whitespace run in {text!r}"
+
+
+async def _until_true(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting on the condition")
+        await asyncio.sleep(0.005)
+
+
+def test_clause_token_stream_reaches_the_engine_with_the_clients_spacing() -> None:
+    """However the pieces fall into requests, each request is the client's text with
+    whitespace runs made one space: no space inside a split word or before a mark."""
+    from voicemanager.pipeline.audiocpp_tts import AudioCppTTSStreamPipeline
+
+    with FakeTtsSidecar() as fake:
+        engine = _external_engine(fake)
+        ws = _FakeWS()
+
+        async def scenario() -> None:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pipeline = TTSPipeline(engine=engine, executor=executor)
+                stream = AudioCppTTSStreamPipeline(
+                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0)
+                for token in TOKENS:
+                    await stream.feed_text(chunk=token, done=False, websocket=ws,
+                                           request_id="c1", chunking="clause")
+                await stream.feed_text(chunk="", done=True, websocket=ws,
+                                       request_id="c1")
+                task = stream.synthesis_task
+                assert task is not None
+                await asyncio.wait_for(task, timeout=10.0)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            engine.dispose()
+
+    texts = [r["text"] for r in fake.requests]
+    assert texts, "the clause request must reach the engine"
+    _assert_clean(texts)
+    assert " ".join(texts) == SPOKEN
+
+
+def test_clause_pieces_merged_while_busy_get_no_inserted_space() -> None:
+    """Pieces cut inside a word and before a mark, queued while the engine is busy,
+    merge into one request that reads as the client sent it."""
+    from voicemanager.pipeline.audiocpp_tts import AudioCppTTSStreamPipeline
+
+    with FakeTtsSidecar(gate_after_first=True) as fake:
+        engine = _external_engine(fake)
+        ws = _FakeWS()
+
+        async def scenario() -> None:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pipeline = TTSPipeline(engine=engine, executor=executor)
+                stream = AudioCppTTSStreamPipeline(
+                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0,
+                    clause_first_deadline_ms=50)
+
+                async def feed(chunk: str, done: bool = False) -> None:
+                    await stream.feed_text(chunk=chunk, done=done, websocket=ws,
+                                           request_id="c1", chunking="clause")
+
+                # The first piece goes out at its clause mark; the fake holds it.
+                await feed("Hi there friend,")
+                await _await_requests(fake, 1)
+
+                # A token that stops mid-word is cut once its word grace passes,
+                # so "subsystem" and "s." become separate pieces...
+                await feed("subsystem")
+                await _until_true(lambda: stream._clause_chunker.held_text == "")
+                # ...and a time cut before a mark leaves "," to start the next one.
+                for token in ["s.", " Six", " categories"]:
+                    await feed(token)
+                await _until_true(lambda: stream._clause_chunker.held_text == "")
+                for token in [",", " including", " CAS", "-"]:
+                    await feed(token)
+                await feed("1", done=True)
+                assert len(fake.requests) == 1, \
+                    "nothing new may dispatch while a request is synthesizing"
+
+                fake.proceed.set()
+                task = stream.synthesis_task
+                assert task is not None
+                await asyncio.wait_for(task, timeout=10.0)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            engine.dispose()
+
+    texts = [r["text"] for r in fake.requests]
+    _assert_clean(texts)
+    assert texts == ["Hi there friend,", SPOKEN]
