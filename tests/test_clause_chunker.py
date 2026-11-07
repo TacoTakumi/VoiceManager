@@ -672,6 +672,57 @@ def test_first_piece_wait_when_the_last_word_completes_the_count(clock):
     assert chunker.poll(now=0.45) == ["one two three"]
 
 
+def _count_met_when_the_audio_runs_out(clock) -> ClauseChunker:
+    """Two complete words held while audio plays, a third word inside its grace."""
+    chunker = ClauseChunker(first_piece_words=2, first_piece_deadline_ms=300,
+                            word_grace_ms=250, unplayed_margin_ms=0, clock=clock)
+    chunker.record_audio(0.5, now=0.0)
+    chunker.feed("Hello", now=0.0)
+    chunker.feed(" there", now=0.1)
+    chunker.feed(" friend", now=0.4)
+    return chunker
+
+
+def test_first_piece_wait_does_not_delay_a_met_word_count(clock):
+    # With no margin the first-piece count of complete words is due the moment
+    # the audio runs out; the grace wait is for the time trigger only.
+    chunker = _count_met_when_the_audio_runs_out(clock)
+    assert chunker.next_deadline(now=0.4) == pytest.approx(0.5)
+    pieces = chunker.poll(now=0.5)
+    assert [p.rstrip() for p in pieces] == ["Hello there"]
+    assert chunker.held_text == "friend"
+
+
+def test_remainder_deadline_after_a_met_count_cut_is_cut_when_due(clock):
+    chunker = _count_met_when_the_audio_runs_out(clock)
+    chunker.poll(now=0.5)
+    deadline = chunker.next_deadline(now=0.5)
+    assert deadline is not None
+    assert chunker.poll(now=max(deadline, 0.5)) == ["friend"]
+
+
+def test_next_deadline_is_the_audio_end_when_the_first_count_is_met(clock):
+    # With no margin the first-piece count applies once the audio runs out, which
+    # here is before the first-piece deadline.
+    chunker = ClauseChunker(first_piece_words=2, first_piece_deadline_ms=600,
+                            unplayed_margin_ms=0, clock=clock)
+    chunker.record_audio(0.2, now=0.0)
+    chunker.feed("Hello there ", now=0.0)
+    assert chunker.poll(now=0.0) == []
+    assert chunker.next_deadline(now=0.0) == pytest.approx(0.2)
+    assert chunker.poll(now=0.2) == ["Hello there "]
+
+
+def test_next_deadline_waits_for_the_grace_after_the_audio_end(clock):
+    chunker = ClauseChunker(first_piece_words=1, first_piece_deadline_ms=300,
+                            word_grace_ms=250, unplayed_margin_ms=0, clock=clock)
+    chunker.record_audio(0.2, now=0.0)
+    chunker.feed("Hello", now=0.0)
+    assert chunker.next_deadline(now=0.0) == pytest.approx(0.25)
+    assert chunker.poll(now=0.24) == []
+    assert chunker.poll(now=0.25) == ["Hello"]
+
+
 def test_count_trigger_counts_only_complete_words(clock):
     chunker = ClauseChunker(first_piece_words=4, clock=clock)
     chunker.feed("one two three fou")

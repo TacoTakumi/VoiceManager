@@ -216,12 +216,16 @@ class ClauseChunker:
         at or before ``now`` means a trigger is already due: call ``poll``. While no
         whitespace follows a held word, the time is no earlier than the end of the
         word grace of the newest frame, because no trigger can cut before then. When
-        the first-piece deadline governs and the held text ends in a partial word,
-        the time is the earlier of the end of its grace and the deadline plus
-        ``word_grace_ms``, because the first-piece cut waits until then. When a
-        partial last word would complete the active word count, the time is no later
-        than the end of its grace, when the count trigger fires. The answer can
-        change after ``feed`` or ``record_audio``, so ask again after each.
+        the first-piece deadline governs and the held text ends in a partial word
+        after fewer complete words than ``first_piece_words``, the time is the
+        earlier of the end of its grace and the deadline plus ``word_grace_ms``,
+        because the first-piece cut waits until then. When a partial last word would
+        complete the active word count, the time is no later than the end of its
+        grace, when the count trigger fires. With an ``unplayed_margin_ms`` of 0 and
+        ``first_piece_words`` held while audio plays, the time is no later than the
+        audio end, or the end of the last word's grace when that is later, because
+        the first-piece count fires then. The answer can change after ``feed`` or
+        ``record_audio``, so ask again after each.
         """
         held = "".join(text for text, _ in self._frames)
         if not _is_spoken(held):
@@ -231,16 +235,24 @@ class ClauseChunker:
         grace_end = self._frames[-1][1] + self.word_grace_ms / 1000.0
         boundary = _word_boundary(held)
         count_met = len(held.split()) >= self._count_threshold(now)
+        if (self.unplayed_margin_ms == 0 and self.unplayed_estimate(now) > 0.0
+                and len(held.split()) >= self.first_piece_words):
+            # The first-piece count takes over when the audio runs out, which can
+            # be before the first-piece deadline.
+            deadline = self._play_cursor
         if boundary is None:
             # No trigger can cut before the grace ends (a cut before the last word
             # would hold no letter or digit); once it ends, a met word count cuts at
             # once.
             return grace_end if count_met else max(deadline, grace_end)
-        if held[boundary:] and (self.unplayed_estimate(now) == 0.0
-                                or self.unplayed_margin_ms == 0):
+        first_count_met = len(held[:boundary].split()) >= self.first_piece_words
+        if held[boundary:] and not first_count_met and (
+                self.unplayed_estimate(now) == 0.0 or self.unplayed_margin_ms == 0):
             # The first-piece deadline waits for the partial last word: until its
             # grace ends (all held text goes) or for at most the grace (the cut is
-            # at the last whitespace), whichever comes first.
+            # at the last whitespace), whichever comes first. A met first-piece
+            # count of complete words cuts as soon as that rule governs, so it
+            # does not wait.
             first_deadline = first_word_at + self.first_piece_deadline_ms / 1000.0
             grace = self.word_grace_ms / 1000.0
             deadline = max(deadline, min(grace_end, first_deadline + grace))
