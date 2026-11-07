@@ -207,7 +207,7 @@ def test_the_first_piece_goes_at_the_first_piece_word_count(cls):
         await pipe.feed_text("one two", False, ws, "r1", chunking="clause")
         await asyncio.sleep(0.05)
         assert engine.texts == []
-        await pipe.feed_text(" three", False, ws, "r1")
+        await pipe.feed_text(" three ", False, ws, "r1")
         await _until(lambda: engine.texts == ["one two three"])
         await _finish(pipe, ws)
 
@@ -221,7 +221,7 @@ def test_the_first_piece_deadline_follows_the_injected_clock(cls):
         pipe = _pipe(engine, cls, clause_first_deadline_ms=600, clause_clock=clock)
         await pipe.feed_text("Hi", False, ws, "r1", chunking="clause")
         clock.t = 0.5
-        await pipe.feed_text(" there", False, ws, "r1")
+        await pipe.feed_text(" there ", False, ws, "r1")
         await asyncio.sleep(0.05)
         assert engine.texts == []  # 0.5 s after the first word: not yet
         clock.t = 0.6
@@ -257,10 +257,10 @@ def test_held_words_wait_for_the_margin_while_audio_plays(cls):
         engine, ws = _Engine(audio_s=0.4, sample_rate=1000), _WS()
         pipe = _pipe(engine, cls, clause_first_words=2, clause_first_deadline_ms=40,
                      clause_later_words=12, clause_margin_ms=100)
-        await pipe.feed_text("One two", False, ws, "r1", chunking="clause")
+        await pipe.feed_text("One two ", False, ws, "r1", chunking="clause")
         await _until(lambda: len(engine.calls) == 1)
         first_at = engine.calls[0][1]
-        await pipe.feed_text(" three four five", False, ws, "r1")
+        await pipe.feed_text(" three four five ", False, ws, "r1")
         # Past the first-piece deadline and word count: the later rule holds them.
         await asyncio.sleep(0.12)
         assert engine.texts == ["One two"]
@@ -277,12 +277,12 @@ def test_the_later_piece_word_count_sends_while_audio_plays(cls):
     async def run():
         engine, ws = _Engine(audio_s=5.0, sample_rate=1000), _WS()
         pipe = _pipe(engine, cls, clause_first_words=2, clause_later_words=4, **_NO_TIMER)
-        await pipe.feed_text("One two", False, ws, "r1", chunking="clause")
+        await pipe.feed_text("One two ", False, ws, "r1", chunking="clause")
         await _until(lambda: len(engine.calls) == 1)
         await pipe.feed_text(" three four five", False, ws, "r1")
         await asyncio.sleep(0.05)
         assert engine.texts == ["One two"]  # 3 words, 5 s still unplayed
-        await pipe.feed_text(" six", False, ws, "r1")
+        await pipe.feed_text(" six ", False, ws, "r1")
         await _until(lambda: engine.texts == ["One two", "three four five six"])
         await _finish(pipe, ws)
 
@@ -314,7 +314,7 @@ def test_audiocpp_merges_pieces_cut_while_busy_into_one_request():
         # Two pieces become ready while the first request is still synthesizing:
         # one at a clause mark, one at the first-piece word count.
         await pipe.feed_text(" Well, I see,", False, ws, "r1")
-        await pipe.feed_text(" one two", False, ws, "r1")
+        await pipe.feed_text(" one two ", False, ws, "r1")
         assert pipe._clause_chunker.held_text == ""  # both were cut, none held
         await asyncio.sleep(0.05)
         assert engine.texts == ["Hi there friend,"]
@@ -531,7 +531,7 @@ def test_the_handler_builds_the_chunker_from_settings(monkeypatch, fresh_setting
         client = TestClient(app)
         with authkit.ws_connect(client, "/ws/stream") as ws:
             assert ws.receive_json()["type"] == "ready"
-            ws.send_json({"type": "tts_stream", "request_id": "r1", "text": "one two",
+            ws.send_json({"type": "tts_stream", "request_id": "r1", "text": "one two ",
                           "chunking": "clause"})
             ws.send_json({"type": "tts_stream", "request_id": "r1", "text": " three",
                           "done": True})

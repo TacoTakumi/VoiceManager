@@ -145,7 +145,7 @@ async def _until(predicate, timeout: float = 5.0) -> None:
 
 async def _first_piece(fake: FakeTtsSidecar, pipe, ws, chunking: str = "clause") -> None:
     """Open request r1 and wait until its first engine request has been answered."""
-    text = FIRST if chunking == "clause" else FEED1
+    text = FIRST + " " if chunking == "clause" else FEED1
     await pipe.feed_text(text, False, ws, "r1", chunking=chunking)
     await _until(lambda: len(fake.requests) == 1)
     await _until(lambda: fake.request_done.is_set())

@@ -1,9 +1,9 @@
 """Clause cut rule for streamed TTS text.
 
-A client that streams its reply in small chunks (2-3 words at a time) gets choppy
-speech if every chunk is synthesized on its own. ClauseChunker holds the incoming
-text and decides when a piece is big enough to send to the engine, using how much
-audio of the request is still unplayed:
+A client that streams its reply in small chunks (2-3 words, or single LLM tokens,
+at a time) gets choppy speech if every chunk is synthesized on its own. ClauseChunker
+holds the incoming text and decides when a piece is big enough to send to the engine,
+using how much audio of the request is still unplayed:
 
 - First-piece rule, used while the unplayed-audio estimate is 0 (nothing is
   playing yet, or the audio already sent has run out): send at a clause mark, when
@@ -22,8 +22,17 @@ it would leave a gap.
 
 A clause-mark trigger sends the held text up to and including the last clause mark
 that qualifies (plus any closing quotes or brackets right after it); the words after
-it stay held. A word-count or time trigger sends all held text. A piece is the held
-text exactly as received, with only surrounding whitespace trimmed.
+it stay held. A word-count or time trigger sends the held text up to its last word
+end, so a token stream never has a word cut in two ("subsystem" + "s." stays one
+word). A word ends at a whitespace character. The end of the held text is also a
+word end once the newest frame has been held for ``word_grace_ms`` with no new frame:
+a client that streams whole words without trailing whitespace stops sending its
+last word, while a token stream sends the rest of a word within a few milliseconds.
+Text after the last word end may be a partial word and stays held. The word count
+counts only the words before the last word end, and neither trigger fires while no
+word end follows a word. With ``word_grace_ms`` of 0 every frame end is a word end.
+``drain`` still sends all held text. A piece is the held text exactly as received,
+with only surrounding whitespace trimmed.
 
 The unplayed-audio estimate is a play cursor: the clock time at which the audio sent
 so far ends. Each audio chunk extends playback from the later of the cursor and now
@@ -70,6 +79,19 @@ def _last_clause_cut(text: str, min_words: int = 1) -> int | None:
     return None
 
 
+def _word_boundary(text: str) -> int | None:
+    """Return the index just past the last whitespace in ``text``, or None.
+
+    The text before that index holds only complete words; the text after it may be a
+    word still arriving. None when no whitespace follows a word, so ``text`` holds no
+    complete word.
+    """
+    for i in range(len(text) - 1, -1, -1):
+        if text[i].isspace():
+            return i + 1 if text[:i].strip() else None
+    return None
+
+
 class ClauseChunker:
     """Hold streamed text and cut it into clause-sized pieces for synthesis.
 
@@ -82,6 +104,9 @@ class ClauseChunker:
             estimate drops below this.
         mark_min_words: Words the held text must hold up to a clause mark for the
             mark to be a cut point.
+        word_grace_ms: Time the newest frame must be held with no new frame before
+            the end of the held text counts as a word end. 0 makes every frame end a
+            word end.
         clock: Returns the current time in seconds. Every method that takes ``now``
             uses it when ``now`` is None.
     """
@@ -93,6 +118,7 @@ class ClauseChunker:
         later_piece_words: int = 12,
         unplayed_margin_ms: int = 1000,
         mark_min_words: int = 3,
+        word_grace_ms: int = 250,
         clock: Callable[[], float] = time.monotonic,
     ):
         if first_piece_words < 1 or later_piece_words < 1:
@@ -103,11 +129,14 @@ class ClauseChunker:
             raise ValueError("first_piece_deadline_ms must be positive")
         if unplayed_margin_ms < 0:
             raise ValueError("unplayed_margin_ms must not be negative")
+        if word_grace_ms < 0:
+            raise ValueError("word_grace_ms must not be negative")
         self.first_piece_words = first_piece_words
         self.first_piece_deadline_ms = first_piece_deadline_ms
         self.later_piece_words = later_piece_words
         self.unplayed_margin_ms = unplayed_margin_ms
         self.mark_min_words = mark_min_words
+        self.word_grace_ms = word_grace_ms
         self._clock = clock
         # Held text as the frames that brought it, each with its arrival time, so the
         # words left after a clause cut keep the arrival time of their own frame.
@@ -157,21 +186,30 @@ class ClauseChunker:
         """Return the clock time at which a time trigger fires, or None.
 
         None means no text is held, so only a new ``feed`` can produce a piece. A time
-        at or before ``now`` means a trigger is already due: call ``poll``. The answer
+        at or before ``now`` means a trigger is already due: call ``poll``. While no
+        whitespace follows a held word, the time is no earlier than the end of the
+        word grace of the newest frame, because no trigger can cut before then. When
+        a partial last word would complete the active word count, the time is no
+        later than the end of its grace, when the count trigger fires. The answer
         can change after ``feed`` or ``record_audio``, so ask again after each.
         """
         first_word_at = self._first_word_at()
         if first_word_at is None:
             return None
-        first_deadline = first_word_at + self.first_piece_deadline_ms / 1000.0
-        if self.unplayed_estimate(now) == 0.0:
-            return first_deadline
-        audio_end = self._play_cursor
-        if self.unplayed_margin_ms > 0:
-            return audio_end - self.unplayed_margin_ms / 1000.0
-        # With no margin the later-piece rule has no time trigger; the first-piece
-        # deadline takes over once the audio has run out.
-        return max(audio_end, first_deadline)
+        deadline = self._trigger_deadline(first_word_at, now)
+        held = "".join(text for text, _ in self._frames)
+        grace_end = self._frames[-1][1] + self.word_grace_ms / 1000.0
+        boundary = _word_boundary(held)
+        count_met = len(held.split()) >= self._count_threshold(now)
+        if boundary is None:
+            # No trigger can cut before the grace ends; once it ends, a met word
+            # count cuts at once.
+            return grace_end if count_met else max(deadline, grace_end)
+        if held[boundary:] and count_met:
+            # The partial last word completes the word count once its grace has
+            # passed, so wake then rather than wait for the time trigger.
+            return min(deadline, grace_end)
+        return deadline
 
     def drain(self) -> list[str]:
         """Remove and return all held text as one piece ([] if nothing is held).
@@ -207,6 +245,29 @@ class ClauseChunker:
     def _now(self, now: float | None) -> float:
         return self._clock() if now is None else now
 
+    def _trigger_deadline(self, first_word_at: float, now: float | None) -> float:
+        """Clock time at which the first-piece deadline or the margin trigger fires."""
+        first_deadline = first_word_at + self.first_piece_deadline_ms / 1000.0
+        if self.unplayed_estimate(now) == 0.0:
+            return first_deadline
+        audio_end = self._play_cursor
+        if self.unplayed_margin_ms > 0:
+            return audio_end - self.unplayed_margin_ms / 1000.0
+        # With no margin the later-piece rule has no time trigger; the first-piece
+        # deadline takes over once the audio has run out.
+        return max(audio_end, first_deadline)
+
+    def _word_end(self, held: str, now: float) -> int | None:
+        """Return the index just past the last word end in ``held``, or None.
+
+        The end of ``held`` is a word end once the newest frame has been held for the
+        word grace; before that, only whitespace after a word ends one.
+        """
+        newest_at = self._frames[-1][1]
+        if now - newest_at >= self.word_grace_ms / 1000.0 - _EPS:
+            return len(held)
+        return _word_boundary(held)
+
     def _first_word_at(self) -> float | None:
         """Arrival time of the frame that brought the first held word."""
         for text, at in self._frames:
@@ -215,7 +276,11 @@ class ClauseChunker:
         return None
 
     def _next_piece(self, now: float) -> str | None:
-        """Cut one piece off the buffer if a trigger fires, else return None."""
+        """Cut one piece off the buffer if a trigger fires, else return None.
+
+        A clause mark cuts after the mark; a word-count or time trigger cuts at the
+        last word end, leaving a partial last word held.
+        """
         held = "".join(text for text, _ in self._frames)
         if not held.strip():
             return None
@@ -223,22 +288,27 @@ class ClauseChunker:
         if cut is not None:
             self._take(cut)
             return held[:cut].strip()
-        if self._count_or_time_due(held, now):
-            self._frames.clear()
-            return held.strip()
+        end = self._word_end(held, now)
+        if end is not None and self._count_or_time_due(held[:end], now):
+            self._take(end)
+            return held[:end].strip()
         return None
 
-    def _count_or_time_due(self, held: str, now: float) -> bool:
-        words = len(held.split())
+    def _count_threshold(self, now: float | None) -> int:
+        """Word count that sends a piece under the rule active at ``now``."""
+        if self.unplayed_estimate(now) == 0.0:
+            return self.first_piece_words
+        return self.later_piece_words
+
+    def _count_or_time_due(self, complete: str, now: float) -> bool:
+        """True when a word-count or time trigger fires for the complete words held."""
+        if len(complete.split()) >= self._count_threshold(now):
+            return True
         estimate = self.unplayed_estimate(now)
         if estimate == 0.0:
-            if words >= self.first_piece_words:
-                return True
             first_word_at = self._first_word_at()
             deadline = first_word_at + self.first_piece_deadline_ms / 1000.0
             return now >= deadline - _EPS
-        if words >= self.later_piece_words:
-            return True
         return estimate < self.unplayed_margin_ms / 1000.0 - _EPS
 
     def _take(self, cut: int) -> None:
