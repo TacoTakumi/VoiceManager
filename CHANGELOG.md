@@ -4,6 +4,27 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1]
+
+### Fixed
+
+- Clause-mode `tts_stream` with a client that streams LLM tokens. A word split
+  across tokens ("subsystem" + "s.") is no longer cut in two: a word-count or time
+  trigger cuts at the last word end, which is whitespace, or the end of the held
+  text once no new frame arrived for the word grace. A piece with no letter or
+  digit (a lone ".") is never sent to the engine: it starts the next piece, or is
+  dropped at `done` or `flush`. Pieces keep the client's whitespace, so the
+  audiocpp engine no longer puts a space inside a split word or before
+  punctuation ("tri age", "categories ,"), and a paragraph break no longer joins
+  two sentences ("use.One").
+
+### Added
+
+- Setting `VM_TTS_CLAUSE_WORD_GRACE_MS` (250). The end of the held text counts as
+  a word end once no new frame arrived for this long. 0 makes every frame end a
+  word end, the behaviour before this release. A client that sends whole words
+  with no trailing space gets each count or time cut at most this much later.
+
 ## [0.8.0]
 
 ### Added
