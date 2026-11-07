@@ -115,6 +115,19 @@ class EndpointHoldMachine:
         self._stitch_prefix = ""
         self._stitch_turn = 0
 
+    def clear(self) -> None:
+        """Drop the pending hold and the stitch prefix without emitting either.
+
+        Used when the client stops listening: the held text is from audio before
+        the stop, so it must neither confirm later nor stitch onto speech after a
+        listen_start. The segment offset is kept, so emitted segment indexes stay
+        monotonic and are never reused.
+        """
+        self._held = None
+        self._samples_since_eou = 0
+        self._held_turn = 0
+        self.clear_stitch()
+
     def remap(self, pipeline_segment_index: int) -> int:
         """Map a NeMo segment_index to the emitted one; reopens collapse segments."""
         return pipeline_segment_index - self._segment_offset

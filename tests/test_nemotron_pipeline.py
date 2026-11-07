@@ -178,3 +178,121 @@ def test_nemotron_cfg_disables_per_stream_biasing():
     s = Settings()
     cfg = _build_nemotron_cfg(s, "cuda:2")
     assert cfg.asr.decoding.greedy.enable_per_stream_biasing is False
+
+
+# --- discard_utterance: drop the open utterance and start a fresh NeMo stream -------
+
+import numpy as np
+
+_STATEFUL_CHUNK_SAMPLES = 512
+# Speech values that name the audio: a leak shows as "pre" in text after a discard.
+STATEFUL_PRE = (0x1111).to_bytes(2, "little") * _STATEFUL_CHUNK_SAMPLES
+STATEFUL_POST = (0x2222).to_bytes(2, "little") * _STATEFUL_CHUNK_SAMPLES
+
+
+def _names(audio_f32) -> list[str]:
+    found = []
+    for name, value in (("pre", 0x1111), ("post", 0x2222)):
+        if np.any(np.abs(audio_f32 - value / 32768.0) < 1e-6):
+            found.append(name)
+    return found
+
+
+class _StepOut:
+    def __init__(self, partial: str, final: str = "") -> None:
+        self.partial_transcript = partial
+        self.final_transcript = final
+
+
+class _Frame:
+    def __init__(self, samples, stream_id, is_first, is_last) -> None:
+        self.samples = samples
+        self.stream_id = stream_id
+        self.is_first = is_first
+        self.is_last = is_last
+
+
+class StatefulShared:
+    """A CacheAwareRNNTPipeline stand-in that keeps a running hypothesis per stream.
+
+    Like NeMo, the partial of a step is the text of the whole open utterance of that
+    stream so far, so audio fed earlier on a stream carries into later partials. A
+    frame with is_last deletes the stream's state (as the real is_last frees its slot).
+    """
+    chunk_size_in_secs = _STATEFUL_CHUNK_SAMPLES / 16000
+
+    def __init__(self) -> None:
+        self.states: dict[int, list[str]] = {}
+        self.inits: list[int] = []
+        self.deleted: list[int] = []
+        self.last_frames: list[int] = []
+
+    def init_state(self, stream_id, options):
+        self.inits.append(stream_id)
+        self.states[stream_id] = []
+        return object()
+
+    def delete_state(self, stream_id):
+        self.deleted.append(stream_id)
+        self.states.pop(stream_id, None)
+
+    def transcribe_step(self, frames):
+        frame = frames[0]
+        words = self.states.setdefault(frame.stream_id, [])
+        for name in _names(frame.samples):
+            if name not in words:
+                words.append(name)
+        partial = " ".join(words)
+        if frame.is_last:
+            self.last_frames.append(frame.stream_id)
+            self.states.pop(frame.stream_id, None)
+            return [_StepOut("", partial)]
+        return [_StepOut(partial)]
+
+
+class StatefulNemotron(NemotronSTTPipeline):
+    """The real wrapper over StatefulShared; only the NeMo Frame type is replaced."""
+
+    def _make_options(self):
+        return None
+
+    def _build_frame(self, audio_f32, *, is_last: bool):
+        frame = _Frame(audio_f32.copy(), self._stream_id, not self._first_chunk_sent, is_last)
+        self._first_chunk_sent = True
+        return frame
+
+
+def test_discard_utterance_drops_the_hypothesis_and_starts_a_fresh_stream():
+    shared = StatefulShared()
+    p = StatefulNemotron(shared_pipeline=shared, stream_id=11, att_context_size=[70, 13])
+    assert asyncio.run(p.feed(STATEFUL_PRE)) is True
+    assert p.get_current_text() == ("pre", "en", 0)
+    asyncio.run(p.feed(STATEFUL_PRE[:100]))       # a sub-chunk tail stays buffered
+
+    asyncio.run(p.discard_utterance())
+
+    # The old stream was ended the way teardown frees it, and a new one opened.
+    assert shared.last_frames == [11]
+    assert 11 in shared.deleted
+    assert shared.inits[0] == 11 and len(shared.inits) == 2
+    new_id = shared.inits[1]
+    assert new_id != 11 and new_id in shared.states
+    # No text is left to emit, and the segment index moved on, never back.
+    assert p.get_current_text() == ("", "en", 1)
+    assert p.take_final() is None
+    # The next audio starts a new utterance on the new stream: no pre-stop text, and
+    # the buffered tail is gone (one full chunk gives exactly one step).
+    assert asyncio.run(p.feed(STATEFUL_POST)) is True
+    assert p.get_current_text() == ("post", "en", 1)
+    assert shared.states[new_id] == ["post"]
+
+
+def test_discard_utterance_before_any_audio_frees_the_initial_state():
+    shared = StatefulShared()
+    p = StatefulNemotron(shared_pipeline=shared, stream_id=12, att_context_size=[70, 13])
+    asyncio.run(p.discard_utterance())
+    assert shared.last_frames == []                # nothing streamed: no is_last frame
+    assert 12 in shared.deleted
+    assert len(shared.inits) == 2
+    # Nothing was open, so the segment index stays.
+    assert p.get_current_text() == ("", "en", 0)

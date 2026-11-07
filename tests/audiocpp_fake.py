@@ -60,6 +60,10 @@ Scriptable per connection:
                     connection serves normally again -- exactly what drive_loop.cpp does
                     when session.finalize() throws: it writes ERROR `internal` from the
                     catch block and CONTINUES its loop, still serving
+  * audio_reply_gate -- a threading.Event the fake waits on (up to 5 s) before it
+                    answers each AUDIO frame. It reads frames in order, so the frames
+                    behind a held AUDIO wait too: a decode still running while the
+                    client goes on, whose deltas arrive late
   * die_on_audio -- close the socket abruptly on the first AUDIO frame (fault sim)
   * die_on_audio_conn -- die like die_on_audio, but ONLY for the Nth connection (0-based),
                     leaving every other connection healthy -- so one session can be
@@ -162,6 +166,7 @@ class FakeSidecar:
                  flush_final_delay: float = 0.0,
                  flush_event_flood: str | None = None,
                  flush_script: list[tuple[list[str], str]] | None = None,
+                 audio_reply_gate: threading.Event | None = None,
                  die_on_audio: bool = False,
                  die_on_audio_conn: int | None = None, lang: str = "en",
                  socket_path: str | None = None, accept_mode: str = "single"):
@@ -193,6 +198,7 @@ class FakeSidecar:
         # takes over the FLUSH branch entirely (flush_events/flush_final/flush_error are
         # ignored).
         self.flush_script = flush_script
+        self.audio_reply_gate = audio_reply_gate
         self.die_on_audio = die_on_audio
         self.die_on_audio_conn = die_on_audio_conn
         self.lang = lang
@@ -319,6 +325,8 @@ class FakeSidecar:
                     if die_on_audio:
                         conn.close()  # abrupt EOF, no BYE -- the crash fault shape
                         return
+                    if self.audio_reply_gate is not None:
+                        self.audio_reply_gate.wait(5.0)  # a decode still running
                     if self.audio_delta_script is not None:
                         if delta_idx < len(self.audio_delta_script):
                             entry = self.audio_delta_script[delta_idx]

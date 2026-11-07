@@ -306,10 +306,16 @@ class ListenState:
     carries. It counts the way the turn engine's hop feed does (bytes / 2 over every
     accepted frame, past a WAV header on the first one), so the two agree for the
     same audio.
+
+    The epoch counts the listen_stops that stopped a listening connection. A
+    transcription frame carries the epoch its audio was fed in, and the sink drops a
+    frame whose epoch is not the current one: nothing made from audio before a stop
+    reaches the client after it. A connection that never stops stays in epoch 0.
     """
 
     def __init__(self) -> None:
         self.stopped = False
+        self.epoch = 0
         self._frames = 0
         self._mic_bytes = 0
 
@@ -425,11 +431,17 @@ async def websocket_endpoint(websocket: WebSocket):
         # model object; sharing one would cross-contaminate concurrent sessions), built
         # off-loop. No factory configured -> inert, and the frame gap is the only trigger.
         vad_factory = (audiocpp_config or {}).get("vad_model_factory")
-        audiocpp_endpointer = AcousticEndpointer(
-            vad_model=await asyncio.to_thread(vad_factory) if vad_factory else None,
-            vad_threshold=settings.audiocpp_vad_threshold,
-            silence_ms=settings.audiocpp_silence_ms,
-        )
+        audiocpp_vad_model = await asyncio.to_thread(vad_factory) if vad_factory else None
+
+        def _new_audiocpp_endpointer() -> AcousticEndpointer:
+            # Built again at a listen_stop on the same silero instance: a fresh
+            # VADIterator resets the net's state and drops the half chunk it carried.
+            return AcousticEndpointer(
+                vad_model=audiocpp_vad_model,
+                vad_threshold=settings.audiocpp_vad_threshold,
+                silence_ms=settings.audiocpp_silence_ms,
+            )
+        audiocpp_endpointer = _new_audiocpp_endpointer()
         # Idle-feed gate. Inter-utterance silence frames are not
         # fed to the (4B) decoder; a rolling pre-roll is replayed at speech onset so
         # the attack silero needed a chunk to confirm is not clipped. Armed only when
@@ -611,10 +623,10 @@ async def websocket_endpoint(websocket: WebSocket):
     # held mic audio); the teardown waits for it.
     engine_stt_tasks: set[asyncio.Task] = set()
 
-    async def _feed_audiocpp_stt(chunks) -> None:
+    async def _feed_audiocpp_stt(chunks, send) -> None:
         """Run each chunk through the audio.cpp STT path, in order. Hold stt_lock."""
         for chunk in chunks:
-            await _audiocpp_stt_frame(chunk)
+            await _audiocpp_stt_frame(chunk, send)
 
     async def _engine_stt_fault(exc: SidecarFault) -> None:
         """A sidecar fault met by the turn engine's STT work: the handler's own surface."""
@@ -630,7 +642,7 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
-    async def _end_turn_locked(event) -> None:
+    async def _end_turn_locked(event, epoch: int) -> None:
         """FLUSH the open utterance, if there is one, then send the turn_end.
 
         Both under stt_lock, so the flushed final goes out before the turn_end and is
@@ -639,13 +651,17 @@ async def websocket_endpoint(websocket: WebSocket):
         is not in) stays held and reaches the STT after this turn end. The speculative
         endpoint-hold is nemotron-only (hold_machine is None on audiocpp, the one engine
         a turn engine runs on), so a turn end never meets a held final.
+
+        The frames go out fenced to ``epoch``, the listen epoch when the turn end came
+        in: a flush still running when a listen_stop arrives sends nothing.
         """
         nonlocal audiocpp_last_audio
+        send = _fenced_sink(epoch)
         try:
             async with stt_lock:
-                await _feed_audiocpp_stt(turn_engine.take_stt_audio())
+                await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
                 if audiocpp_last_audio is not None:
-                    await _finalize_audiocpp_utterance(pipeline, _emit, session_id=session_id)
+                    await _finalize_audiocpp_utterance(pipeline, send, session_id=session_id)
                     audiocpp_last_audio = None
                 await turn_engine.send_turn_end(event)
         except SidecarFault as exc:
@@ -654,11 +670,14 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.warning("Turn end failed for session %s: %s", session_id, exc)
             logger.debug("Turn end failure detail", exc_info=True)
 
-    async def _release_held_locked() -> None:
-        """Feed the STT the mic audio the hold lets go now, under stt_lock, in order."""
+    async def _release_held_locked(epoch: int) -> None:
+        """Feed the STT the mic audio the hold lets go now, under stt_lock, in order.
+
+        Its frames are fenced to ``epoch``, the listen epoch when the release came in.
+        """
         try:
             async with stt_lock:
-                await _feed_audiocpp_stt(turn_engine.take_stt_audio())
+                await _feed_audiocpp_stt(turn_engine.take_stt_audio(), _fenced_sink(epoch))
         except SidecarFault as exc:
             await _engine_stt_fault(exc)
         except Exception as exc:
@@ -680,11 +699,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def _end_turn(event) -> None:
         """The turn engine's end_turn callback."""
-        await _shielded(_end_turn_locked(event))
+        await _shielded(_end_turn_locked(event, listen.epoch))
 
     async def _release_held() -> None:
         """The turn engine's release_held callback."""
-        await _shielded(_release_held_locked())
+        await _shielded(_release_held_locked(listen.epoch))
 
     # The connection's turn engine. It does nothing (no I/O, no task) until a
     # turn_engine frame opts in, so a connection that never opts in runs exactly the
@@ -709,7 +728,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # utterance is un-flushed, and is None when there is nothing pending to finalize.
     audiocpp_last_audio: float | None = None
 
-    async def _emit(msg: TranscriptionMessage) -> None:
+    async def _emit(msg: TranscriptionMessage, epoch: int | None = None) -> None:
         """Send one transcription frame, stamped with its turn (shared cross-engine sink).
 
         The turn_id is the turn open when this utterance's audio was received
@@ -723,7 +742,18 @@ async def websocket_endpoint(websocket: WebSocket):
         current turn when it confirms across a turn_start. Do NOT overwrite that with the
         send-time turn; the id on the frame is the race-free fence the client reads. Only the
         nemotron hold path has held finals; whisper/qwen (hold_machine None) stamp normally.
+
+        The listening boundary fence: ``epoch`` is the listen epoch the frame's audio
+        was fed in. A frame from an earlier epoch (audio fed before a listen_stop, its
+        decode still running when the stop came in) is dropped here, before the socket
+        and before the turn engine's note_final. None means the caller's audio is of
+        the current epoch: the paths that flush engine state, which a listen_stop
+        has already discarded.
         """
+        if epoch is not None and epoch != listen.epoch:
+            logger.debug("Dropped a transcription frame from before a listen_stop: "
+                         "session=%s final=%s %s", session_id, msg.is_final, msg.text[:50])
+            return
         if not (hold_machine is not None and msg.is_final):
             turn_tracker.stamp(msg)
         await websocket.send_text(msg.model_dump_json())
@@ -731,8 +761,16 @@ async def websocket_endpoint(websocket: WebSocket):
             # An opted-in session's turn_end joins the finals sent since the last one.
             turn_engine.note_final(msg.text, msg.turn_id)
 
-    async def _audiocpp_stt_frame(data: bytes) -> None:
+    def _fenced_sink(epoch: int):
+        """The transcription sink for audio fed in listen epoch ``epoch``."""
+        async def send(msg: TranscriptionMessage) -> None:
+            await _emit(msg, epoch)
+        return send
+
+    async def _audiocpp_stt_frame(data: bytes, send) -> None:
         """One chunk of mic audio through the audio.cpp STT path. Hold stt_lock.
+
+        ``send`` is the fenced sink for the epoch the chunk was fed in.
 
         The silero endpointer, the idle gate and its onset pre-roll, the pipeline feed,
         and the finals it volunteers or the acoustic endpoint flushes. The handler runs
@@ -770,7 +808,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if has_update:
             text, language, seg_idx = pipeline.get_current_text()
             if text.strip():
-                await _emit(TranscriptionMessage(
+                await send(TranscriptionMessage(
                     text=text, is_final=False, segment_index=seg_idx, language=language))
         # A volunteered mid-stream FINAL commits immediately and ends
         # the utterance, exactly like nemotron's legacy path.
@@ -779,7 +817,7 @@ async def websocket_endpoint(websocket: WebSocket):
             committed = True
             f_text, f_lang, f_seg = final
             if f_text.strip():
-                await _emit(TranscriptionMessage(
+                await send(TranscriptionMessage(
                     text=f_text, is_final=True, segment_index=f_seg, language=f_lang))
             pipeline.reset()
             audiocpp_last_audio = None  # committed; nothing pending until next audio
@@ -788,12 +826,51 @@ async def websocket_endpoint(websocket: WebSocket):
         # timeout that hosts the gap trigger never elapses for this client).
         # Skipped when a volunteered FINAL just committed this utterance.
         if acoustic_endpoint and not committed:
-            await _finalize_audiocpp_utterance(pipeline, _emit, session_id=session_id)
+            await _finalize_audiocpp_utterance(pipeline, send, session_id=session_id)
             audiocpp_last_audio = None
 
     # The listening boundary. The flag and the count live here; everything a
     # listen_stop does to the connection is in _apply_listen_stop below.
     listen = ListenState()
+
+    async def _discard_open_utterance() -> None:
+        """Drop the STT engine's utterance state built from audio before a listen_stop.
+
+        Without it the open utterance would go on into the first utterance after
+        listen_start, and the audio.cpp quiet flush or the nemotron endpoint hold would
+        send a final from it while stopped. Under stt_lock, like every other place that
+        drives the pipeline: a turn-end flush or a held-audio feed still running runs
+        to its end first (its frames are fenced by their epoch). Nothing here blocks
+        the event loop; the one engine call that waits on a decode runs off-loop.
+        """
+        nonlocal audiocpp_last_audio, audiocpp_endpointer, streaming_last_update
+        async with stt_lock:
+            if stt_engine_type == "audiocpp":
+                # The sidecar answers in order and RESET has no reply, so a delta or a
+                # final for audio before the stop can still be on its way and would be
+                # read by the next feed as new text. A FLUSH is the one round trip that
+                # ends with the reply to every frame sent before it: read it all, keep
+                # none of it. It is a no-op when no audio was fed since the last flush.
+                await pipeline.finalize()
+                while pipeline.take_final() is not None:
+                    pass
+                pipeline.reset()
+                audiocpp_last_audio = None      # the quiet flush has nothing to flush
+                audiocpp_preroll.clear()        # pre-stop audio is not an onset pre-roll
+                audiocpp_endpointer = _new_audiocpp_endpointer()
+            elif stt_engine_type == "nemotron":
+                # A fresh NeMo stream: the running hypothesis of the open utterance
+                # and the buffered PCM tail go with the old one.
+                await pipeline.discard_utterance()
+                if hold_machine is not None:
+                    hold_machine.clear()        # a held final never confirms
+            elif stt_engine_type == "qwen":
+                pipeline.reset()
+                streaming_last_update = None
+            else:
+                # Whisper: dispose() clears the audio buffer, the VAD carry-over and
+                # the VAD state, and leaves the pipeline usable for the next feed.
+                pipeline.dispose()
 
     async def _apply_listen_stop() -> None:
         """Stop listening and answer listen_stopped with the count at the boundary.
@@ -803,11 +880,18 @@ async def websocket_endpoint(websocket: WebSocket):
         may follow right behind. A listen_stop while stopped answers again with the
         same count. TTS is not touched: a reply keeps playing, and tts requests while
         stopped are synthesized as usual.
+
+        A real stop (listening -> stopped) also starts a new listen epoch, so the sink
+        drops every frame still to come from audio fed before it, and discards the
+        engine's open utterance. The discard is done before the answer goes out, so
+        the STT holds nothing from before the stop by then.
         """
         if not listen.stopped:
             listen.stopped = True
+            listen.epoch += 1
             logger.info("Listening stopped: session=%s mic_sample=%d",
                         session_id, listen.mic_samples)
+            await _discard_open_utterance()
         await websocket.send_text(
             ListenStoppedMessage(mic_sample=listen.mic_samples).model_dump_json())
 
@@ -1041,6 +1125,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 # it, so frames it produces are tagged with the turn open at receive time
                 # (not the turn that may open while its inference is still in flight).
                 turn_tracker.mark_received()
+                # Likewise its listen epoch: the frames this audio produces go out
+                # through a sink fenced to it, so a decode that is still running when
+                # a listen_stop comes in cannot send them after its answer.
+                send = _fenced_sink(listen.epoch)
 
                 # STT path - route to correct pipeline
                 if stt_engine_type == "nemotron":
@@ -1048,7 +1136,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # contract: acoustic-EoU driven, with a speculative endpoint-hold when
                     # enabled (hold_machine None -> legacy immediate finals).
                     await _drive_nemotron_stt(
-                        pipeline, hold_machine, data, _emit, session_id=session_id,
+                        pipeline, hold_machine, data, send, session_id=session_id,
                     )
                 elif stt_engine_type == "audiocpp":
                     # audio.cpp shares the feed/get_current_text/take_final
@@ -1078,9 +1166,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     # straight on.
                     async with stt_lock:
                         if via_hold:
-                            await _feed_audiocpp_stt(turn_engine.take_stt_audio())
+                            await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
                         else:
-                            await _audiocpp_stt_frame(data)
+                            await _audiocpp_stt_frame(data, send)
                 elif stt_engine_type == "qwen":
                     # Streaming path: qwen interim result protocol
                     has_update = await pipeline.feed(data)
@@ -1094,7 +1182,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 segment_index=seg_idx,
                                 language=language,
                             )
-                            await _emit(msg_out)  # stamp turn_id via the shared sink
+                            await send(msg_out)  # stamp turn_id via the shared sink
                             logger.debug(
                                 "Sent interim transcription for session %s: %s",
                                 session_id, text[:50],
@@ -1112,7 +1200,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     segment_index=seg_idx,
                                     language=language,
                                 )
-                                await _emit(final_msg)  # stamp turn_id via the shared sink
+                                await send(final_msg)  # stamp turn_id via the shared sink
                                 logger.debug(
                                     "Sent silence-triggered final for session %s: %s",
                                     session_id, text[:50],
@@ -1122,7 +1210,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 else:
                     # Whisper path: VAD-gated finals, stamped via the shared sink.
                     if pipeline.feed(data):
-                        await _send_transcription(pipeline, loop, _emit, session_id)
+                        await _send_transcription(pipeline, loop, send, session_id)
 
             elif msg.get("text") is not None:
                 try:

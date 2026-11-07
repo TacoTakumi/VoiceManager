@@ -32,6 +32,7 @@ asyncio.to_thread() (same pattern as qwen_stt.py).
 """
 import asyncio
 import logging
+import uuid
 
 import numpy as np
 
@@ -46,6 +47,18 @@ def _pcm_to_float32(pcm_bytes: bytes) -> np.ndarray:
     Duplicated for module self-containment (same pattern as qwen_stt.py).
     """
     return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _new_stream_id(previous: int) -> int:
+    """A new random 32-bit stream id, never the one it replaces.
+
+    Drawn the way the WS handler draws a connection's first one, so ids stay unique
+    across live connections with the same odds.
+    """
+    while True:
+        stream_id = uuid.uuid4().int & 0xFFFFFFFF
+        if stream_id != previous:
+            return stream_id
 
 
 class NemotronSTTPipeline:
@@ -218,6 +231,45 @@ class NemotronSTTPipeline:
         """
         self._last_partial = ""
         logger.debug("NemotronSTTPipeline reset for stream %d", self._stream_id)
+
+    async def discard_utterance(self) -> None:
+        """Drop the open utterance and go on in a fresh NeMo stream, emitting nothing.
+
+        For the client stopping listening: the audio fed so far must not reach any
+        later text. reset() is not enough for that, because NeMo keeps the running
+        hypothesis of the open utterance in the stream's own state, and the sub-chunk
+        PCM tail in the feed buffer would be decoded with the next audio. So the
+        buffered PCM is dropped, the old stream is ended the way finalize() frees it
+        (one is_last frame, whose text is thrown away), and a new stream with a new
+        stream_id takes its place.
+
+        Off-loop, like feed() and finalize(): the is_last frame is a model step.
+        segment_index only moves forward: past an utterance whose partial the client
+        may have seen, so the next utterance gets a new index.
+        """
+        await asyncio.to_thread(self._discard_utterance_sync)
+
+    def _discard_utterance_sync(self) -> None:
+        old_stream = self._stream_id
+        self._buf.clear()
+        # finalize()'s stream end: an is_last frame (a silence chunk, the buffer being
+        # empty) frees the bufferer slot and deletes the state. Nothing streamed yet
+        # sends no frame, and the delete below frees the state made by init_state.
+        self._finalize_sync()
+        try:
+            self._pipeline.delete_state(old_stream)
+        except Exception:
+            logger.debug("delete_state failed for stream %d (already gone)", old_stream)
+        if self._last_partial:
+            self._segment_index += 1
+        self._last_partial = ""
+        self._pending_finals.clear()
+        self._stream_id = _new_stream_id(old_stream)
+        self._first_chunk_sent = False
+        self._closed = False
+        self._state = self._pipeline.init_state(self._stream_id, self._make_options())
+        logger.debug("NemotronSTTPipeline discarded the open utterance: stream %d -> %d",
+                     old_stream, self._stream_id)
 
     def dispose(self) -> None:
         """Release the stream's state on disconnect.
