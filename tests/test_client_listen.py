@@ -13,14 +13,17 @@ a listening session sends nothing and closing on a gone connection raises nothin
 a session that never calls them is unchanged.
 """
 import asyncio
+import io
 import json
 import logging
+import wave
 from unittest.mock import AsyncMock
 
 import pytest
 import websockets
 
 from voicemanager.client import VoiceManagerClient, VoiceManagerError
+from voicemanager.transport.websocket import ListenState
 from voicemanager.protocol import (
     ListenStartMessage,
     ListenStoppedMessage,
@@ -456,3 +459,80 @@ def test_closing_a_stopped_session_on_a_gone_connection_raises_nothing(gone, mon
         return session.listening, session.closed, client._duplex
     assert asyncio.run(run()) == (True, True, None)
     assert connects == []  # closing does not reconnect; the next send does
+
+
+# --- a WAV container on the first frame ------------------------------------------------
+
+def _wav(pcm: bytes) -> bytes:
+    """A 16 kHz mono 16-bit WAV container holding ``pcm``."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _server_count(frames: list[bytes]) -> int:
+    """The mic_sample the server's own counter gives for these accepted frames."""
+    state = ListenState()
+    for frame in frames:
+        state.accept(frame)
+    return state.mic_samples
+
+
+def test_send_audio_skips_a_wav_header_on_the_first_frame_like_the_server(caplog):
+    first = _wav(CHUNK)
+    ws = _FakeServerWS({"listen_stop": lambda: [_stopped(_server_count([first, CHUNK]))]})
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            await session.send_audio(first)
+            await session.send_audio(CHUNK)
+            assert session.mic_sample == 320
+            count = await session.listen_stop()
+            ws.end()
+            return count
+    with caplog.at_level(logging.WARNING, logger="voicemanager.client"):
+        assert asyncio.run(run()) == 320
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_wav_header_on_a_later_frame_is_counted_like_the_server():
+    # The server skips a header only on the first frame, so the client does too.
+    frames = [CHUNK, _wav(CHUNK)]
+    client = _client()
+
+    async def run():
+        async with client.duplex() as session:
+            for frame in frames:
+                await session.send_audio(frame)
+            return session.mic_sample
+    assert asyncio.run(run()) == _server_count(frames) == 160 + len(frames[1]) // 2
+
+
+@pytest.mark.parametrize("method", ["stream_stt", "stream_stt_live"])
+def test_stream_stt_skips_a_wav_header_on_the_first_frame_like_the_server(method):
+    frames = [_wav(CHUNK), CHUNK]
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def chunks():
+        for frame in frames:
+            yield frame
+        ws.end()
+
+    async def run():
+        _start_reader(client)
+        stream = getattr(client, method)(chunks())
+        if method == "stream_stt":
+            await asyncio.wait_for(stream, 2.0)
+        else:
+            async def drain():
+                return [frame async for frame in stream]
+            await asyncio.wait_for(drain(), 2.0)
+    asyncio.run(run())
+    assert client._mic_bytes // 2 == _server_count(frames) == 320

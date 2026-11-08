@@ -202,6 +202,21 @@ def test_enable_turn_engine_refuses_after_audio_was_sent():
     assert all(isinstance(f, bytes) for f in _sent(client))
 
 
+def test_enable_turn_engine_refuses_after_a_header_only_wav_frame():
+    # A first frame that is only a WAV header holds no samples, but the server still
+    # counts it as the first audio frame, so the opt-in is barred all the same.
+    header = b"RIFF" + b"\x00" * 4 + b"WAVE" + b"fmt " + (16).to_bytes(4, "little") + b"\x00" * 16
+    client = _client()
+
+    async def run():
+        async with client.duplex() as session:
+            await session.send_audio(header)
+            assert session.mic_sample == 0
+            with pytest.raises(VoiceManagerError, match="first audio frame"):
+                await session.enable_turn_engine("tyger")
+    asyncio.run(run())
+
+
 def test_enable_turn_engine_refuses_a_second_opt_in():
     ws = _FakeServerWS({"turn_engine": [_ready()]})
     client = _client(ws)
@@ -420,6 +435,7 @@ def test_a_reconnect_resets_the_opt_in_and_the_mic_count(monkeypatch):
     client = _client()
     client.turn_engine = "tyger"
     client._mic_bytes = 640
+    client._mic_frames = 2
     real_sleep = asyncio.sleep
 
     async def _no_wait(_delay):
@@ -438,3 +454,4 @@ def test_a_reconnect_resets_the_opt_in_and_the_mic_count(monkeypatch):
     asyncio.run(run())
     assert client.turn_engine is None
     assert client._mic_bytes == 0
+    assert client._mic_frames == 0

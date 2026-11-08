@@ -43,6 +43,25 @@ _TURN_ENGINE_REFUSALS = ("invalid_request", "turn_engine_unavailable",
 _TURN_ENGINE_LOST = "turn_engine_lost"
 
 
+def _wav_payload_offset(data: bytes) -> int | None:
+    """Where the PCM starts in a WAV container, or None when data is not one.
+
+    The offset is past the 'data' chunk header; a container with no 'data' chunk
+    in this frame holds no samples (the whole frame is header). It matches the
+    server's rule, so the client counts the mic samples the server counts.
+    """
+    if not (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"):
+        return None
+    pos = 12
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        if chunk_id == b"data":
+            return pos + 8
+        pos += 8 + size + (size & 1)
+    return len(data)
+
+
 def _check_chunking(chunking: str | None) -> None:
     """Refuse an unknown chunking mode before a request opens.
 
@@ -251,7 +270,7 @@ class DuplexSession:
         if self._client._listen_stopped:
             return
         await self._client._send_or_raise(pcm, STTError)
-        self._client._mic_bytes += len(pcm)
+        self._client._count_mic(pcm)
 
     @property
     def listening(self) -> bool:
@@ -351,7 +370,7 @@ class DuplexSession:
         client = self._client
         if self.closed:
             raise VoiceManagerError("the duplex session is closed")
-        if client._mic_bytes:
+        if client._mic_frames:
             raise VoiceManagerError(
                 "enable_turn_engine must come before the first audio frame")
         if client._turn_engine_sent is not None:
@@ -506,9 +525,11 @@ class VoiceManagerClient:
         self._turn_engine_sent: str | None = None
         self._turn_engine_waiter: asyncio.Future | None = None
         self.turn_engine: str | None = None
-        # Bytes of mic audio sent on this connection. Half of it is the mic_sample
-        # a playback frame reports, and any of it bars a later opt-in.
+        # Bytes of mic audio sent on this connection, past a WAV header on the
+        # first frame. Half of it is the mic_sample a playback frame reports.
         self._mic_bytes: int = 0
+        # Binary mic frames sent on this connection; any of them bars a later opt-in.
+        self._mic_frames: int = 0
         # Listening boundary state for this connection: whether a DuplexSession
         # stopped listening (send_audio then drops its frames), how many listen_stop
         # frames were sent and how many listen_stopped answers came in. The server
@@ -652,6 +673,7 @@ class VoiceManagerClient:
         self._turn_engine_sent = None
         self.turn_engine = None
         self._mic_bytes = 0
+        self._mic_frames = 0
         self._listen_stopped = False
         self._listen_stops_sent = 0
         self._listen_acks_seen = 0
@@ -808,6 +830,19 @@ class VoiceManagerClient:
             await self._reconnect()
             raise error("Connection lost during duplex session")
 
+    def _count_mic(self, data: bytes) -> None:
+        """Count one sent binary mic frame the way the server counts it.
+
+        The server skips a WAV header on the connection's first frame, so the
+        client does too, or mic_sample would be off by the header.
+        """
+        if self._mic_frames == 0:
+            offset = _wav_payload_offset(data)
+            if offset is not None:
+                data = data[offset:]
+        self._mic_frames += 1
+        self._mic_bytes += len(data)
+
     # ------------------------------------------------------------------
     # STT methods
     # ------------------------------------------------------------------
@@ -850,7 +885,7 @@ class VoiceManagerClient:
         try:
             async for chunk in audio_chunks:
                 await self._ws.send(chunk)
-                self._mic_bytes += len(chunk)
+                self._count_mic(chunk)
                 # Drain any transcriptions that arrived while sending
                 while not self._stt_queue.empty():
                     item = self._stt_queue.get_nowait()
@@ -914,7 +949,7 @@ class VoiceManagerClient:
                 try:
                     chunk = await send_iter.__anext__()
                     await self._ws.send(chunk)
-                    self._mic_bytes += len(chunk)
+                    self._count_mic(chunk)
                 except StopAsyncIteration:
                     send_done = True
                 except websockets.exceptions.ConnectionClosed:

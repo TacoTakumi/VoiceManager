@@ -11,6 +11,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A WebSocket text frame that is valid JSON but not an object (an array, a number,
   a string, `true` or `null`) is now dropped with a warning in the log, like
   invalid JSON. Before, it closed the session with `server_error` and code 1011.
+- `client.py` counts mic samples the way the server does: a WAV header on the
+  connection's first frame is not counted. Before, `mic_sample` on playback frames
+  was off by the header, and `listen_stop` logged a false count-mismatch warning,
+  for a client that sent a WAV container first.
 
 ## [0.8.1]
 
