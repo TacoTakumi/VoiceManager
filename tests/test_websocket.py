@@ -98,3 +98,20 @@ def test_ws_accepts_wav_header(client):
         ws.receive_json()  # consume handshake
         ws.send_bytes(wav_header)
         # Should not raise — connection stays open
+
+
+@pytest.mark.parametrize("frame", ["[1, 2]", "42", "null", '"tts"', "true"])
+def test_ws_drops_non_object_json_frame(client, frame):
+    """A JSON frame that is not an object is dropped and the session stays open.
+
+    Before the fix, dispatch called .get("type") on it, which raised and closed the
+    session with server_error 1011. The odd-byte audio frame after it proves the
+    session still answers.
+    """
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        ws.receive_json()  # consume handshake
+        ws.send_text(frame)
+        ws.send_bytes(b"\x01\x02\x03")
+        error = ws.receive_json()
+        assert error["type"] == "error"
+        assert error["error_type"] == "invalid_audio_format"

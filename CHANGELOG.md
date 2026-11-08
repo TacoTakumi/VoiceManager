@@ -4,6 +4,14 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2]
+
+### Fixed
+
+- A WebSocket text frame that is valid JSON but not an object (an array, a number,
+  a string, `true` or `null`) is now dropped with a warning in the log, like
+  invalid JSON. Before, it closed the session with `server_error` and code 1011.
+
 ## [0.8.1]
 
 ### Fixed

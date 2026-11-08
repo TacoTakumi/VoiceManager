@@ -1234,6 +1234,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 except json.JSONDecodeError:
                     logger.warning("Invalid JSON from session %s", session_id)
                     continue
+                if not isinstance(parsed, dict):
+                    # A JSON array or scalar has no type field to dispatch on. Drop it
+                    # like invalid JSON, so it cannot close the session as a server error.
+                    logger.warning("Non-object JSON frame from session %s", session_id)
+                    continue
 
                 msg_type = parsed.get("type")
 
