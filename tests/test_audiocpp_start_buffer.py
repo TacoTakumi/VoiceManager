@@ -78,7 +78,8 @@ class _WS:
 
 def _pipe(engine: _Engine, events: list, **kwargs) -> AudioCppTTSStreamPipeline:
     pipe = AudioCppTTSStreamPipeline(TTSPipeline(engine=engine, executor=None),
-                                     clause_continue=False, **{**_NO_TIMER, **kwargs})
+                                     clause_continue=False, clause_end_mark="",
+                                     **{**_NO_TIMER, **kwargs})
     original = pipe._report_audio
 
     def spy(request_id: str, n_samples: int, sample_rate: int) -> None:

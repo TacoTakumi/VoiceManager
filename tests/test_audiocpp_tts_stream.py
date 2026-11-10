@@ -451,7 +451,8 @@ def test_clause_token_stream_reaches_the_engine_with_the_clients_spacing() -> No
             with ThreadPoolExecutor(max_workers=1) as executor:
                 pipeline = TTSPipeline(engine=engine, executor=executor)
                 stream = AudioCppTTSStreamPipeline(
-                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0)
+                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0,
+                    clause_end_mark="")
                 for token in TOKENS:
                     await stream.feed_text(chunk=token, done=False, websocket=ws,
                                            request_id="c1", chunking="clause")
@@ -486,7 +487,7 @@ def test_clause_pieces_merged_while_busy_get_no_inserted_space() -> None:
                 pipeline = TTSPipeline(engine=engine, executor=executor)
                 stream = AudioCppTTSStreamPipeline(
                     tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0,
-                    clause_first_deadline_ms=50)
+                    clause_first_deadline_ms=50, clause_end_mark="")
 
                 async def feed(chunk: str, done: bool = False) -> None:
                     await stream.feed_text(chunk=chunk, done=done, websocket=ws,
@@ -538,7 +539,8 @@ def test_clause_pieces_merged_across_a_whitespace_only_flush_keep_the_space() ->
             with ThreadPoolExecutor(max_workers=1) as executor:
                 pipeline = TTSPipeline(engine=engine, executor=executor)
                 stream = AudioCppTTSStreamPipeline(
-                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0)
+                    tts_pipeline=pipeline, clause_continue=False, start_buffer_ms=0,
+                    clause_end_mark="")
 
                 async def feed(chunk: str, done: bool = False, flush: bool = False) -> None:
                     await stream.feed_text(chunk=chunk, done=done, websocket=ws,

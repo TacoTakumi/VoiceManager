@@ -130,7 +130,7 @@ def _engine(fake: FakeTtsSidecar, refs: Path) -> AudioCppTTSEngine:
 
 
 def _pipe(engine: AudioCppTTSEngine, **kwargs) -> AudioCppTTSStreamPipeline:
-    kwargs = {**_NO_TIMER, "clause_continue": True, **kwargs}
+    kwargs = {**_NO_TIMER, "clause_continue": True, "clause_end_mark": "", **kwargs}
     return AudioCppTTSStreamPipeline(TTSPipeline(engine=engine, executor=None), **kwargs)
 
 

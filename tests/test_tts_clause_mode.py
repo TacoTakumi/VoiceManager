@@ -100,6 +100,10 @@ class _Clock:
 
 
 def _pipe(engine, cls=TTSStreamPipeline, **kwargs):
+    if cls is AudioCppTTSStreamPipeline:
+        # These tests compare the engine text with the pieces; the audiocpp end
+        # mark for a piece that ends on a word has its own test file.
+        kwargs.setdefault("clause_end_mark", "")
     return cls(TTSPipeline(engine=engine, executor=None), **kwargs)
 
 

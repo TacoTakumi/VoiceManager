@@ -925,11 +925,15 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     instead of the preset: the preset clip plus the previous piece's own audio
     tail, and the preset transcript plus that piece's text. The first piece,
     sentence requests and the setting-off case send the preset as before.
+
+    A clause engine request whose text ends on a letter or digit gets
+    `clause_end_mark` added, because the engine can cut the last word of a
+    text that ends with no mark. Sentence requests are sent as they are.
     """
 
     def __init__(self, *args, coalesce_ms: int = 0, clause_continue: bool | None = None,
                  clause_tail_ms: int | None = None, start_buffer_ms: int | None = None,
-                 **kwargs) -> None:
+                 clause_end_mark: str | None = None, **kwargs) -> None:
         """Same surface as the base pipeline plus the coalescing window.
 
         `coalesce_ms` defaults to 0 - the drain-what-is-already-queued behavior
@@ -939,11 +943,13 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         `clause_continue` and `clause_tail_ms` default to the settings
         (VM_AUDIOCPP_TTS_CLAUSE_CONTINUE, VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS) when
         not given, so the websocket layer need not know about them.
-        `start_buffer_ms` likewise defaults to VM_AUDIOCPP_TTS_START_BUFFER_MS.
+        `start_buffer_ms` likewise defaults to VM_AUDIOCPP_TTS_START_BUFFER_MS,
+        and `clause_end_mark` to VM_AUDIOCPP_TTS_CLAUSE_END_MARK.
         """
         super().__init__(*args, **kwargs)
         self._coalesce_ms = max(0, int(coalesce_ms))
-        if clause_continue is None or clause_tail_ms is None or start_buffer_ms is None:
+        if (clause_continue is None or clause_tail_ms is None or start_buffer_ms is None
+                or clause_end_mark is None):
             settings = get_settings()
             if clause_continue is None:
                 clause_continue = settings.audiocpp_tts_clause_continue
@@ -951,9 +957,12 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 clause_tail_ms = settings.audiocpp_tts_clause_tail_ms
             if start_buffer_ms is None:
                 start_buffer_ms = settings.audiocpp_tts_start_buffer_ms
+            if clause_end_mark is None:
+                clause_end_mark = settings.audiocpp_tts_clause_end_mark
         self._clause_continue = bool(clause_continue)
         self._clause_tail_ms = max(1, int(clause_tail_ms))
         self._start_buffer_ms = max(0, int(start_buffer_ms))
+        self._clause_end_mark = clause_end_mark.strip()
 
     @property
     def clause_continue(self) -> bool:
@@ -969,6 +978,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     def start_buffer_ms(self) -> int:
         """How much audio each engine request holds before its first send."""
         return self._start_buffer_ms
+
+    @property
+    def clause_end_mark(self) -> str:
+        """The mark added to a clause engine request that ends without one."""
+        return self._clause_end_mark
 
     async def _write_clause_reference(self, state: "_ClauseReference", loop,
                                       sample_rate: int) -> str:
@@ -1092,6 +1106,13 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                     text = " ".join(p.strip() for p in parts if p and p.strip())
                 if not text:
                     continue
+                if clause and self._clause_end_mark and text[-1].isalnum():
+                    # A piece often ends in the middle of a sentence, and the
+                    # engine can cut or weaken the last word of a text that ends
+                    # on a letter or digit. The mark gives that word its full
+                    # length. A text that ends with any other character (a mark,
+                    # a quote, a bracket) is sent as it is.
+                    text += self._clause_end_mark
 
                 if not self._audio_started:
                     # The rate in audio_start is

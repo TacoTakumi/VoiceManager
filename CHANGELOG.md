@@ -4,6 +4,23 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3]
+
+### Fixed
+
+- Clause-mode `tts_stream` on the audiocpp engine: the last word of a piece that
+  ends in the middle of a sentence ("...cuts the richness of a") could be cut or
+  weak, because Breeze does not finish a text that ends with no mark. The engine
+  request of such a piece now gets an end mark. On 71 real pieces the audio of 7
+  ended with no decay without a mark, and of none with a comma.
+
+### Added
+
+- Setting `VM_AUDIOCPP_TTS_CLAUSE_END_MARK` (`,`). The mark is added to the text
+  of a clause-mode engine request that ends on a letter or digit. A text that
+  ends with any other character is sent as it is. Empty turns it off. The
+  `Clause TTS engine request` log line shows the text with the mark.
+
 ## [0.8.2]
 
 ### Fixed

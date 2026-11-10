@@ -293,6 +293,11 @@ class Settings(BaseSettings):
     # arrive at about real-time speed, so a client that plays on arrival runs
     # dry between them; later frames run ahead of playback. 0 sends on arrival.
     audiocpp_tts_start_buffer_ms: int = Field(default=250, ge=0)  # VM_AUDIOCPP_TTS_START_BUFFER_MS
+    # End mark for a chunking="clause" engine request whose text ends on a letter
+    # or digit. A clause piece often ends in the middle of a sentence, and Breeze
+    # can cut or weaken the last word of a text that ends with no mark. Empty
+    # sends every text as it is.
+    audiocpp_tts_clause_end_mark: str = Field(default=",")   # VM_AUDIOCPP_TTS_CLAUSE_END_MARK
 
     # VoXtream TTS sidecar (only used when VM_TTS_ENGINE=voxtream). VoXtream reads
     # streamed text at the speaking rate, so one generation speaks a whole tts_stream
