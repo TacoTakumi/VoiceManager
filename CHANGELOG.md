@@ -6,8 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.8.4]
 
+### Fixed
+
+- Turn engine: a short answer spoken over a playing reply ("yes", "do it
+  again") sometimes got no STT text. Then no `turn_end` came for it, and the
+  words were lost until the user spoke again. The streaming decoder got the
+  barge audio with nothing usable in front of it: the onset pre-roll was from
+  before the reply, and a client with an echo canceller sends digital silence
+  while the reply plays. At a barge the server now drops that pre-roll and feeds
+  the decoder a lead-in of low white noise (about -61 dBFS), then the mic audio
+  from the barge onset. No frame and no field changes, and the client gets no
+  part of the noise. The STT language has an effect too: set
+  `VM_AUDIOCPP_REQUEST_OPTIONS=language=en-US` (or the code of your language)
+  when all users of the server speak one language. On 8 captured barges of one
+  session (one speaker, one browser microphone), replayed through the STT
+  sidecar, 7 of 8 got the correct text with `language=en-US` and 5 of 8 with
+  auto-detect when 200 ms of digital silence came first (close to the behaviour
+  before), and 8 of 8 and 7 of 8 with the 600 ms noise lead-in.
+
 ### Added
 
+- Setting `VM_TYGER_BARGE_LEAD_MS` (600). The length in ms of the noise lead-in
+  that the STT decoder gets in front of a barge's audio. 0 turns the lead-in
+  off.
 - Setting `VM_LOG_LEVEL` (`INFO`): `DEBUG`, `INFO`, `WARNING` or `ERROR`. It sets
   the level of the `voicemanager` loggers and of the Tyger sidecar's log. `DEBUG`
   adds the per-frame and per-event lines (playback frames, turn engine events,

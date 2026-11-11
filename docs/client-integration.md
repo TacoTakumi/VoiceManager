@@ -354,6 +354,12 @@ registry defaults inside the sidecar; operators can override or extend them with
 `VM_AUDIOCPP_SESSION_OPTIONS` / `VM_AUDIOCPP_REQUEST_OPTIONS` (comma-separated
 KEY=VALUE lists, forwarded opaquely).
 
+The STT language is one such request option. The Nemotron model detects the
+language by default (`language=auto`). `VM_AUDIOCPP_REQUEST_OPTIONS=language=en-US`
+fixes it, and other languages use their own code (`da-DK`, for example). Set it
+when all users of the server speak one language: on auto-detect the model gives
+no text, or text in another language, for some short answers.
+
 Check `client.stt_engine == "audiocpp"` on the handshake to branch behaviour.
 The handshake does not reveal WHICH model_task the server is configured with, so
 render defensively: treat `segment_index` as an upsert key and replace the
@@ -1094,6 +1100,7 @@ While a reply plays, the mic picks up the speaker, and the STT would transcribe 
 - The `playback` `start` releases the audio before its `mic_sample` to the STT, in order.
 - From the `start` to the `stop`'s `mic_sample` plus `VM_TYGER_HOLD_TAIL_MS` (default 150 ms, for room echo), the audio is dropped: the STT does not hear the echo of the reply. A barge can still come for that audio after the `stop` arrives, so the server holds it until the turn engine has scored the mic audio up to that point, or up to the end of the last hop it sent with the reply in it, whichever is later (a `stop` that comes late leaves hops already sent with the reply past the cut), and drops it then if no barge came. If the turn engine is slow, it waits until the mic stream is `VM_TYGER_START_WAIT_MS` past the `stop` plus the tail at most. Mic audio after that point waits behind it, so the STT gets it a little later (about one hop, 320 ms, plus the turn engine's scoring time).
 - After a `barge`, the held audio goes to the STT from the user's onset (`onset_mic_sample`, at most 4 s before the barge's `mic_sample`), so **the user's speech from the onset is transcribed**, and the audio after it goes on to the STT.
+- In front of that audio the server feeds the STT decoder a lead-in: `VM_TYGER_BARGE_LEAD_MS` (default 600 ms) of low white noise, then the audio from the onset with nothing between. Without a lead-in the decoder gave no text for some short answers spoken over a reply ("yes", "do it again"), and then no `turn_end` came for them. The lead-in changes nothing for the client: there is no new frame and no new field, and the noise is not in any audio the client gets. `0` turns it off.
 - With no `start` within `VM_TYGER_START_WAIT_MS` after the reply's `audio_end`, the held audio goes to the STT as if the reply never played. A reply that sent no PCM holds nothing.
 
 What a client sees: no transcription of the reply's echo; transcripts of audio held during a reply arrive late, when the hold lets the audio go; and speech during a reply that the turn engine does not take as a barge (a short "mm-hm") is dropped with the echo. A client that never sends `playback` frames makes the STT wait for each reply plus the start wait, so always report playback on an opted-in connection.
@@ -1607,6 +1614,7 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_TYGER_PREFILTER` | `off` | Experimental. `voxlock` filters the mic to the user's voice for the turn engine while a reply plays, for barge-in on speakers. See [Barge-in on speakers](#barge-in-on-speakers-the-experimental-pre-filter). |
 | `VM_TYGER_HOLD_TAIL_MS` | `150` | Turn engine: mic audio up to a `playback` `stop` plus this many ms stays out of the STT. |
 | `VM_TYGER_START_WAIT_MS` | `2000` | Turn engine: with no `playback` `start` this many ms after a reply's `audio_end`, the held mic audio goes to the STT as if the reply never played. After a `stop`, it is also the most mic audio past the stop plus the hold tail that the server waits for the turn engine's scoring before it drops the reply's echo. |
+| `VM_TYGER_BARGE_LEAD_MS` | `600` | Turn engine: at a barge the STT decoder first gets this many ms of low white noise (about -61 dBFS), then the mic audio from the barge onset. Without it the decoder gives no text for some short answers spoken over a reply. The client gets no part of the noise. `0` is off. See [The mic hold](#the-mic-hold). |
 | `VM_TYGER_BARGE_CAPTURE_DIR` | (empty) | Debug. A directory: each barge the server acts on writes the mic audio around it there, as a WAV and a JSON note, to measure what the STT got after the barge. The files hold the user's voice. Empty is off. |
 | `VM_TYGER_SILENCE_FALLBACK_MS` | `1200` | Turn engine: this many ms of silence after speech end the turn with `by: "silence"` when the model has not ended it. |
 

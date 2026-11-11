@@ -218,3 +218,50 @@ def test_the_calibrated_gate_settings_are_documented(name):
     newest = _release_section("0.8.0")
     assert name in newest
 
+
+
+# --- the barge lead-in and the STT language ----------------------------------------------
+
+LEAD_SETTING = "VM_TYGER_BARGE_LEAD_MS"
+LANGUAGE_OPTION = "language=en-US"
+
+
+def _newest_release_section() -> str:
+    """The first '## [' section of the CHANGELOG: the release in preparation."""
+    return "## [" + re.split(r"^## \[", CHANGELOG, flags=re.M)[1]
+
+
+def test_the_guide_has_the_barge_lead_in_in_its_settings_table():
+    row = re.search(rf"^\| `{LEAD_SETTING}` \| `600` \|", section(GUIDE, "## Configuration"),
+                    re.M)
+    assert row, f"no settings table row for {LEAD_SETTING} with its default"
+
+
+def test_the_guide_says_what_the_stt_gets_after_a_barge():
+    hold = section(turn_engine_section(), "### The mic hold")
+    assert LEAD_SETTING in hold and "lead-in" in hold
+
+
+def test_the_readme_names_the_lead_in_and_the_stt_language():
+    tyger = section(README, "### Tyger")
+    assert LEAD_SETTING in tyger
+    assert f"VM_AUDIOCPP_REQUEST_OPTIONS={LANGUAGE_OPTION}" in tyger
+    # The measurement names its sample, and the operator's own way to measure.
+    assert "8 captured barges" in tyger
+    assert "VM_TYGER_BARGE_CAPTURE_DIR" in tyger
+    assert "scripts/barge_capture_replay.py" in tyger
+
+
+def test_env_example_shows_the_stt_language_as_a_commented_example():
+    lines = ENV_EXAMPLE.splitlines()
+    assert f"# VM_AUDIOCPP_REQUEST_OPTIONS={LANGUAGE_OPTION}" in lines
+    # The template's default line stays, and no line sets the option.
+    assert "# VM_AUDIOCPP_REQUEST_OPTIONS=" in lines
+    assert not [ln for ln in lines if ln.startswith("VM_AUDIOCPP_REQUEST_OPTIONS")]
+    assert f"# {LEAD_SETTING}=600" in lines
+
+
+def test_the_newest_changelog_section_records_the_lead_in():
+    newest = _newest_release_section()
+    assert LEAD_SETTING in newest
+    assert LANGUAGE_OPTION in newest
