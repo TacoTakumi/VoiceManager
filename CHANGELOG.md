@@ -37,6 +37,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [`barge_state`](docs/client-integration.md#barge_state---bargestatemessage).
 - Python client: `DuplexSession.barge_state` holds the last state and
   `DuplexSession.barge_states()` yields the `barge_state` frames.
+- `turn_empty` frame, for a turn-engine client. When a turn ended and the STT gave
+  no words, the server sent nothing, so a client that waited for an answer could
+  not tell the user. The server now sends
+  `{"type": "turn_empty", "mic_sample": N, "by": "model" | "silence", "speech": true | false}`
+  in place of `turn_end`. `speech` is `true` when the STT's speech detector heard
+  a speech start in the turn (the user spoke and no words came) and `false` when
+  the turn engine alone ended a turn, as on a noise. A client that does not know
+  the frame can ignore it. See
+  [`turn_empty`](docs/client-integration.md#turn_empty---turnemptymessage).
+- Python client: `DuplexSession.turn_empties()` yields the `turn_empty` frames.
 - `scripts/wake_probe.py` runs WAV files through the server's wake spotter with
   the real model, to try a phrase or a threshold with no server running.
 

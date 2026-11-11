@@ -228,6 +228,11 @@ class DuplexSession:
     gone and the session goes on as one that never opted in. A reconnect starts a
     new connection that has not opted in, with ``mic_sample`` back at 0.
 
+    Empty turns: when a turn ends and the STT gave no words, the server sends a
+    turn_empty frame in place of turn_end, and ``turn_empties()`` yields it. Its
+    ``speech`` is True when the user spoke and no words came, so a session that
+    waits for an answer can ask again.
+
     Barge state: a server that runs the pre-filter for speakers sends no barge until
     it has learned the user's voice. ``barge_state`` is then ``"learning"`` and later
     ``"ready"``, and ``barge_states()`` yields each barge_state frame. On a server
@@ -620,6 +625,11 @@ class DuplexSession:
         while (frame := await self._client._turn_end_queue.get()) is not None:
             yield frame
 
+    async def turn_empties(self) -> AsyncIterator[dict]:
+        """Yield every turn_empty frame as it arrives (opted-in connections only)."""
+        while (frame := await self._client._turn_empty_queue.get()) is not None:
+            yield frame
+
     @property
     def barge_state(self) -> str | None:
         """``"learning"`` or ``"ready"`` from the server's last barge_state frame, or
@@ -677,6 +687,8 @@ class VoiceManagerClient:
         self._turn_queue: asyncio.Queue = asyncio.Queue()
         # turn_end frames, for a connection that opted in to a turn engine.
         self._turn_end_queue: asyncio.Queue = asyncio.Queue()
+        # turn_empty frames: a turn that ended with no words.
+        self._turn_empty_queue: asyncio.Queue = asyncio.Queue()
         # barge_state frames, from a server that runs the pre-filter, and the state
         # of the last one (None until one comes, and again after turn_engine_lost).
         self._barge_state_queue: asyncio.Queue = asyncio.Queue()
@@ -822,7 +834,7 @@ class VoiceManagerClient:
 
         # Drain all queues - put sentinel None to unblock any waiters
         for q in (self._stt_queue, self._tts_queue, self._error_queue, self._turn_queue,
-                  self._turn_end_queue, self._barge_state_queue):
+                  self._turn_end_queue, self._turn_empty_queue, self._barge_state_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -845,6 +857,7 @@ class VoiceManagerClient:
         self._error_queue = asyncio.Queue()
         self._turn_queue = asyncio.Queue()
         self._turn_end_queue = asyncio.Queue()
+        self._turn_empty_queue = asyncio.Queue()
         self._barge_state_queue = asyncio.Queue()
         self.barge_state = None
         self._wake_queue = asyncio.Queue()
@@ -921,6 +934,8 @@ class VoiceManagerClient:
                         await self._tts_queue.put(frame)
                     elif ftype == "turn_engine_ready":
                         self._on_turn_engine_ready(frame)
+                    elif ftype == "turn_empty":
+                        await self._turn_empty_queue.put(frame)
                     elif ftype == "barge_state":
                         self.barge_state = frame.get("state")
                         await self._barge_state_queue.put(frame)
@@ -985,6 +1000,7 @@ class VoiceManagerClient:
             await self._tts_queue.put(None)
             await self._turn_queue.put(None)
             await self._turn_end_queue.put(None)
+            await self._turn_empty_queue.put(None)
             await self._barge_state_queue.put(None)
             await self._error_queue.put(None)
 

@@ -34,6 +34,8 @@ class MessageType(str, enum.Enum):
     # Sent only to an opted-in session on a server that runs the pre-filter:
     # whether barge-in works yet.
     barge_state = "barge_state"
+    # Sent only to an opted-in session: a turn ended and the STT gave no words.
+    turn_empty = "turn_empty"
     # Listening-boundary frames: a client that stops sending mic audio sends
     # listen_stop and the server acks with listen_stopped; listen_start resumes
     # listening on the same connection and gets no ack. A client that never sends
@@ -285,6 +287,21 @@ class TurnEndMessage(BaseModel):
     text: str
     mic_sample: int
     by: Literal["model", "silence"]
+
+
+class TurnEmptyMessage(BaseModel):
+    """Server report that a turn ended with no words, for an opted-in session.
+
+    Sent in place of turn_end when no final with text went out since the previous
+    turn_end or turn_empty. ``mic_sample`` and ``by`` are as in turn_end. ``speech``
+    is True when the STT's speech detector found a speech start in that time: the
+    user spoke and the decoder gave no words. It is False when the turn engine alone
+    ended a turn, as on a noise.
+    """
+    type: Literal["turn_empty"] = "turn_empty"
+    mic_sample: int
+    by: Literal["model", "silence"]
+    speech: bool
 
 
 # --- listening boundary ----------------------------------------------------------

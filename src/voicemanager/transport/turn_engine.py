@@ -203,7 +203,11 @@ the connection sends (``note_final``, called by the handler's transcription sink
 the frame is out), and ``send_turn_end`` sends {"type": "turn_end", "turn_id", "text",
 "mic_sample", "by"}: text is those finals since the previous turn_end, each stripped,
 empty ones skipped, joined with one space, and turn_id is the turn the last of them
-carries. With no final text since the previous turn_end, no frame goes out.
+carries. With no final text since the previous turn end, a turn_empty frame goes out
+in its place: {"type": "turn_empty", "mic_sample", "by", "speech"}. ``speech`` says
+whether the STT's speech detector found a speech start since the previous turn end
+(``note_speech``, called by the handler): True means the user spoke and the decoder
+gave no words, False that the turn engine alone ended a turn, as on a noise.
 
 The event comes in on the reader task, concurrent with the handler. The handler owns
 the STT pipeline, so it passes ``end_turn``: a callback that FLUSHes the open
@@ -360,7 +364,7 @@ from websockets.protocol import State
 
 from voicemanager.pipeline.tyger import wire
 from voicemanager.protocol import (
-    BargeMessage, BargeStateMessage, ErrorMessage, PlaybackMessage, TurnEndMessage, TurnEngineMessage,
+    BargeMessage, BargeStateMessage, ErrorMessage, PlaybackMessage, TurnEmptyMessage, TurnEndMessage, TurnEngineMessage,
     TurnEngineReadyMessage,
     INVALID_REQUEST, TURN_ENGINES, TURN_ENGINE_LOST, TURN_ENGINE_UNAVAILABLE,
     TURN_ENGINE_UNSUPPORTED,
@@ -1167,6 +1171,7 @@ class TurnEngineSession:
         self._release_held = release_held
         self._start_wait_s = start_wait_ms / 1000.0
         self._finals: list[tuple[str, int]] = []  # (text, turn_id) since the last turn_end
+        self._speech = False  # the STT found a speech start since the last turn end
         self.engine: str | None = None
         # The pre-filter's state: the last one the sidecar reported, and whether the
         # client may get it yet (only after its turn_engine_ready).
@@ -1456,6 +1461,7 @@ class TurnEngineSession:
             handle.cancel()
         self._timers.clear()
         self._finals.clear()
+        self._speech = False
         if self.engine is None:
             # Not opted in (yet): the feed holds no mic audio, no reply and no hop,
             # and no sidecar session is open. It only records the stop, so an opt-in
@@ -1505,23 +1511,32 @@ class TurnEngineSession:
             if self._capture is not None:
                 self._capture.finals.append(text)
 
+    def note_speech(self) -> None:
+        """The STT's speech detector found a speech start on the connection's audio."""
+        if self.active:
+            self._speech = True
+
     async def send_turn_end(self, event: wire.EndpointEvent) -> bool:
         """Send the turn_end for every final since the previous one; False when none.
 
-        Nothing goes out once the sidecar is lost, nor for an event at or before a
-        listening boundary (and the finals since the boundary stay for the next)."""
+        With none, a turn_empty goes out in its place. Nothing goes out once the
+        sidecar is lost, nor for an event at or before a listening boundary (and the
+        finals since the boundary stay for the next)."""
         if self._before_boundary(event.mic_sample):
             logger.debug("Turn end from before a listening boundary, nothing sent: "
                          "session=%s mic_sample=%s", self._label, event.mic_sample)
             return False
         finals, self._finals = self._finals, []
+        speech, self._speech = self._speech, False
         if self._lost:
             logger.debug("Turn end after the turn engine was lost, nothing sent: "
                          "session=%s", self._label)
             return False
         if not finals:
-            logger.debug("Turn end with no final text, nothing sent: session=%s by=%s "
-                         "mic_sample=%s", self._label, event.by, event.mic_sample)
+            logger.info("Turn end with no final text: session=%s by=%s mic_sample=%s "
+                        "speech=%s", self._label, event.by, event.mic_sample, speech)
+            await self._send_text(TurnEmptyMessage(
+                mic_sample=event.mic_sample, by=event.by, speech=speech).model_dump_json())
             return False
         msg = TurnEndMessage(turn_id=finals[-1][1], text=" ".join(t for t, _ in finals),
                              mic_sample=event.mic_sample, by=event.by)

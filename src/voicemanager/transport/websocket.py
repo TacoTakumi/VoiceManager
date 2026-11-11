@@ -904,6 +904,9 @@ async def websocket_endpoint(websocket: WebSocket):
         # utterance). Everything else is inter-utterance audio.
         in_utterance = (was_speaking or audiocpp_endpointer.speech_active
                         or acoustic_endpoint)
+        if not was_speaking and (audiocpp_endpointer.speech_active or acoustic_endpoint):
+            # A speech start: a turn that ends with no words then says the user spoke.
+            turn_engine.note_speech()
         if audiocpp_idle_gate and not in_utterance:
             # Inter-utterance silence is NOT billed to the
             # decoder -- not fed, and (fed nothing) it cannot arm the frame-gap

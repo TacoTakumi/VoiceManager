@@ -169,9 +169,13 @@ def _app(prefilter_factory=None):
 
 def _sync(ws) -> list:
     """Send a text message that is not a control and return its answer: once it
-    is in, every message sent before it has been handled."""
+    is in, every message sent before it has been handled. A message that holds
+    only the pre-filter's barge-state lines is not the answer and is skipped."""
     ws.send_text("not a control")
-    return wire.parse_events(ws.receive_text())
+    while True:
+        events = wire.parse_events(ws.receive_text())
+        if not all(isinstance(e, wire.BargeStateEvent) for e in events):
+            return events
 
 
 def _assert_turn_dropped(engine: TurnRules, gate: float) -> None:

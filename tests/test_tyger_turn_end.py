@@ -4,7 +4,8 @@ When the turn engine reports a turn end (its endpoint head, or its silence
 fallback), the server FLUSHes the open STT utterance, if there is one, sends that
 final as today, and then sends {"type": "turn_end", "turn_id", "text",
 "mic_sample", "by"}. text joins, in order, every final sent since the previous
-turn_end. A turn end with no final text since the previous one sends nothing.
+turn_end. A turn end with no final text since the previous one sends no turn_end
+(it sends a turn_empty: see tests/test_turn_empty.py).
 Silero still ends utterances on its own, so finals keep flowing between turn ends.
 
 The STT side is a scripted stand-in for the audiocpp pipeline that commits only at
@@ -370,5 +371,7 @@ def test_the_session_joins_stripped_finals_and_skips_empty_ones(tyger):
         return sent
 
     sent = asyncio.run(scenario())
+    # The second turn end has nothing new: it gives a turn_empty, not a turn_end.
     assert sent == [{"type": "turn_end", "turn_id": 2, "text": "alpha beta",
-                     "mic_sample": 7, "by": "silence"}]
+                     "mic_sample": 7, "by": "silence"},
+                    {"type": "turn_empty", "mic_sample": 8, "by": "model", "speech": False}]

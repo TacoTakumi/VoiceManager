@@ -911,13 +911,15 @@ mint a fresh id (e.g. a new UUID) for the next reply.
 
 A turn engine is a model that listens to the user's mic and to the agent's own reply as it plays, and decides two things: when the user's turn ended, and when the user cut in over the reply (a barge). The server runs one, Tyger, as a sidecar process when the operator sets `VM_TURN_ENGINE=tyger` (see the README for the setup). It works only with the `audiocpp` STT engine.
 
-A connection uses the turn engine only after it opts in. A connection that never sends `turn_engine` gets none of the frames in this section and behaves exactly as described in the rest of this guide. Five frame types are added to `MessageType`: `turn_engine` and `playback` go from client to server, `turn_engine_ready`, `barge` and `turn_end` go from server to client. The models are in `protocol.py`.
+A connection uses the turn engine only after it opts in. A connection that never sends `turn_engine` gets none of the frames in this section and behaves exactly as described in the rest of this guide. Seven frame types are added to `MessageType`: `turn_engine` and `playback` go from client to server, `turn_engine_ready`, `barge`, `barge_state`, `turn_end` and `turn_empty` go from server to client. The models are in `protocol.py`.
 
 An opted-in connection changes in four ways:
 
 - The client reports when each reply starts and stops playing at its speaker, with `playback` frames. The server needs this to build the agent channel: the reply audio placed where it played on the client's mic stream.
 - The server sends `barge` when the user cut in over a playing reply, and ends that reply itself with `audio_end` reason `"interrupted"`. The client does not send `tts_cancel` for it.
 - The server sends `turn_end` when the user's turn ended. Finals still arrive as before, but **the turn ends on `turn_end`, not on a final** or an endpoint frame.
+- When a turn ended and the STT gave no words, the server sends `turn_empty` in place of `turn_end`. A client that waits for an answer can then tell the user that it did not catch the words.
+- On a server that runs the experimental pre-filter, the server sends `barge_state` to say when barge-in is off (`learning`) and when it works (`ready`).
 - While a reply plays, the server holds the mic audio back from the STT, so the STT does not transcribe the agent's own voice from the speaker (see [The mic hold](#the-mic-hold)).
 
 One call in outline (the server frames are on the right):
@@ -1099,7 +1101,28 @@ Server to client. The user's turn ended.
 { "type": "turn_end", "turn_id": 4, "text": "book me a flight to boston on friday", "mic_sample": 163840, "by": "model" }
 ```
 
-At a turn end the server first flushes the open utterance, so its final is sent before the `turn_end` and is part of its `text`. With no final text since the previous `turn_end`, no frame goes out. Transcription frames (interims and finals) still arrive as before, and Silero still ends utterances, so one turn can hold several finals. For an opted-in connection, act on the turn when `turn_end` arrives, not on a final or an endpoint frame. A final that arrives after a `turn_end` belongs to the next one.
+At a turn end the server first flushes the open utterance, so its final is sent before the `turn_end` and is part of its `text`. With no final text since the previous turn end, a [`turn_empty`](#turn_empty---turnemptymessage) frame goes out in its place. Transcription frames (interims and finals) still arrive as before, and Silero still ends utterances, so one turn can hold several finals. For an opted-in connection, act on the turn when `turn_end` arrives, not on a final or an endpoint frame. A final that arrives after a `turn_end` belongs to the next one.
+
+#### `turn_empty` - `TurnEmptyMessage`
+
+Server to client. A turn ended and the STT gave no words: no final with text went out since the previous `turn_end` or `turn_empty`. The server sends it in place of `turn_end`, so each turn end gives exactly one of the two frames. A client that waits for an answer can use it to tell the user that it did not catch the words.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"turn_empty"` | Frame discriminator. |
+| `mic_sample` | integer | *(required)* | Where on the client's mic stream the turn engine decided, as in `turn_end`. |
+| `by` | string | *(required)* | `"model"` or `"silence"`, as in `turn_end`. |
+| `speech` | boolean | *(required)* | `true`: the STT's speech detector found a speech start since the previous turn end, so the user spoke and the decoder gave no words. `false`: the turn engine alone ended a turn and the STT heard no speech, as on a noise, a cough or the tail of a reply's echo. |
+
+```json
+{ "type": "turn_empty", "mic_sample": 488960, "by": "silence", "speech": true }
+```
+
+Most `turn_empty` frames have `speech: false`: the turn engine ends a turn on any sound above its voice gate. Act only on `speech: true`, and only while the client waits for an answer. A short one-syllable answer ("one", "yes") is the usual case with `speech: true`: the streaming decoder sometimes gives no text for it.
+
+The words of an utterance can still come after its `turn_empty`: when the turn engine ends the turn while the speech detector still hears speech, the rest of the utterance gets its final a moment later, and that final is part of the next `turn_end`. This is rare. A client that speaks on `turn_empty` can wait about 1 s and drop the notice when a transcription frame with text comes in that time.
+
+The frame comes only on a connection that opted in. None comes after a `turn_engine_lost` error, and none for audio from before a `listen_stop`. A client must ignore keys it does not know in this frame: a later version can add one.
 
 ### Turn engine errors
 
@@ -1135,7 +1158,7 @@ What a client sees: no transcription of the reply's echo; transcripts of audio h
 If the turn engine's sidecar exits or the server loses its link to it, each opted-in connection gets **one** `error` frame with `error_type` `"turn_engine_lost"`, and from then on it is a plain connection, as if it never opted in:
 
 - The held mic audio goes to the STT in order, and later audio goes straight to it.
-- No more `barge` or `turn_end` frames. Finals and endpoint frames end turns, as for any connection.
+- No more `barge`, `barge_state`, `turn_end` or `turn_empty` frames. Finals and endpoint frames end turns, as for any connection.
 - `playback` frames are dropped with no answer.
 - TTS replies go on as before.
 
@@ -1167,7 +1190,7 @@ client -> binary mic PCM ...
 - While stopped, binary mic frames are dropped with no error. They are not counted, not checked as the first audio frame, and not sent to the STT or the turn engine.
 - Both frames are idempotent. A second `listen_stop` while stopped answers again with the same `mic_sample`; a `listen_start` while listening does nothing.
 - Neither frame ever sends an `error` frame, and extra fields are ignored. An unknown frame type still gets no answer, as before.
-- `mic_sample` keeps counting across a stop and a start: it is not reset. So the `mic_sample` values of `playback`, `barge` and `turn_end` frames stay on the connection's count. A client that counts the samples it sent counts only the audio it really sent, not the time it was stopped.
+- `mic_sample` keeps counting across a stop and a start: it is not reset. So the `mic_sample` values of `playback`, `barge`, `turn_end` and `turn_empty` frames stay on the connection's count. A client that counts the samples it sent counts only the audio it really sent, not the time it was stopped.
 - A `listen_stop` may come before the first audio frame of the connection (it then answers `mic_sample` 0). A `turn_engine` opt-in after it, sent before the first audio frame, still succeeds.
 
 ### What the server does at `listen_stop`
@@ -1176,7 +1199,7 @@ On a `listen_stop` that stops a listening connection, the server cuts the transc
 
 - Every transcription frame (partial or final) from audio before the stop that has not been sent yet is dropped.
 - The STT engine's open utterance is discarded, so it does not go on into the first utterance after `listen_start`. On the `audiocpp` engine the answer can wait for one tail decode of the open utterance: the server reads that decode and discards it.
-- On a connection that opted in to the turn engine, the pending finals are dropped, so the next `turn_end` holds only text from audio after `listen_start`. The partial hop of mic audio is dropped, the mic hold drops what it keeps, and every turn-engine event at or before the boundary is ignored: no `turn_end` and no `barge` goes out for audio before the stop.
+- On a connection that opted in to the turn engine, the pending finals are dropped, so the next `turn_end` holds only text from audio after `listen_start`. The partial hop of mic audio is dropped, the mic hold drops what it keeps, and every turn-engine event at or before the boundary is ignored: no `turn_end`, no `turn_empty` and no `barge` goes out for audio before the stop.
 
 The server keeps the rest of the connection's state. The turn engine's voice gate calibration and the VoxLock enrollment of the [experimental pre-filter](#barge-in-on-speakers-the-experimental-pre-filter) are kept, so the user does not calibrate or speak the 3 s voice sample again. The turn engine opt-in and the `turn_id` counter are kept too.
 
@@ -1283,8 +1306,8 @@ types; the **Default** column is the value a field takes when the sender omits
 it, and *(required)* marks a field with no default. Binary frames carry no JSON
 envelope - see [Binary frames](#binary-frames) at the end of this section.
 
-The turn-engine frames (`turn_engine`, `turn_engine_ready`, `playback`, `barge`
-and `turn_end`) are documented with their fields and examples in
+The turn-engine frames (`turn_engine`, `turn_engine_ready`, `playback`, `barge`,
+`barge_state`, `turn_end` and `turn_empty`) are documented with their fields and examples in
 [Turn engine frames](#turn-engine-frames).
 
 The listen frames (`listen_stop`, `listen_start` and `listen_stopped`) are listed
@@ -1603,6 +1626,9 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `DuplexSession.playback_start` | `(request, mic_sample=None)` | `None` | Send `playback` `start` for a `TTSRequest` or `request_id`; `mic_sample` defaults to `mic_sample` now. |
 | `DuplexSession.playback_stop` | `(request, mic_sample=None, *, reply_sample)` | `None` | Send `playback` `stop`, with `reply_sample` in samples of the reply at its `audio_start` rate. |
 | `DuplexSession.turn_ends` | `()` | `AsyncIterator[dict]` | Yield each `turn_end` frame of an opted-in connection. |
+| `DuplexSession.turn_empties` | `()` | `AsyncIterator[dict]` | Yield each `turn_empty` frame of an opted-in connection: a turn that ended with no words. Its `speech` is `True` when the user spoke and the STT gave no text. |
+| `DuplexSession.barge_state` | property | `str \| None` | `"learning"` or `"ready"` from the server's last `barge_state` frame. `None` when the server sent none (no pre-filter, or no turn engine) and after `turn_engine_lost`. |
+| `DuplexSession.barge_states` | `()` | `AsyncIterator[dict]` | Yield each `barge_state` frame, from a server that runs the pre-filter. |
 | `DuplexSession.listen_stop` | `(timeout=5.0)` | `int \| None` | Stop listening: the session stops first, so `send_audio` drops frames from then on, then it sends `listen_stop` and returns the `mic_sample` of `listen_stopped`. Logs a warning when that count differs from `mic_sample`. Returns `None`, still stopped, when no answer comes within `timeout` (a server older than 0.8.0) or the connection closes. Sends the frame again when already stopped. |
 | `DuplexSession.listen_start` | `()` | `None` | Send `listen_start` and listen again; returns at once (the server sends no answer). Sends the frame again when already listening. |
 | `DuplexSession.listening` | property | `bool` | `False` between a `listen_stop` and the next `listen_start`. While stopped, `send_audio` sends and counts nothing, so `mic_sample` keeps matching the server's count. A reconnect starts listening, and so does `close()`. |
