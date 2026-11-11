@@ -612,3 +612,258 @@ def test_the_default_is_600_ms_and_a_negative_length_is_refused():
     assert cfg.Settings(_env_file=None).tyger_barge_lead_ms == 600
     with pytest.raises(ValidationError, match="tyger_barge_lead_ms"):
         cfg.Settings(_env_file=None, tyger_barge_lead_ms=-1)
+
+
+# --- an utterance still open at the barge --------------------------------------------
+#
+# The reply can start while an utterance is still open: the mic hold keeps the audio
+# under the reply from the VAD, so the VAD never hears the silence that ends the
+# utterance, and with no VAD the audio fed before the reply waits for its flush. A
+# barge is an utterance boundary for the STT: the open utterance is flushed first, and
+# the lead-in and the barge's audio start a new one.
+
+class _WordedSTT(_RecordingSTT):
+    """A recording decoder that has a text for every utterance it got audio for, and
+    moves to the next segment at a reset, as the real pipeline does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.segment = 0
+        #: The segment each feed went to, in the order of ``feeds``.
+        self.feed_segments: list[int] = []
+        self._heard = False
+
+    async def feed(self, data: bytes) -> bool:
+        self.events.append(("feed", bytes(data)))
+        self.feed_segments.append(self.segment)
+        self._heard = True
+        return True
+
+    def get_current_text(self):
+        return (f"partial {self.segment}" if self._heard else "", "en", self.segment)
+
+    async def finalize(self):
+        self.events.append(("finalize",))
+        return (f"final {self.segment}" if self._heard else "", "en", self.segment)
+
+    def reset(self) -> None:
+        self.segment += 1
+        self._heard = False
+
+
+@pytest.fixture
+def worded(made, monkeypatch) -> list:
+    """The worded STT pipelines the connections made, in place of the plain ones."""
+    pipelines: list[_WordedSTT] = []
+
+    def factory(config=None, **kwargs):
+        pipelines.append(_WordedSTT())
+        return pipelines[-1]
+
+    monkeypatch.setattr(audiocpp_stt, "AudioCppSTTPipeline", factory)
+    return pipelines
+
+
+@pytest.fixture
+def endpointers(monkeypatch) -> list:
+    """Every acoustic endpointer the connections built, in order."""
+    from voicemanager.pipeline import AcousticEndpointer
+
+    built: list = []
+
+    class Counted(AcousticEndpointer):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr("voicemanager.transport.websocket.AcousticEndpointer", Counted)
+    return built
+
+
+#: Where the reply of these tests starts to play, and the onset of the barge over it.
+REPLY_AT = 3000
+ONSET = 10000
+
+
+def _speech_then_barge_speech() -> bytes:
+    """A mic stream that is loud up to the reply, quiet under it, and loud again from
+    the barge onset on. The two loud parts are different ramps."""
+    stream = _QUIET.copy()
+    stream[:REPLY_AT] = (np.arange(REPLY_AT) % 20000) + 1000
+    stream[ONSET:] = (np.arange(len(stream) - ONSET) % 20000) + 9000
+    return stream.tobytes()
+
+
+def _barge_over_open_utterance(ws, tyger, dispatched, mic: _Mic, stt) -> list:
+    """Mic audio up to REPLY_AT reaches the STT, a reply plays from there, and a barge
+    with its onset at ONSET comes while the mic is at 18048. The frames the server
+    sent up to the end of the barge.
+
+    No barrier before the barge: its turn_start resets the decoder on this engine. The
+    audio the playback start lets go shows that the start was handled.
+    """
+    mic.send(2048)
+    speak(ws, "r1")
+    mic.send(16000)                          # to 18048
+    ws.send_json(_start("r1", REPLY_AT))
+    assert tyger.wait_for(lambda: stt.fed == mic.stream[:2 * REPLY_AT], timeout=5), \
+        len(stt.fed)
+    return _events(ws, tyger, dispatched,
+                   wire.BargeEvent(onset_mic_sample=ONSET, mic_sample=15360))
+
+
+def _transcriptions(frames: list) -> list[dict]:
+    return [f for f in frames if isinstance(f, dict) and f.get("type") == "transcription"]
+
+
+def test_an_open_utterance_is_flushed_before_the_lead_in_under_the_idle_gate(
+        tyger, gated_client, worded, endpointers, dispatched, env):
+    # 30 s: no frame-gap flush of its own. The VAD's silence window is as long, but the
+    # VAD hears no silence at all here: the hold keeps the quiet audio under the reply.
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    stream = _speech_then_barge_speech()
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = worded[0]
+        frames = _barge_over_open_utterance(ws, tyger, dispatched, _Mic(ws, stream), stt)
+
+        # The decoder: the old utterance, its flush, the lead-in, the barge's audio.
+        events = stt.events
+        assert events.count(("finalize",)) == 1
+        flush = events.index(("finalize",))
+        assert all(e[0] == "feed" for e in events[:flush] + events[flush + 1:])
+        assert b"".join(e[1] for e in events[:flush]) == stream[:2 * REPLY_AT]
+        assert _is_lead_in(events[flush + 1][1])
+        assert b"".join(e[1] for e in events[flush + 2:]) == stream[2 * ONSET:2 * 18048]
+        assert sum(_is_lead_in(f) for f in stt.feeds) == 1
+        # The flush reset the decoder: the lead-in and the barge's audio are in the
+        # next segment, the old audio is not.
+        assert stt.feed_segments == [0] * flush + [1] * (len(events) - flush - 1)
+        # The VAD started fresh for the barge's audio, on a new endpointer.
+        assert len(endpointers) == 2
+
+        # The client: the old utterance's final, on its own segment, before any frame
+        # of the barge's utterance.
+        sent = _transcriptions(frames)
+        finals = [f for f in sent if f["is_final"]]
+        assert [(f["text"], f["segment_index"]) for f in finals] == [("final 0", 0)]
+        at = sent.index(finals[0])
+        assert all(f["segment_index"] == 0 for f in sent[:at])
+        assert sent[at + 1:] and all(f["segment_index"] == 1 for f in sent[at + 1:])
+
+
+def test_an_open_utterance_is_flushed_before_the_lead_in_with_no_vad(
+        tyger, client, made, endpointers, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = made[0]
+        _barge_over_open_utterance(ws, tyger, dispatched, _Mic(ws), stt)
+        events = stt.events
+        assert events.count(("finalize",)) == 1
+        flush = events.index(("finalize",))
+        assert all(e[0] == "feed" for e in events[:flush] + events[flush + 1:])
+        assert b"".join(e[1] for e in events[:flush]) == _s(0, REPLY_AT)
+        assert _is_lead_in(events[flush + 1][1])
+        assert b"".join(e[1] for e in events[flush + 2:]) == _s(ONSET, 18048)
+        assert len(endpointers) == 1         # with no VAD there is nothing to start fresh
+
+
+def test_with_no_open_utterance_a_barge_flushes_nothing(
+        tyger, gated_client, made, endpointers, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(12000)             # quiet up to the barge: no utterance yet
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        _play_and_barge(ws, tyger, dispatched, _Mic(ws, stream))
+        stt = made[0]
+        assert ("finalize",) not in stt.events
+        assert _is_lead_in(stt.feeds[0])
+        assert stt.fed[600 * MS:] == stream[2 * 10000:2 * 18048]
+        assert len(endpointers) == 1
+
+
+def test_with_the_lead_in_off_an_open_utterance_is_not_flushed_under_the_idle_gate(
+        tyger, gated_client, made, endpointers, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=0, VM_AUDIOCPP_SILENCE_MS=30000)
+    stream = _speech_then_barge_speech()
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = made[0]
+        _barge_over_open_utterance(ws, tyger, dispatched, _Mic(ws, stream), stt)
+        # As before: the barge's audio goes on in the utterance the VAD is still in.
+        assert ("finalize",) not in stt.events
+        assert stt.fed == stream[:2 * REPLY_AT] + stream[2 * ONSET:2 * 18048]
+        assert len(endpointers) == 1
+
+
+def test_with_the_lead_in_off_an_open_utterance_is_not_flushed_with_no_vad(
+        tyger, client, made, endpointers, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=0, VM_AUDIOCPP_SILENCE_MS=30000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = made[0]
+        _barge_over_open_utterance(ws, tyger, dispatched, _Mic(ws), stt)
+        assert ("finalize",) not in stt.events
+        assert stt.fed == _s(0, REPLY_AT) + _s(ONSET, 18048)
+        assert len(endpointers) == 1
+
+
+@pytest.fixture
+def playbacks(monkeypatch) -> list:
+    """Every playback frame the server has finished handling, in order."""
+    done = []
+    original = te.TurnEngineSession.handle_playback
+
+    async def recording(self, frame):
+        try:
+            await original(self, frame)
+        finally:
+            done.append(frame)
+    monkeypatch.setattr(te.TurnEngineSession, "handle_playback", recording)
+    return done
+
+
+def test_a_flushed_open_utterance_the_vad_is_still_in_gets_no_second_flush(
+        tyger, gated_client, worded, endpointers, dispatched, playbacks, env):
+    # The usual order: the turn end flushes the utterance, the reply starts, and the
+    # hold keeps the VAD from the silence. At the barge the VAD is inside speech and
+    # the decoder has nothing un-flushed: an empty flush would only skip a segment.
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    stream = _speech_then_barge_speech()
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = worded[0]
+        mic = _Mic(ws, stream)
+        mic.send(2048)                       # speech: the VAD is inside an utterance
+        assert tyger.wait_for(lambda: stt.fed == stream[:2 * 2048], timeout=5)
+        # The turn end flushes it. No barrier from here to the barge: its turn_start
+        # would reset the decoder and move the segment.
+        tyger.send(0, wire.EndpointEvent(by="model", mic_sample=2048))
+        assert tyger.wait_for(lambda: len(dispatched) == 1, timeout=5), dispatched
+        assert stt.events.count(("finalize",)) == 1
+        left = stt.segment                   # the segment the turn end left
+        assert left == 1
+        # The reply plays from the sample its hold began at, so the start lets no
+        # audio go: the VAD hears nothing more and the decoder gets nothing.
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 2048))
+        assert tyger.wait_for(lambda: len(playbacks) == 1, timeout=5), playbacks
+        assert stt.fed == stream[:2 * 2048]
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=ONSET, mic_sample=15360))
+        assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+
+        events = stt.events
+        assert events.count(("finalize",)) == 1          # the turn end's; none at the barge
+        flush = events.index(("finalize",))
+        assert all(e[0] == "feed" for e in events[:flush] + events[flush + 1:])
+        assert b"".join(e[1] for e in events[:flush]) == stream[:2 * 2048]
+        assert _is_lead_in(events[flush + 1][1])
+        assert b"".join(e[1] for e in events[flush + 2:]) == stream[2 * ONSET:2 * 18048]
+        # No segment was skipped: the lead-in and the barge's audio are in the segment
+        # the turn end left.
+        assert stt.feed_segments == [0] * flush + [left] * (len(events) - flush - 1)
+        # The VAD started fresh for the barge's audio, on a new endpointer.
+        assert len(endpointers) == 2

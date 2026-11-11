@@ -661,6 +661,18 @@ async def websocket_endpoint(websocket: WebSocket):
     async def _begin_barge_utterance(send) -> None:
         """Give the decoder the noise lead-in in front of a barge's audio.
 
+        The barge is an utterance boundary for the STT. Two things can be left open
+        from before the reply, alone or together:
+
+        * audio the decoder got and has not flushed. It is flushed first, as the
+          acoustic end does, so its final goes out on its own segment before any frame
+          of the barge's audio. With nothing un-flushed there is no flush: an empty
+          one would only use up a segment index.
+        * a VAD still inside an utterance: the mic hold kept the audio under the reply
+          from it, so it never heard the silence that ends the utterance (a turn end
+          may have flushed the decoder meanwhile). It would report no speech start
+          for the barge, so the endpointer is built again.
+
         With no idle gate every frame goes straight to the decoder, so the lead-in is
         fed now and the barge's audio follows it. Under the idle gate the decoder gets
         nothing until the VAD reports the speech start, so the lead-in is only armed
@@ -672,10 +684,21 @@ async def websocket_endpoint(websocket: WebSocket):
         The turn engine runs on the audiocpp engine only, so the audiocpp state read
         here always exists.
         """
-        nonlocal audiocpp_last_audio, audiocpp_barge_lead
+        nonlocal audiocpp_last_audio, audiocpp_barge_lead, audiocpp_endpointer
         lead = barge_lead_in(settings.tyger_barge_lead_ms)
         if not lead:
             return
+        if audiocpp_last_audio is not None:
+            # Un-flushed audio from before the reply. Without this the lead-in would
+            # land in the middle of the old utterance, and the barge's words would
+            # join its segment.
+            await _finalize_audiocpp_utterance(pipeline, send, session_id=session_id)
+            audiocpp_last_audio = None
+        if audiocpp_endpointer.speech_active:
+            # Only a VAD can be inside speech, with or without un-flushed audio. A
+            # fresh one hears the barge's audio as a new utterance, so its speech
+            # start feeds the lead-in armed below.
+            audiocpp_endpointer = _new_audiocpp_endpointer()
         if audiocpp_idle_gate:
             # Nothing is fed, so there is no open utterance for the gap flush yet.
             audiocpp_preroll.clear()

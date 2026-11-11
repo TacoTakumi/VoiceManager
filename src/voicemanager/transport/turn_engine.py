@@ -279,10 +279,17 @@ speech with no lead-in gives no text for some short answers ("yes", "do it again
 So a barge the session acts on raises a one-shot mark, in the same step that ends
 the hold at the onset. The handler reads it with ``take_barge_onset`` under the STT
 lock, right before it takes held audio, so whichever taker gets the barge audio
-first (a mic frame, the barge's own release, a turn end) sees the mark with it and
-feeds the decoder ``barge_lead_in`` first: white noise at ``BARGE_LEAD_DBFS``, for
-VM_TYGER_BARGE_LEAD_MS. A listening boundary and the loss of the sidecar clear the
-mark.
+first (a mic frame, the barge's own release, a turn end) sees the mark with it. A
+listening boundary and the loss of the sidecar clear the mark.
+
+The barge is an utterance boundary for the STT. Audio from before the reply that
+the decoder has not flushed is flushed first, so its final goes out on its own
+segment, and a VAD still inside an utterance starts fresh. Then the decoder gets
+``barge_lead_in``: white noise at ``BARGE_LEAD_DBFS``, for VM_TYGER_BARGE_LEAD_MS.
+With no VAD it is fed at once, in front of the barge audio. Under the idle gate the
+decoder gets nothing before the speech onset: the stale pre-roll is dropped and the
+lead-in waits for the onset, where it is fed in front of the audio gated since the
+barge.
 
 The barge capture
 -----------------
