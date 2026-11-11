@@ -35,6 +35,15 @@ websocket_router = APIRouter()
 # Seconds before the session inactivity close that the timeout_warning frame is sent.
 WARNING_LEAD = 30
 
+# The most audio the idle gate's pre-roll keeps while a barge lead-in waits for the
+# speech onset. The usual onset pre-roll is short (VM_AUDIOCPP_ONSET_PREROLL_MS), as
+# it only covers the attack the VAD needs to confirm. After a barge the gated audio
+# is the mic stream from the barge onset on, and the VAD may report the start well
+# after it (soft first words, the reply's echo), so the short cap would cut the
+# front of the user's words. Still a cap: a barge with no speech after it must not
+# grow the pre-roll without limit.
+BARGE_PREROLL_MS = 2000
+
 
 def _cap(limit: float | None, cap: float) -> float:
     """The receive-wait timeout under ``cap``; ``limit`` None means no deadline yet."""
@@ -452,6 +461,9 @@ async def websocket_endpoint(websocket: WebSocket):
         audiocpp_idle_gate = settings.audiocpp_idle_gate and audiocpp_endpointer.armed
         audiocpp_preroll_max = max(0, settings.audiocpp_onset_preroll_ms) * 32  # bytes
         audiocpp_preroll = bytearray()
+        # The barge lead-in the next speech onset feeds ahead of the pre-roll; empty
+        # when none is armed. Only the idle gate arms it (see _begin_barge_utterance).
+        audiocpp_barge_lead = b""
     else:
         # Whisper path: existing behavior
         # Use getattr for safe access - app.state attributes absent when TestClient skips lifespan
@@ -642,10 +654,27 @@ async def websocket_endpoint(websocket: WebSocket):
         return turn_engine.take_stt_audio()
 
     async def _begin_barge_utterance(send) -> None:
-        """Feed the decoder the noise lead-in in front of a barge's audio."""
-        nonlocal audiocpp_last_audio
+        """Give the decoder the noise lead-in in front of a barge's audio.
+
+        With no idle gate every frame goes straight to the decoder, so the lead-in is
+        fed now and the barge's audio follows it. Under the idle gate the decoder gets
+        nothing until the VAD reports the speech start, so the lead-in is only armed
+        here: the onset in _audiocpp_stt_frame feeds it, then the audio gated since
+        the barge. The pre-roll kept up to now is from before the reply and is
+        dropped, so only the barge's audio follows the lead-in. With the lead-in off
+        (VM_TYGER_BARGE_LEAD_MS=0) nothing is touched.
+
+        The turn engine runs on the audiocpp engine only, so the audiocpp state read
+        here always exists.
+        """
+        nonlocal audiocpp_last_audio, audiocpp_barge_lead
         lead = barge_lead_in(settings.tyger_barge_lead_ms)
         if not lead:
+            return
+        if audiocpp_idle_gate:
+            # Nothing is fed, so there is no open utterance for the gap flush yet.
+            audiocpp_preroll.clear()
+            audiocpp_barge_lead = lead
             return
         await pipeline.feed(lead)
         audiocpp_last_audio = time.monotonic()
@@ -809,9 +838,10 @@ async def websocket_endpoint(websocket: WebSocket):
         The silero endpointer, the idle gate and its onset pre-roll, the pipeline feed,
         and the finals it volunteers or the acoustic endpoint flushes. The handler runs
         each received frame through here; an opted-in session's held audio comes
-        through here too when the hold lets it go.
+        through here too when the hold lets it go. A barge lead-in armed under the idle
+        gate is fed at the speech onset, ahead of the pre-roll.
         """
-        nonlocal audiocpp_last_audio
+        nonlocal audiocpp_last_audio, audiocpp_barge_lead
         was_speaking = audiocpp_endpointer.speech_active
         acoustic_endpoint = await asyncio.to_thread(audiocpp_endpointer.feed, data)
         # In-utterance = inside silero's start..end span before or after this
@@ -825,14 +855,26 @@ async def websocket_endpoint(websocket: WebSocket):
             # trigger either, so no empty inter-utterance flush ever consumes a
             # segment index. Keep the tail in the rolling onset pre-roll.
             audiocpp_preroll.extend(data)
-            if len(audiocpp_preroll) > audiocpp_preroll_max:
-                del audiocpp_preroll[:len(audiocpp_preroll) - audiocpp_preroll_max]
+            preroll_max = audiocpp_preroll_max
+            if audiocpp_barge_lead:
+                # The gated audio is a barge's, from its onset on: keep much more of
+                # it than the onset pre-roll, or the front of the words is cut.
+                preroll_max = max(preroll_max, BARGE_PREROLL_MS * 32)
+            if len(audiocpp_preroll) > preroll_max:
+                del audiocpp_preroll[:len(audiocpp_preroll) - preroll_max]
             return
-        if audiocpp_idle_gate and not was_speaking and audiocpp_preroll:
-            # Speech onset: replay the gated tail ahead of this frame so the
-            # attack silero took a chunk to confirm is not clipped.
-            await pipeline.feed(bytes(audiocpp_preroll))
-            audiocpp_preroll.clear()
+        if audiocpp_idle_gate and not was_speaking:
+            if audiocpp_barge_lead:
+                # Speech onset after a barge: the noise lead-in goes first, as a chunk
+                # of its own. The pre-roll behind it holds only audio from the barge
+                # onset on, so nothing comes between the lead-in and the user's words.
+                await pipeline.feed(audiocpp_barge_lead)
+                audiocpp_barge_lead = b""
+            if audiocpp_preroll:
+                # Speech onset: replay the gated tail ahead of this frame so the
+                # attack silero took a chunk to confirm is not clipped.
+                await pipeline.feed(bytes(audiocpp_preroll))
+                audiocpp_preroll.clear()
         # Feed the chunk off-loop and mark the utterance un-flushed.
         has_update = await pipeline.feed(data)
         audiocpp_last_audio = time.monotonic()

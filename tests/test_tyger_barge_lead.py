@@ -27,6 +27,7 @@ from voicemanager.pipeline import audiocpp_stt
 from voicemanager.pipeline.tyger import wire
 from voicemanager.transport import turn_engine as te
 
+from test_audiocpp_idle_gate import FakeVadModel
 from tyger_fake_sidecar import FakeTygerSidecar
 from tyger_ws_kit import (
     FakeTTSEngine, StandInSidecar, barrier, errors, make_app, opt_in, speak,
@@ -46,10 +47,12 @@ def _s(a: int, b: int) -> bytes:
 
 
 class _Mic:
-    """Sends the client's mic stream in FRAME-sample frames and counts what went."""
+    """Sends a mic stream (the client's ramp, if no other is given) in FRAME-sample
+    frames and counts what went."""
 
-    def __init__(self, ws) -> None:
+    def __init__(self, ws, stream: bytes = _STREAM) -> None:
         self.ws = ws
+        self.stream = stream
         self.at = 0
         self.frames: list[bytes] = []
 
@@ -57,7 +60,7 @@ class _Mic:
         end = self.at + n
         while self.at < end:
             step = min(FRAME, end - self.at)
-            data = _s(self.at, self.at + step)
+            data = self.stream[2 * self.at:2 * (self.at + step)]
             self.ws.send_bytes(data)
             self.frames.append(data)
             self.at += step
@@ -254,6 +257,129 @@ def test_zero_turns_the_lead_in_off(tyger, client, made, dispatched, env):
         mic = _Mic(ws)
         _play_and_barge(ws, tyger, dispatched, mic)
         assert made[0].fed == _s(0, 3000) + _s(10000, 18048)
+
+
+# --- the idle gate armed: the lead-in waits for the speech onset ---------------------
+#
+# With a VAD the decoder gets nothing outside an utterance: quiet frames go to a
+# rolling pre-roll, and the speech onset feeds the pre-roll and then the frame. So a
+# barge only arms the lead-in. The onset feeds it, then the audio kept since the barge.
+
+#: The onset pre-roll of these tests, the default: 200 ms.
+PREROLL = 200 * MS
+#: The most audio the pre-roll keeps while a lead-in is armed: 2 s.
+BARGE_PREROLL = 2000 * MS
+#: Quiet mic audio: the scripted VAD reads |x| <= 327 as no speech. Random, so any
+#: slice shows where it came from.
+_QUIET = np.random.default_rng(7).integers(-90, 91, 6 * 16000).astype("<i2")
+
+
+def _speech_from(sample: int) -> bytes:
+    """A mic stream that is quiet up to ``sample`` and a loud ramp from there on."""
+    stream = _QUIET.copy()
+    stream[sample:] = (np.arange(len(stream) - sample) % 30000) + 1000
+    return stream.tobytes()
+
+
+def _is_lead_in(chunk: bytes, ms: int = 600) -> bool:
+    return len(chunk) == ms * MS and -62.5 <= _level_dbfs(chunk) <= -59.5
+
+
+@pytest.fixture
+def gated_client(tyger, executor, made, env):
+    """The client of an app whose idle gate is armed by the scripted VAD."""
+    env(VM_AUDIOCPP_IDLE_GATE=1, VM_AUDIOCPP_ONSET_PREROLL_MS=200,
+        VM_AUDIOCPP_VAD_THRESHOLD=0.5, VM_AUDIOCPP_SILENCE_MS=800)
+    app = make_app(sidecar=StandInSidecar(tyger.url), executor=executor,
+                   tts_engine=FakeTTSEngine(_chunks()))
+    app.state.audiocpp_config = {"vad_model_factory": FakeVadModel}
+    return contextlib.nullcontext(TestClient(app))
+
+
+def test_under_the_idle_gate_the_lead_in_is_fed_at_the_speech_onset(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(12000)             # the words start 125 ms after the onset
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        _play_and_barge(ws, tyger, dispatched, mic)
+        stt = made[0]
+        # Quiet audio is gated, so the lead-in is the first thing the decoder gets.
+        lead = stt.feeds[0]
+        assert len(lead) == 600 * MS == 19200
+        assert -62.5 <= _level_dbfs(lead) <= -59.5
+        # Then the audio from the barge onset on: the frames before the VAD's start
+        # (one chunk, the pre-roll kept since the barge), then the frame of the start.
+        assert stt.feeds[1] == stream[2 * 10000:2 * 11264]
+        assert stt.fed == lead + stream[2 * 10000:2 * 18048]
+        # Nothing from before the reply played (the mic up to sample 3000), which the
+        # pre-roll held when the barge came.
+        assert all(stream[2 * a:2 * (a + 32)] not in stt.fed
+                   for a in range(0, 3000 - 32, 16))
+        assert sum(_is_lead_in(f) for f in stt.feeds) == 1
+
+        mic.send(2048)                       # later audio follows with no second lead-in
+        barrier(ws)
+        assert stt.fed == lead + stream[2 * 10000:2 * 20096]
+
+
+def test_zero_gives_no_lead_in_under_the_idle_gate(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=0)
+    stream = _speech_from(12000)
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        _play_and_barge(ws, tyger, dispatched, mic)
+        stt = made[0]
+        assert not any(_is_lead_in(f) for f in stt.feeds)
+        # As with no lead-in setting at all: the onset feeds the usual pre-roll, the
+        # last 200 ms the gate kept, and that still reaches back before the reply.
+        gated = stream[:2 * 3000] + stream[2 * 10000:2 * 11264]
+        assert stt.feeds[0] == gated[-PREROLL:]
+        assert stt.fed == gated[-PREROLL:] + stream[2 * 11264:2 * 18048]
+
+
+def test_the_idle_gate_keeps_the_audio_from_the_onset_past_the_usual_pre_roll(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(18000)             # the words start 500 ms after the onset
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        _play_and_barge(ws, tyger, dispatched, mic)
+        stt = made[0]
+        # The VAD has not heard the start yet (its chunk is not whole): the lead-in
+        # is armed, and the decoder has nothing.
+        assert stt.feeds == []
+
+        mic.send(2048)                       # to 20096: the start is in
+        barrier(ws)
+        assert _is_lead_in(stt.feeds[0])
+        assert len(stt.feeds[1]) > PREROLL   # more than the usual pre-roll keeps
+        assert stt.fed[600 * MS:] == stream[2 * 10000:2 * 20096]
+        assert sum(_is_lead_in(f) for f in stt.feeds) == 1
+
+
+def test_an_idle_gate_lead_in_stays_armed_while_old_quiet_audio_is_trimmed(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(50000)             # the words start 2.5 s after the onset
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        _play_and_barge(ws, tyger, dispatched, mic)
+        mic.send(34 * FRAME)                 # to 52864
+        barrier(ws)
+        stt = made[0]
+        assert _is_lead_in(stt.feeds[0])
+        # The pre-roll kept its cap of the newest audio, all of it from after the onset.
+        assert len(stt.feeds[1]) == BARGE_PREROLL
+        rest = stt.fed[600 * MS:]
+        assert len(rest) > BARGE_PREROLL
+        assert rest == stream[2 * 10000:2 * 52864][-len(rest):]
+        assert sum(_is_lead_in(f) for f in stt.feeds) == 1
 
 
 def test_two_lead_ins_are_not_the_same_noise():
