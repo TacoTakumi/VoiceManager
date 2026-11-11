@@ -302,16 +302,39 @@ class DuplexSession:
                 return
             # Dormant: the server gives the frame to its wake word spotter and
             # counts it as dormant audio, not as mic audio.
-            client._dormant_bytes += len(pcm)
-            await client._send_or_raise(pcm, STTError)
-            return
+            dormant = True
+        else:
+            dormant = False
         # The frame is counted before the send is awaited. A send can wait for room
         # in the write buffer with the frame already on the wire, and the reader
         # (a wake frame) or another task (an opt-in, a listen_stop) that runs in
-        # that wait must find the frame in the count, as the server will. A send
-        # that fails reconnects, and the new connection's counts start at 0.
-        client._count_mic(pcm)
-        await client._send_or_raise(pcm, STTError)
+        # that wait must find the frame in the count, as the server will.
+        ws = client._ws
+        if dormant:
+            client._dormant_bytes += len(pcm)
+            counted = len(pcm)
+        else:
+            before = client._mic_bytes
+            client._count_mic(pcm)
+            counted = client._mic_bytes - before
+        try:
+            await client._send_or_raise(pcm, STTError)
+        except STTError:
+            # The connection was lost: the client reconnected, and the counts of
+            # the new connection start at 0.
+            raise
+        except Exception:
+            # Nothing was sent: there is no socket while another task reconnects,
+            # or the socket refused the data. The frame comes out of the count
+            # again, unless a reconnect started the counts over in the meantime.
+            # A cancelled send is not caught here: its frame is on the wire.
+            if client._ws is ws:
+                if dormant:
+                    client._dormant_bytes -= counted
+                else:
+                    client._mic_bytes -= counted
+                    client._mic_frames -= 1
+            raise
 
     @property
     def listening(self) -> bool:

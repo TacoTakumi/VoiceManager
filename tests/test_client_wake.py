@@ -491,6 +491,109 @@ def test_a_listen_stop_sent_while_a_dormant_frames_send_waits_has_that_frame_in_
     assert asyncio.run(run()) == (0, (True, 0), [])
 
 
+# The count is taken before the send, so a frame that was never sent must come out of
+# it again. Only a closed connection is different: the client reconnects, and the new
+# connection's counts start at 0.
+
+def test_a_mic_frame_that_was_not_sent_for_want_of_a_socket_is_not_counted():
+    """While another task reconnects there is no socket. Frames that fail then must
+    not be in the new connection's count, and must not bar a turn-engine opt-in."""
+    ws = _FakeServerWS(
+        {"turn_engine": lambda sent: [{"type": "turn_engine_ready", "engine": "tyger"}]})
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            client._ws = None
+            for _ in range(3):
+                with pytest.raises(AttributeError):
+                    await session.send_audio(CHUNK)
+            counts = (session.mic_sample, client._mic_frames)
+            client._ws = ws                       # the reconnect is done
+            engine = await session.enable_turn_engine("tyger")
+            await session.send_audio(CHUNK)
+            ws.end()
+            return counts, engine, session.mic_sample
+    assert asyncio.run(run()) == ((0, 0), "tyger", 160)
+
+
+def test_a_dormant_frame_that_was_not_sent_for_want_of_a_socket_is_not_counted():
+    ws = _FakeServerWS(_accepting())
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            await session.enable_wake_word()
+            await session.send_audio(CHUNK)
+            client._ws = None
+            with pytest.raises(AttributeError):
+                await session.send_audio(CHUNK)
+            client._ws = ws
+            ws.end()
+            return client._dormant_bytes, session.mic_sample
+    assert asyncio.run(run()) == (320, 0)
+
+
+@pytest.mark.parametrize("dormant", [False, True])
+def test_a_frame_that_was_not_sent_for_another_error_is_not_counted(dormant):
+    ws = _FakeServerWS(_accepting())
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            if dormant:
+                await session.enable_wake_word()
+            await session.send_audio(CHUNK)
+            good_send = ws.send
+            ws.send = AsyncMock(side_effect=TypeError("data must be bytes"))
+            with pytest.raises(TypeError):
+                await session.send_audio(CHUNK)
+            ws.send = good_send                   # closing a dormant session sends a frame
+            ws.end()
+            return session.mic_sample, client._mic_frames, client._dormant_bytes
+    assert asyncio.run(run()) == ((0, 0, 320) if dormant else (160, 1, 0))
+
+
+def test_a_frame_not_sent_on_a_closed_connection_leaves_the_new_connections_counts_at_zero(
+        monkeypatch):
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def run():
+        monkeypatch.setattr(client, "_disconnect", AsyncMock())
+        monkeypatch.setattr(client, "_connect", AsyncMock())
+        async with client.duplex() as session:
+            await session.send_audio(CHUNK)
+            ws.send = AsyncMock(side_effect=websockets.exceptions.ConnectionClosed(None, None))
+            with pytest.raises(VoiceManagerError):
+                await session.send_audio(CHUNK)
+            return session.mic_sample, client._mic_frames
+    assert asyncio.run(run()) == (0, 0)
+
+
+def test_a_cancelled_send_keeps_its_frame_in_the_count():
+    """The frame is on the wire when the send waits, so a cancel in that wait does
+    not take it out of the count."""
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            ws.pause = asyncio.Event()
+            sending = asyncio.create_task(session.send_audio(CHUNK))
+            await _settle()
+            sending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await sending
+            ws.end()
+            return session.mic_sample
+    assert asyncio.run(run()) == 160
+
+
 def test_a_wake_frame_with_no_opt_in_is_ignored():
     ws = _FakeServerWS()
     client = _client(ws)
