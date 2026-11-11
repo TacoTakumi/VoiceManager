@@ -24,7 +24,7 @@ from voicemanager.protocol import (
 from voicemanager.session import SessionRegistry, SessionEntry
 from voicemanager.transport.endpoint_hold import EndpointHoldMachine
 from voicemanager.transport.turn_engine import (
-    TurnEngineSession, _wav_payload_offset, barge_lead_in,
+    StreamBreak, TurnEngineSession, _wav_payload_offset, barge_lead_in,
 )
 from voicemanager.transport.turns import TurnTracker
 
@@ -644,19 +644,24 @@ async def websocket_endpoint(websocket: WebSocket):
     engine_stt_tasks: set[asyncio.Task] = set()
 
     async def _feed_audiocpp_stt(chunks, send) -> None:
-        """Run each chunk through the audio.cpp STT path, in order. Hold stt_lock."""
-        for chunk in chunks:
-            await _audiocpp_stt_frame(chunk, send)
+        """Run what the mic hold gave through the audio.cpp STT path, in order. Hold
+        stt_lock.
 
-    async def _take_engine_audio(send) -> list[bytes]:
-        """The held mic audio the STT gets now, in order. Hold stt_lock.
-
-        When that audio starts at a barge onset, the decoder gets the barge lead-in
-        first: see "The barge lead-in" in the turn engine module.
+        ``chunks`` is what ``take_stt_audio`` gave: mic audio, with a StreamBreak in
+        front of each chunk that does not continue the audio before it. A barge's
+        break is where its utterance starts, so the flush and the lead-in go there,
+        behind any older audio the hold let go with it: see "The barge lead-in" in
+        the turn engine module.
         """
-        if turn_engine.take_barge_onset():
-            await _begin_barge_utterance(send)
-        return turn_engine.take_stt_audio()
+        for chunk in chunks:
+            if chunk is StreamBreak.BARGE:
+                await _begin_barge_utterance(send)
+            elif chunk is StreamBreak.GAP:
+                # A reply played here and no barge came. The decoder needs nothing
+                # at this place for now.
+                continue
+            else:
+                await _audiocpp_stt_frame(chunk, send)
 
     async def _begin_barge_utterance(send) -> None:
         """Give the decoder the noise lead-in in front of a barge's audio.
@@ -744,7 +749,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.debug("Turn end from before a listen_stop skipped: session=%s",
                                  session_id)
                     return
-                await _feed_audiocpp_stt(await _take_engine_audio(send), send)
+                await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
                 if audiocpp_last_audio is not None:
                     await _finalize_audiocpp_utterance(pipeline, send, session_id=session_id)
                     audiocpp_last_audio = None
@@ -767,7 +772,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if epoch != listen.epoch:
                     return
                 send = _fenced_sink(epoch)
-                await _feed_audiocpp_stt(await _take_engine_audio(send), send)
+                await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
         except SidecarFault as exc:
             await _engine_stt_fault(exc)
         except Exception as exc:
@@ -1284,7 +1289,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # straight on.
                     async with stt_lock:
                         if via_hold:
-                            await _feed_audiocpp_stt(await _take_engine_audio(send), send)
+                            await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
                         else:
                             await _audiocpp_stt_frame(data, send)
                 elif stt_engine_type == "qwen":

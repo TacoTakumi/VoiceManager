@@ -614,6 +614,351 @@ def test_the_default_is_600_ms_and_a_negative_length_is_refused():
         cfg.Settings(_env_file=None, tyger_barge_lead_ms=-1)
 
 
+# --- the lead-in goes where the fed audio breaks --------------------------------------
+#
+# The mic hold says where the audio it gives the STT does not continue the audio before
+# it, and the barge's flush and lead-in go at that place and nowhere else. A barge whose
+# audio continues what the STT already has (the user talked through the start of the
+# reply) is no boundary at all. Audio the hold lets go from before the played reply is
+# fed as it is, in front of the lead-in.
+
+def test_a_barge_whose_audio_continues_what_the_stt_has_gets_no_flush_and_no_lead_in(
+        tyger, client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = made[0]
+        mic = _Mic(ws)
+        mic.send(2048)
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 3000))
+        assert tyger.wait_for(lambda: stt.fed == _s(0, 3000), timeout=5), len(stt.fed)
+        # The user began 200 samples before the reply played: the hold drops nothing,
+        # so the audio from 3000 on goes on right behind the audio the STT has.
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=2800, mic_sample=15360))
+        assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+        assert ("finalize",) not in stt.events
+        assert _no_lead_in(stt)
+        assert stt.fed == _s(0, 18048)       # one stretch of speech, byte for byte
+
+        mic.send(2048)
+        barrier(ws)
+        assert stt.fed == _s(0, 20096)
+        assert _no_lead_in(stt)
+
+
+def test_under_the_idle_gate_a_barge_whose_audio_continues_stays_in_the_open_utterance(
+        tyger, gated_client, worded, endpointers, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    stream = _speech_from(0)                 # the user talks all the way through
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = worded[0]
+        mic = _Mic(ws, stream)
+        mic.send(2048)
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 3000))
+        assert tyger.wait_for(lambda: stt.fed == stream[:2 * 3000], timeout=5), \
+            len(stt.fed)
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=2800, mic_sample=15360))
+        assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+        assert ("finalize",) not in stt.events
+        assert _no_lead_in(stt)
+        assert stt.fed == stream[:2 * 18048]
+        # The barge's audio is in the segment of the audio before it, and the VAD that
+        # heard the start of the speech is the one that hears the rest.
+        assert set(stt.feed_segments) == {0}
+        assert len(endpointers) == 1
+        assert [f for f in _transcriptions(frames) if f["is_final"]] == []
+
+
+def test_audio_from_before_the_played_reply_is_fed_before_the_lead_in(
+        tyger, client, made, dispatched, env):
+    # A long start wait: the reply with no playback start holds for the whole test.
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000,
+        VM_TYGER_START_WAIT_MS=20000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = made[0]
+        mic = _Mic(ws)
+        mic.send(2048)
+        speak(ws, "r1")                      # holding from sample 2048
+        mic.send(2048)                       # to 4096
+        speak(ws, "r2")                      # a later reply, holding from 4096
+        mic.send(13952)                      # to 18048
+        ws.send_json(_start("r1", 6000))     # r1 plays; no start comes for r2
+        # The start frees the audio before 6000, but r2 still holds it from 4096 on.
+        assert tyger.wait_for(lambda: stt.fed == _s(0, 4096), timeout=5), len(stt.fed)
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=10000, mic_sample=15360))
+        assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+
+        # The barge ends both holds: the audio up to r1's start goes on behind the
+        # audio the decoder has, then the flush and the lead-in, then the barge's audio.
+        events = stt.events
+        assert events.count(("finalize",)) == 1
+        flush = events.index(("finalize",))
+        assert all(e[0] == "feed" for e in events[:flush] + events[flush + 1:])
+        assert b"".join(e[1] for e in events[:flush]) == _s(0, 6000)
+        assert _is_lead_in(events[flush + 1][1])
+        assert b"".join(e[1] for e in events[flush + 2:]) == _s(10000, 18048)
+        assert sum(_is_lead_in(f) for f in stt.feeds) == 1
+
+
+def test_the_loss_of_the_sidecar_after_a_barge_leaves_no_barge_break_behind(
+        tyger, client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000,
+        VM_TYGER_START_WAIT_MS=20000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        stt = made[0]
+        mic = _Mic(ws)
+        mic.send(2048)
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 3000))
+        assert errors(barrier(ws)) == []
+        # A barge at the very end of the mic audio in: the hold has none of its audio
+        # to give yet, so its break still waits.
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=18048, mic_sample=18048))
+        assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+        speak(ws, "r2")                      # sent after the barge: it holds from 18048
+        mic.send(2048)                       # to 20096
+        barrier(ws)
+        assert stt.fed == _s(0, 3000)
+
+        tyger.drop(0)
+        # The hold is over: what it kept goes to the STT as it is, and so does every
+        # later frame. The session goes on as one that never opted in.
+        want = len(_s(0, 3000)) + len(_s(18048, 20096))
+        assert tyger.wait_for(lambda: len(stt.fed) >= want, timeout=5), len(stt.fed)
+        mic.send(2048)
+        frames = barrier(ws)
+        assert [f["error_type"] for f in errors(frames)] == ["turn_engine_lost"]
+        assert stt.fed == _s(0, 3000) + _s(18048, 22144)
+        assert _no_lead_in(stt)
+
+
+# The hold on its own: a HopFeed and its MicHold, driven as the session drives them.
+
+GAP, BARGE = te.StreamBreak.GAP, te.StreamBreak.BARGE
+
+
+class _HoldRig:
+    """A HopFeed and its MicHold with no session around them."""
+
+    def __init__(self) -> None:
+        self.feed = te.HopFeed()
+        self.hold = te.MicHold(self.feed, tail_samples=TAIL, start_wait_samples=32000)
+
+    def mic(self, to: int) -> None:
+        """Mic frames up to sample ``to``, pushed into the hold."""
+        while self.feed.mic_samples < to:
+            at = self.feed.mic_samples
+            data = _s(at, min(at + FRAME, to))
+            self.hold.push(at, data, self.feed.feed_mic(data))
+
+    def reply(self, request_id: str) -> None:
+        """A reply of 1 s sent now: its audio_start, its PCM and its audio_end."""
+        for kind in ("audio_start", "audio_end"):
+            self.feed.on_tts_text(request_id, json.dumps(
+                {"type": kind, "request_id": request_id, "sample_rate": 16000}))
+            if kind == "audio_start":
+                self.feed.on_tts_pcm(request_id, b"\x01\x00" * 16000)
+
+    def playback(self, frame: dict) -> None:
+        assert self.feed.playback(frame) is None
+
+    def barge(self, onset: int, mic_sample: int) -> None:
+        """What the session does to the hold for a barge it acts on."""
+        feed_from = max(onset, mic_sample - te.BARGE_LOOKBACK_SAMPLES)
+        for kept in self.feed.replies():
+            if kept.seen_at <= mic_sample and kept.barge_at is None:
+                kept.barge_at = feed_from
+        self.hold.mark_barge(feed_from)
+
+    def marked(self) -> list:
+        """What ``take_marked`` gives now: its breaks, and each stretch of audio
+        between them as one piece."""
+        out: list = []
+        for item in self.hold.take_marked():
+            if isinstance(item, bytes) and out and isinstance(out[-1], bytes):
+                out[-1] += item
+            else:
+                out.append(item)
+        return out
+
+
+def _rig_with_a_reply_in_play(start: int = 3000) -> _HoldRig:
+    """The mic at 18048, r1 sent at 2048 and in play from ``start``, and the audio
+    before the start taken."""
+    rig = _HoldRig()
+    rig.mic(2048)
+    assert rig.marked() == [_s(0, 2048)]
+    rig.reply("r1")
+    rig.mic(18048)
+    rig.playback(_start("r1", start))
+    assert rig.marked() == [_s(2048, start)]
+    return rig
+
+
+def test_a_reply_that_plays_to_its_stop_gives_a_gap_break_in_front_of_the_next_audio():
+    rig = _rig_with_a_reply_in_play()
+    rig.playback(_stop("r1", 12000))
+    assert rig.marked() == [GAP, _s(12000 + TAIL, 18048)]
+    rig.mic(20096)
+    assert rig.marked() == [_s(18048, 20096)]            # no second break
+
+
+def test_a_barge_gives_a_barge_break_in_front_of_the_audio_from_its_onset():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(10000, 15360)
+    assert rig.marked() == [BARGE, _s(10000, 18048)]
+    rig.mic(20096)
+    assert rig.marked() == [_s(18048, 20096)]            # no second break
+
+
+def test_audio_let_go_in_order_gets_no_break():
+    rig = _HoldRig()
+    rig.mic(2048)
+    assert rig.marked() == [_s(0, 2048)]                 # the first audio: no break
+    rig.reply("r1")
+    rig.mic(10240)
+    assert rig.marked() == []                            # held for the start
+    rig.playback(_start("r1", 4000))
+    assert rig.marked() == [_s(2048, 4000)]              # nothing was dropped before it
+
+
+def test_a_barge_with_its_onset_before_the_playback_start_gives_no_break():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(2800, 15360)
+    assert rig.marked() == [_s(3000, 18048)]             # it continues the audio fed
+    # The barge is done with: the next place the audio breaks is a gap, not a barge.
+    rig.reply("r2")
+    rig.mic(30000)
+    rig.playback(_start("r2", 20000))
+    assert rig.marked() == [_s(18048, 20000)]
+    rig.playback(_stop("r2", 24000))
+    assert rig.marked() == [GAP, _s(24000 + TAIL, 30000)]
+
+
+def test_the_barge_break_comes_after_the_audio_from_before_the_played_reply():
+    rig = _HoldRig()
+    rig.mic(2048)
+    assert rig.marked() == [_s(0, 2048)]
+    rig.reply("r1")                          # holding from 2048
+    rig.mic(4096)
+    rig.reply("r2")                          # holding from 4096, and it gets no start
+    rig.mic(18048)
+    rig.playback(_start("r1", 6000))
+    assert rig.marked() == [_s(2048, 4096)]
+    rig.barge(10000, 15360)
+    assert rig.marked() == [_s(4096, 6000), BARGE, _s(10000, 18048)]
+
+
+def test_a_barge_over_a_reply_that_played_from_the_first_mic_sample_gets_its_break():
+    rig = _HoldRig()
+    rig.reply("r1")                          # sent before any mic audio
+    rig.mic(18048)
+    rig.playback(_start("r1", 0))
+    assert rig.marked() == []
+    rig.barge(10000, 15360)
+    # The first audio the STT gets at all, and it is the barge's.
+    assert rig.marked() == [BARGE, _s(10000, 18048)]
+
+
+def test_two_barges_with_none_of_their_audio_given_yet_give_one_barge_break():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # none of its audio is in yet
+    assert rig.marked() == []
+    rig.mic(20096)
+    rig.barge(19000, 20096)                  # a second one before any taker ran
+    # The break is in front of the first audio of the two, and there is only one.
+    assert rig.marked() == [BARGE, _s(18048, 20096)]
+    rig.mic(22144)
+    assert rig.marked() == [_s(20096, 22144)]
+
+
+def test_a_listening_boundary_leaves_no_barge_break_for_the_audio_after_it():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # none of its audio is in yet
+    assert rig.marked() == []
+    assert rig.hold.clear() == 0             # the listening boundary
+    rig.feed.listen_boundary()
+    rig.feed.listen_start()
+    rig.mic(20096)
+    # The STT starts over at the boundary, so this audio breaks from nothing.
+    assert rig.marked() == [_s(18048, 20096)]
+
+    # A barge after the boundary is marked as usual, also over a reply that plays
+    # from the boundary's own sample.
+    rig.reply("r2")
+    rig.mic(30000)
+    rig.playback(_start("r2", 20096))
+    rig.barge(26000, 28000)
+    assert rig.marked() == [BARGE, _s(26000, 30000)]
+
+
+def test_take_all_after_a_barge_leaves_no_barge_break_behind():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # none of its audio is in yet
+    assert rig.marked() == []
+    rig.reply("r2")                          # sent after the barge: it holds from 18048
+    rig.mic(20096)
+    assert rig.marked() == []
+    # The sidecar is lost: everything goes out in order, as plain audio.
+    assert rig.hold.take_all() == [_s(18048, 19072), _s(19072, 20096)]
+    rig.feed.reply("r2").start_wait_over = True          # nothing holds any more
+    rig.mic(22144)
+    assert rig.marked() == [_s(20096, 22144)]
+
+
+def test_take_gives_the_audio_of_take_marked_without_the_breaks():
+    def drive(take) -> list:
+        """One reply with a barge, one that plays to its stop; every take's result."""
+        rig = _HoldRig()
+        taken = []
+
+        def step() -> None:
+            taken.append(take(rig.hold))
+
+        rig.mic(2048)
+        step()
+        rig.reply("r1")
+        rig.mic(18048)
+        rig.playback(_start("r1", 3000))
+        step()
+        rig.barge(10000, 15360)
+        step()
+        rig.reply("r2")
+        rig.mic(30000)
+        rig.playback(_start("r2", 20000))
+        step()
+        rig.playback(_stop("r2", 24000))
+        step()
+        return taken
+
+    marked = drive(lambda hold: hold.take_marked())
+    plain = drive(lambda hold: hold.take())
+    assert [item for step in marked for item in step if not isinstance(item, bytes)] \
+        == [BARGE, GAP]
+    assert all(isinstance(item, bytes) for step in plain for item in step)
+    assert plain == [[item for item in step if isinstance(item, bytes)] for step in marked]
+
+
+def test_take_moves_the_break_marks_as_take_marked_does():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(10000, 15360)
+    assert b"".join(rig.hold.take()) == _s(10000, 18048)  # the barge's audio, unmarked
+    rig.mic(20096)
+    assert rig.marked() == [_s(18048, 20096)]            # so no break is left for later
+
+
 # --- an utterance still open at the barge --------------------------------------------
 #
 # The reply can start while an utterance is still open: the mic hold keeps the audio

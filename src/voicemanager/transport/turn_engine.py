@@ -276,14 +276,29 @@ The words of a barge reach the STT decoder with nothing usable in front of them:
 the onset pre-roll is from before the reply, and a client with an echo canceller
 sends digital silence while the reply plays. A streaming decoder that starts on
 speech with no lead-in gives no text for some short answers ("yes", "do it again").
-So a barge the session acts on raises a one-shot mark, in the same step that ends
-the hold at the onset. The handler reads it with ``take_barge_onset`` under the STT
-lock, right before it takes held audio, so whichever taker gets the barge audio
-first (a mic frame, the barge's own release, a turn end) sees the mark with it. A
-listening boundary and the loss of the sidecar clear the mark.
+So the decoder gets a noise lead-in in front of a barge's audio.
 
-The barge is an utterance boundary for the STT. Audio from before the reply that
-the decoder has not flushed is flushed first, so its final goes out on its own
+The place for it travels with the audio. ``take_stt_audio`` gives the mic audio in
+order, with a ``StreamBreak`` in front of each chunk that does not continue the
+audio given before it, which is where the hold dropped audio: ``GAP`` where a reply
+played and no barge came, ``BARGE`` where the audio of a barge starts. A barge the
+session acts on is marked in the hold (``MicHold.mark_barge``) in the same step
+that ends the hold at the onset, and the first chunk given from there on is the
+barge's. So whichever taker gets that chunk (a mic frame, the barge's own release,
+a turn end) gets the break right in front of it, and:
+
+* audio the hold lets go from before the played reply (a later reply with no
+  playback start yet held it) is fed first, as it is, and the lead-in comes after
+  it;
+* a barge whose audio continues the audio the STT already has gets no break, so
+  no flush and no lead-in. That is a user who talks through the start of a reply:
+  the onset is before the playback start, the hold dropped nothing, and the speech
+  stays one utterance.
+
+A listening boundary and the loss of the sidecar leave no barge mark behind.
+
+A ``BARGE`` break is an utterance boundary for the STT. Audio from before the reply
+that the decoder has not flushed is flushed first, so its final goes out on its own
 segment, and a VAD still inside an utterance starts fresh. Then the decoder gets
 ``barge_lead_in``: white noise at ``BARGE_LEAD_DBFS``, for VM_TYGER_BARGE_LEAD_MS.
 With no VAD it is fed at once, in front of the barge audio. Under the idle gate the
@@ -316,6 +331,7 @@ and removes the files after it. Nothing limits their number.
 import asyncio
 import collections
 import datetime
+import enum
 import functools
 import json
 import logging
@@ -780,6 +796,15 @@ class HopFeed:
 _FEED, _DROP, _HOLD = "feed", "drop", "hold"
 
 
+class StreamBreak(enum.Enum):
+    """A place where the mic audio the STT gets does not continue the audio before it.
+
+    ``MicHold.take_marked`` puts one in front of the first chunk after such a place.
+    """
+    GAP = "gap"        # the hold dropped audio in between (a reply played there)
+    BARGE = "barge"    # a gap whose next audio starts at a barge the session acted on
+
+
 @dataclass
 class _Held:
     """A run of mic audio waiting in the hold."""
@@ -792,8 +817,10 @@ class MicHold:
     """The mic audio between the client and the STT of one opted-in connection.
 
     Plain state, no I/O, read from the ``HopFeed`` it is given: ``push`` takes each
-    mic frame in order, and ``take`` gives back, in order, the audio the STT may have
-    now. See "The mic hold" in the module docstring for what is fed, dropped or held.
+    mic frame in order, and ``take_marked`` gives back, in order, the audio the STT
+    may have now, with a ``StreamBreak`` at each place where that audio does not
+    continue the audio it gave before. See "The mic hold" in the module docstring for
+    what is fed, dropped or held, and "The barge lead-in" for the breaks.
     """
 
     def __init__(self, feed: HopFeed, *, tail_samples: int, start_wait_samples: int) -> None:
@@ -806,6 +833,12 @@ class MicHold:
         # How far the sidecar has scored the mic stream; None while it reports no
         # progress, and then a stop drops its in-play audio at once.
         self._scored: int | None = None
+        # The mic sample just after the last audio given out to be fed. The mic stream
+        # starts at sample 0, so the first audio continues from there.
+        self._fed_to = 0
+        # Where the audio of a barge the session acted on starts, until audio from
+        # there on is given out: see ``mark_barge``.
+        self._barge_from: int | None = None
 
     def on_scored(self, mic_sample: int) -> bool:
         """The sidecar's progress: it is done with the hops up to ``mic_sample``.
@@ -870,10 +903,28 @@ class MicHold:
         """One mic frame: ``raw`` as received, ``pcm`` its samples from mic sample start."""
         self._runs.append(_Held(start=start, pcm=pcm, raw=raw))
 
-    def take(self) -> list[bytes]:
-        """The audio the STT gets now, in order: whole frames where they were not cut."""
+    def mark_barge(self, feed_from: int) -> None:
+        """A barge the session acted on: the user's audio is fed from ``feed_from``.
+
+        Call it in the same step that sets ``barge_at`` on the replies. The next
+        audio ``take_marked`` gives from there on is the barge's, and gets a BARGE
+        break when it does not continue the audio fed before it."""
+        # Two barges with none of their audio given out yet: the earlier place holds
+        # the first audio of both.
+        if self._barge_from is None or feed_from < self._barge_from:
+            self._barge_from = feed_from
+
+    def take_marked(self) -> list[bytes | StreamBreak]:
+        """The audio the STT gets now, in order, and where it breaks.
+
+        The chunks are whole frames where they were not cut. A ``StreamBreak`` is in
+        front of each chunk that does not start where the audio fed before it ended
+        (the hold dropped audio in between): BARGE for the first such chunk from a
+        marked barge on, else GAP. So audio the hold lets go from before a barge's
+        onset comes before the BARGE break, and a barge whose audio continues the
+        audio fed before it gets no break at all."""
         rules = self._rules(self._feed.mic_samples)
-        out = []
+        out: list[bytes | StreamBreak] = []
         while self._runs:
             run = self._runs[0]
             kind, until = self._kind(run.start, rules)
@@ -883,18 +934,47 @@ class MicHold:
             cut = n if until - run.start >= n else int(until - run.start)
             if cut >= n:
                 self._runs.popleft()
-                if kind == _FEED:
-                    out.append(run.raw if run.raw is not None else run.pcm)
-                continue
-            head = run.pcm[:2 * cut]
-            self._runs[0] = _Held(start=run.start + cut, pcm=run.pcm[2 * cut:], raw=None)
+                chunk = run.raw if run.raw is not None else run.pcm
+            else:
+                chunk = run.pcm[:2 * cut]
+                self._runs[0] = _Held(start=run.start + cut, pcm=run.pcm[2 * cut:], raw=None)
             if kind == _FEED:
-                out.append(head)
+                mark = self._feeding(run.start, min(cut, n))
+                if mark is not None:
+                    out.append(mark)
+                out.append(chunk)
         return out
 
+    def _feeding(self, start: int, count: int) -> StreamBreak | None:
+        """``count`` samples from mic sample ``start`` go to the STT now: the break
+        in front of them, or None when they continue the audio fed before them.
+
+        Audio the hold drops never comes here, so it shows as a break in front of
+        the next audio that is fed."""
+        barge = self._barge_from is not None and start >= self._barge_from
+        if barge:
+            # This audio is the barge's, with a break or not: a later break is not.
+            self._barge_from = None
+        broken = start != self._fed_to
+        self._fed_to = start + count
+        if not broken:
+            return None
+        return StreamBreak.BARGE if barge else StreamBreak.GAP
+
+    def take(self) -> list[bytes]:
+        """The audio ``take_marked`` gives now, without the breaks."""
+        return [item for item in self.take_marked() if not isinstance(item, StreamBreak)]
+
     def take_all(self) -> list[bytes]:
-        """Everything in the hold, in order, whatever the replies hold: the hold ends."""
+        """Everything in the hold, in order, whatever the replies hold: the hold ends.
+
+        It is one stretch of the mic stream with nothing dropped, so there is no break
+        in it, and a barge marked before has no break left to get."""
         out = [run.raw if run.raw is not None else run.pcm for run in self._runs]
+        if self._runs:
+            last = self._runs[-1]
+            self._fed_to = last.start + len(last.pcm) // 2
+        self._barge_from = None
         self._runs.clear()
         return out
 
@@ -908,9 +988,15 @@ class MicHold:
         return self._runs[0].start, b"".join(run.pcm for run in self._runs)
 
     def clear(self) -> int:
-        """Drop everything in the hold; the samples dropped."""
+        """Drop everything in the hold; the samples dropped.
+
+        This is the listening boundary, where the STT starts over: the next audio
+        breaks from nothing, so it counts as audio that continues from the mic count
+        now, and a barge marked before the boundary gets no break after it."""
         n = self.held_samples
         self._runs.clear()
+        self._fed_to = self._feed.mic_samples
+        self._barge_from = None
         return n
 
     def _rules(self, now: int) -> list[tuple[int, float, str]]:
@@ -1069,8 +1155,6 @@ class TurnEngineSession:
         # The mic_sample of the last listening boundary: no event at or before it is
         # acted on. None while the connection never stopped listening.
         self._boundary: int | None = None
-        # A barge the session acted on, not yet seen by the handler's STT path.
-        self._barge_onset = False
         # The debug capture: the directory ("" is off), the capture being collected
         # and the writes under way.
         self._capture_dir = barge_capture_dir
@@ -1233,20 +1317,16 @@ class TurnEngineSession:
             logger.exception("Feeding held mic audio to the STT failed: session=%s",
                              self._label)
 
-    def take_barge_onset(self) -> bool:
-        """True once after a barge the session acted on: the audio ``take_stt_audio``
-        gives next starts at the barge onset. Call it under the STT lock, right
-        before ``take_stt_audio``."""
-        seen, self._barge_onset = self._barge_onset, False
-        return seen
-
-    def take_stt_audio(self) -> list[bytes]:
+    def take_stt_audio(self) -> list[bytes | StreamBreak]:
         """The mic audio the STT gets now, in order. Call it under the STT lock.
 
-        After a loss it is everything still in the hold, which ends the hold."""
+        A ``StreamBreak`` is in front of each chunk that does not continue the audio
+        given before it; BARGE is where a barge's utterance starts (see "The barge
+        lead-in" in the module docstring). After a loss it is everything still in
+        the hold, with no break in it, which ends the hold."""
         if self._lost:
             return self._hold.take_all()
-        return self._hold.take()
+        return self._hold.take_marked()
 
     def on_tts_pcm(self, request_id: str, pcm: bytes) -> None:
         """The TTS session's audio tap: PCM a reply sent."""
@@ -1322,9 +1402,10 @@ class TurnEngineSession:
         """The client stopped listening: see "The listening boundary" in the module
         docstring. Call it on a real listening -> stopped change, before the answer
         goes out and before the STT is reset; it never waits."""
-        dropped = self._hold.clear()  # pre-stop audio never reaches the STT after it
-        self._capture = None          # nor a file
-        self._barge_onset = False     # and its barge gets no lead-in after it
+        # Pre-stop audio never reaches the STT after it, and a barge marked before it
+        # gets no lead-in after it: the hold forgets both.
+        dropped = self._hold.clear()
+        self._capture = None          # nor does the audio reach a file
         for handle in self._timers:
             handle.cancel()
         self._timers.clear()
@@ -1555,7 +1636,8 @@ class TurnEngineSession:
         self._timers.clear()
         self._finals.clear()
         self._capture = None
-        self._barge_onset = False
+        # A barge marked in the hold needs no clearing here: from now on the hold is
+        # only read with take_all, which gives no break and drops the mark.
         tts = self._tts_session
         if tts is not None and tts.audio_tap is self:
             tts.audio_tap = None
@@ -1626,7 +1708,9 @@ class TurnEngineSession:
         for kept in self._feed.replies():
             if kept.seen_at <= event.mic_sample and kept.barge_at is None:
                 kept.barge_at = feed_from
-        self._barge_onset = True  # the next audio the STT takes starts at the onset
+        # The hold marks the place in the audio it gives out, so the barge's lead-in
+        # goes in front of the audio from the onset, whichever taker gets it.
+        self._hold.mark_barge(feed_from)
         tts = self._tts_session
         if reply.done or tts is None:
             # Its audio_end already went out: the frame alone clears the speaker.
