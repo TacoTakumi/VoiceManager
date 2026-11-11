@@ -44,8 +44,14 @@ class _FakeServerWS:
         self.replies = replies or {}
         self.send = AsyncMock(side_effect=self._on_send)
         self.close = AsyncMock()
+        # Set to an Event to make the send of each audio frame wait for it, as a
+        # send waits when the transport's write buffer is full. The frame is on the
+        # wire by then: only the return of the call waits.
+        self.pause: asyncio.Event | None = None
 
     async def _on_send(self, data) -> None:
+        if isinstance(data, bytes) and self.pause is not None:
+            await self.pause.wait()
         if isinstance(data, str):
             sent = json.loads(data)
             reply = self.replies.get(sent.get("type"))
@@ -404,6 +410,85 @@ def test_a_listen_start_by_hand_that_crossed_the_wake_keeps_the_count():
             ws.end()
             return session.mic_sample, session.listening
     assert asyncio.run(run()) == (320, True)
+
+
+# A send can wait: the frame is written to the socket and the call returns only when
+# the write buffer has room. Another task, or the reader, runs in that wait. The frame
+# is in the session's count from the moment it is on the wire, so each reader of the
+# count below sees it.
+
+def test_a_wake_read_while_a_dormant_frames_send_waits_counts_that_frame_as_mic_audio():
+    """The server heard the phrase in the first frame, so it counted the second,
+    whose send had not returned yet, as mic audio."""
+    ws = _FakeServerWS(_accepting())
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            await session.enable_wake_word()
+            await session.send_audio(CHUNK)
+            ws.pause = asyncio.Event()
+            sending = asyncio.create_task(session.send_audio(CHUNK))
+            await _settle()
+            ws.push(_wake(0, 160))
+            await _settle()
+            ws.pause.set()
+            await sending
+            ws.end()
+            return session.mic_sample, session.listening
+    assert asyncio.run(run()) == (160, True)
+
+
+def test_an_opt_in_sent_while_a_mic_frames_send_waits_leaves_that_frame_mic_audio():
+    """The mic frame was on the wire before the wake_word frame, so the server took
+    it as mic audio."""
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            ws.pause = asyncio.Event()
+            sending = asyncio.create_task(session.send_audio(CHUNK))
+            await _settle()
+            call = asyncio.create_task(session.enable_wake_word())
+            await _settle()
+            ws.pause.set()
+            await sending
+            ws.push(_ready())
+            await call
+            ws.end()
+            return session.mic_sample, session.dormant
+    assert asyncio.run(run()) == (160, True)
+
+
+def test_a_listen_stop_sent_while_a_dormant_frames_send_waits_has_that_frame_in_its_mark():
+    """The server heard the phrase in the second dormant frame, whose send had not
+    returned when the listen_stop went out. It woke and then got the listen_stop, so
+    it is dormant again, and so is the session."""
+    ws = _FakeServerWS(_accepting())
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            await session.enable_wake_word()
+            await session.send_audio(CHUNK)
+            ws.pause = asyncio.Event()
+            sending = asyncio.create_task(session.send_audio(CHUNK))
+            await _settle()
+            stop = asyncio.create_task(session.listen_stop())
+            await _settle()
+            ws.push(_wake(0, 320))
+            ws.push(ListenStoppedMessage(mic_sample=0).model_dump())
+            ws.pause.set()
+            await sending
+            count = await stop
+            state = (session.dormant, session.mic_sample)
+            ws.end()
+            return count, state, [w async for w in session.wakes()]
+    assert asyncio.run(run()) == (0, (True, 0), [])
 
 
 def test_a_wake_frame_with_no_opt_in_is_ignored():

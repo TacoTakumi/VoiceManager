@@ -302,11 +302,16 @@ class DuplexSession:
                 return
             # Dormant: the server gives the frame to its wake word spotter and
             # counts it as dormant audio, not as mic audio.
-            await client._send_or_raise(pcm, STTError)
             client._dormant_bytes += len(pcm)
+            await client._send_or_raise(pcm, STTError)
             return
-        await client._send_or_raise(pcm, STTError)
+        # The frame is counted before the send is awaited. A send can wait for room
+        # in the write buffer with the frame already on the wire, and the reader
+        # (a wake frame) or another task (an opt-in, a listen_stop) that runs in
+        # that wait must find the frame in the count, as the server will. A send
+        # that fails reconnects, and the new connection's counts start at 0.
         client._count_mic(pcm)
+        await client._send_or_raise(pcm, STTError)
 
     @property
     def listening(self) -> bool:
