@@ -67,6 +67,10 @@ _TURN_ENGINE_MESSAGE_TYPES = frozenset({
 # client->server; listen_stopped answers a listen_stop. A client that never sends
 # listen_stop sees none of them.
 _LISTEN_MESSAGE_TYPES = frozenset({"listen_stop", "listen_start", "listen_stopped"})
+# The wake-word frames, added after those: wake_word is client->server;
+# wake_word_ready answers it and wake reports a heard phrase. A client that never
+# sends wake_word sees none of them.
+_WAKE_MESSAGE_TYPES = frozenset({"wake_word", "wake_word_ready", "wake"})
 
 # Every error_type the server sent before the turn engine. The turn engine reuses
 # invalid_request for bad frames and adds only its three own types.
@@ -265,6 +269,8 @@ def test_legacy_session_trace_is_additive_and_opt_in(monkeypatch):
     # Nor does any listening-boundary frame: listen_stopped answers only a
     # listen_stop, which a legacy client never sends.
     assert not _LISTEN_MESSAGE_TYPES & set(types)
+    # Nor any wake-word frame: a legacy client never opts in.
+    assert not _WAKE_MESSAGE_TYPES & set(types)
 
     # Every server frame type is a pre-project type -- nothing outside today's
     # set, and every one is a known enum member.
@@ -298,10 +304,13 @@ def test_project_added_only_the_two_turn_message_types():
     # a future non-additive frame type (a retraction, a mode negotiation) trips here.
     current = {m.value for m in MessageType}
     assert current - _LEGACY_MESSAGE_TYPES == set(
-        _TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES | _LISTEN_MESSAGE_TYPES)
-    # The three additions are separate sets: no type is counted twice.
+        _TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES | _LISTEN_MESSAGE_TYPES
+        | _WAKE_MESSAGE_TYPES)
+    # The additions are separate sets: no type is counted twice.
     assert not _TURN_MESSAGE_TYPES & _TURN_ENGINE_MESSAGE_TYPES
     assert not _LISTEN_MESSAGE_TYPES & (_TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES)
+    assert not _WAKE_MESSAGE_TYPES & (
+        _TURN_MESSAGE_TYPES | _TURN_ENGINE_MESSAGE_TYPES | _LISTEN_MESSAGE_TYPES)
     # ...and nothing pre-existing was removed or renamed either.
     assert _LEGACY_MESSAGE_TYPES <= current
 

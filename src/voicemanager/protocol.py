@@ -38,6 +38,13 @@ class MessageType(str, enum.Enum):
     listen_stop = "listen_stop"
     listen_start = "listen_start"
     listen_stopped = "listen_stopped"
+    # Wake-word frames, all opt-in: a client asks for a server-side wake word with
+    # wake_word and the server answers wake_word_ready; the server reports wake when
+    # it hears one of the connection's phrases. A client that never sends wake_word
+    # sees none of them.
+    wake_word = "wake_word"
+    wake_word_ready = "wake_word_ready"
+    wake = "wake"
 
 
 class HandshakeMessage(BaseModel):
@@ -298,6 +305,50 @@ class ListenStoppedMessage(BaseModel):
     the boundary. Integers are strict: a string, float or bool is a malformed frame.
     """
     type: Literal["listen_stopped"] = "listen_stopped"
+    mic_sample: int = Field(ge=0, strict=True)
+
+
+# --- server-side wake word -------------------------------------------------------
+#
+# A client with no keyword spotter of its own can ask the server to listen for a wake
+# phrase. An opted-in connection is dormant while it is stopped: its mic audio goes to
+# a keyword spotter and to nothing else. When the spotter hears a phrase the server
+# sends wake and listens, as for a client listen_start. A listen_stop makes the
+# connection dormant again. The frames add no error types: a refused wake_word gets
+# an invalid_request error frame.
+
+
+class WakeWordMessage(BaseModel):
+    """Client opt-in to the server-side wake word.
+
+    ``phrases`` is the list of wake phrases for this connection, as plain text. Left
+    out (or null), the server's default list is used. The list is kept as sent so the
+    server can answer a list it cannot use with an invalid_request error frame.
+    """
+    type: Literal["wake_word"] = "wake_word"
+    phrases: list[str] | None = None
+
+
+class WakeWordReadyMessage(BaseModel):
+    """Server answer to a successful wake_word opt-in.
+
+    ``phrases`` is the list the connection's spotter listens for. The connection is
+    dormant from this frame on.
+    """
+    type: Literal["wake_word_ready"] = "wake_word_ready"
+    phrases: list[str]
+
+
+class WakeMessage(BaseModel):
+    """Server report that it heard a wake phrase on a dormant connection.
+
+    ``phrase`` is the phrase that matched, as the connection's list has it.
+    ``mic_sample`` is how many mic samples the server accepted on the connection at
+    the wake: the first mic frame after this frame starts at that count. Audio sent
+    while dormant is not counted. Integers are strict, as in listen_stopped.
+    """
+    type: Literal["wake"] = "wake"
+    phrase: str
     mic_sample: int = Field(ge=0, strict=True)
 
 
