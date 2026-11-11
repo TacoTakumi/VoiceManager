@@ -19,7 +19,8 @@ from voicemanager.pipeline.tts_session import TTSSession
 from voicemanager.protocol import (
     HandshakeMessage, ErrorMessage, TranscriptionMessage, AUDIO_FORMAT_SPEC,
     TTSRequestMessage, TTSCancelMessage, TTSStreamMessage, TurnStartedMessage,
-    ListenStoppedMessage, CHUNKING_MODES,
+    ListenStoppedMessage, WakeMessage, WakeWordMessage, WakeWordReadyMessage,
+    CHUNKING_MODES,
 )
 from voicemanager.session import SessionRegistry, SessionEntry
 from voicemanager.transport.endpoint_hold import EndpointHoldMachine
@@ -27,6 +28,7 @@ from voicemanager.transport.turn_engine import (
     StreamBreak, TurnEngineSession, _wav_payload_offset, barge_lead_in,
 )
 from voicemanager.transport.turns import TurnTracker
+from voicemanager.wake import WakePhraseError, normalize_phrases
 
 logger = logging.getLogger(__name__)
 
@@ -1026,15 +1028,24 @@ async def websocket_endpoint(websocket: WebSocket):
         are dropped and the sidecar is told, so no turn_end or barge for pre-stop
         audio goes out after the answer.
         """
-        if not listen.stopped:
-            listen.stopped = True
-            listen.epoch += 1
-            logger.info("Listening stopped: session=%s mic_sample=%d",
-                        session_id, listen.mic_samples)
-            turn_engine.listen_boundary()
-            await _discard_open_utterance()
+        if await _stop_listening():
+            # An opted-in connection is dormant again, and listens for its phrases
+            # on a stream that has heard nothing of the conversation before the stop.
+            await _open_wake_stream(wake_stream.phrases if wake_stream is not None else None)
         await websocket.send_text(
             ListenStoppedMessage(mic_sample=listen.mic_samples).model_dump_json())
+
+    async def _stop_listening() -> bool:
+        """Take a listening connection to stopped; False when it was stopped already."""
+        if listen.stopped:
+            return False
+        listen.stopped = True
+        listen.epoch += 1
+        logger.info("Listening stopped: session=%s mic_sample=%d",
+                    session_id, listen.mic_samples)
+        turn_engine.listen_boundary()
+        await _discard_open_utterance()
+        return True
 
     def _apply_listen_start() -> None:
         """Listen again. No answer; a listen_start while listening does nothing."""
@@ -1043,6 +1054,67 @@ async def websocket_endpoint(websocket: WebSocket):
             turn_engine.listen_start()
             logger.info("Listening started: session=%s mic_sample=%d",
                         session_id, listen.mic_samples)
+
+    # The server-side wake word. A connection that opted in with a wake_word frame has
+    # a spotter stream, and is dormant while it is stopped: a stopped mic frame goes to
+    # that stream, where a connection with no opt-in drops it. The dormant state is the
+    # stopped state, so the boundary above does all the resets, and a wake is a
+    # listen_start the server applies itself. All calls into the spotter block on the
+    # model and run in its executor, one at a time for this connection.
+    wake_spotter = getattr(websocket.app.state, "wake_spotter", None)
+    wake_stream = None
+
+    async def _open_wake_stream(phrases: list[str] | None) -> None:
+        """Give the connection a new spotter stream for ``phrases``; None does nothing."""
+        nonlocal wake_stream
+        if phrases is None:
+            return
+        wake_stream = await asyncio.get_running_loop().run_in_executor(
+            wake_spotter.executor, wake_spotter.open_stream, phrases)
+
+    async def _apply_wake_word(parsed: dict) -> None:
+        """Opt the connection in to the wake word and make it dormant.
+
+        The answer is wake_word_ready with the phrases the connection listens for. A
+        frame the server cannot use (no wake engine, a malformed frame, a bad phrase
+        list) gets an invalid_request error frame and changes nothing: a connection
+        that was listening keeps listening. A second wake_word replaces the phrases.
+        """
+        try:
+            msg = WakeWordMessage.model_validate(parsed)
+            if wake_spotter is None:
+                raise WakePhraseError(
+                    "this server has no wake word engine (VM_WAKE_ENGINE is none)")
+            phrases = (normalize_phrases(msg.phrases) if msg.phrases is not None
+                       else list(wake_spotter.default_phrases))
+            await _open_wake_stream(phrases)
+        except (ValidationError, WakePhraseError) as exc:
+            reason = ("phrases must be a list of strings"
+                      if isinstance(exc, ValidationError) else str(exc))
+            logger.warning("Refused wake_word: session=%s %s", session_id, reason)
+            await websocket.send_text(
+                ErrorMessage(
+                    error_type="invalid_request",
+                    message=f"wake_word refused: {reason}; the frame was dropped.",
+                ).model_dump_json())
+            return
+        # The same boundary as a client listen_stop, with wake_word_ready as its answer.
+        await _stop_listening()
+        logger.info("Wake word on: session=%s phrases=%s", session_id, wake_stream.phrases)
+        await websocket.send_text(
+            WakeWordReadyMessage(phrases=wake_stream.phrases).model_dump_json())
+
+    async def _feed_wake(data: bytes) -> None:
+        """Give a dormant connection's mic frame to its spotter; wake on a phrase."""
+        phrase = await asyncio.get_running_loop().run_in_executor(
+            wake_spotter.executor, wake_stream.feed, data)
+        if phrase is None:
+            return
+        _apply_listen_start()
+        logger.info("Wake: session=%s phrase=%r mic_sample=%d",
+                    session_id, phrase, listen.mic_samples)
+        await websocket.send_text(
+            WakeMessage(phrase=phrase, mic_sample=listen.mic_samples).model_dump_json())
 
     try:
         loop = asyncio.get_event_loop()
@@ -1232,9 +1304,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Stopped: the frame is dropped before anything looks at it. It is not
                 # validated (so it is not the first audio frame and cannot fail as
                 # one), not counted, and fed to neither the turn engine nor the STT.
+                # On a connection that opted in to the wake word the frame goes to its
+                # spotter, and to nothing else: the frame a phrase is heard in is not
+                # transcribed, and the next one is the first the STT gets.
                 if listen.stopped:
-                    logger.debug("Dropped mic frame while stopped: session=%s (%d bytes)",
-                                 session_id, len(data))
+                    if wake_stream is not None:
+                        await _feed_wake(data)
+                    else:
+                        logger.debug("Dropped mic frame while stopped: session=%s (%d bytes)",
+                                     session_id, len(data))
                     continue
 
                 # Validate first binary frame
@@ -1480,6 +1558,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 elif msg_type == "listen_start":
                     _apply_listen_start()
+
+                elif msg_type == "wake_word":
+                    await _apply_wake_word(parsed)
 
                 # Any other frame type is dropped unanswered, as it always was.
 
