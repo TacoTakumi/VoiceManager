@@ -40,8 +40,13 @@ WARNING_LEAD = 30
 # it only covers the attack the VAD needs to confirm. After a barge the gated audio
 # is the mic stream from the barge onset on, and the VAD may report the start well
 # after it (soft first words, the reply's echo), so the short cap would cut the
-# front of the user's words. Still a cap: a barge with no speech after it must not
-# grow the pre-roll without limit.
+# front of the user's words.
+#
+# It is also the time limit of the armed lead-in. When more than this much audio is
+# gated after the barge with no speech onset, the lead-in is dropped and the pre-roll
+# goes back to its usual cap: words that come later are an utterance of their own,
+# and must not get the lead-in and 2 s of old quiet audio in front of them. So a
+# barge with no speech after it cannot grow the pre-roll without limit either.
 BARGE_PREROLL_MS = 2000
 
 
@@ -839,7 +844,8 @@ async def websocket_endpoint(websocket: WebSocket):
         and the finals it volunteers or the acoustic endpoint flushes. The handler runs
         each received frame through here; an opted-in session's held audio comes
         through here too when the hold lets it go. A barge lead-in armed under the idle
-        gate is fed at the speech onset, ahead of the pre-roll.
+        gate is fed at the speech onset, ahead of the pre-roll. It is dropped when
+        more than BARGE_PREROLL_MS of audio is gated after the barge with no onset.
         """
         nonlocal audiocpp_last_audio, audiocpp_barge_lead
         was_speaking = audiocpp_endpointer.speech_active
@@ -855,13 +861,17 @@ async def websocket_endpoint(websocket: WebSocket):
             # trigger either, so no empty inter-utterance flush ever consumes a
             # segment index. Keep the tail in the rolling onset pre-roll.
             audiocpp_preroll.extend(data)
-            preroll_max = audiocpp_preroll_max
-            if audiocpp_barge_lead:
-                # The gated audio is a barge's, from its onset on: keep much more of
-                # it than the onset pre-roll, or the front of the words is cut.
-                preroll_max = max(preroll_max, BARGE_PREROLL_MS * 32)
-            if len(audiocpp_preroll) > preroll_max:
-                del audiocpp_preroll[:len(audiocpp_preroll) - preroll_max]
+            if audiocpp_barge_lead and len(audiocpp_preroll) > BARGE_PREROLL_MS * 32:
+                # The pre-roll was emptied when the lead-in was armed, so it holds
+                # all the audio gated since the barge, and that is now past the time
+                # limit with no speech onset. Words that come this late are not the
+                # barge's: drop the lead-in, and trim to the usual pre-roll below.
+                audiocpp_barge_lead = b""
+            # While a lead-in is armed the gated audio is a barge's, from its onset
+            # on, and all of it is kept (the time limit above is its cap): the short
+            # onset pre-roll would cut the front of the words.
+            if not audiocpp_barge_lead and len(audiocpp_preroll) > audiocpp_preroll_max:
+                del audiocpp_preroll[:len(audiocpp_preroll) - audiocpp_preroll_max]
             return
         if audiocpp_idle_gate and not was_speaking:
             if audiocpp_barge_lead:
@@ -920,6 +930,7 @@ async def websocket_endpoint(websocket: WebSocket):
         the event loop; the one engine call that waits on a decode runs off-loop.
         """
         nonlocal audiocpp_last_audio, audiocpp_endpointer, streaming_last_update
+        nonlocal audiocpp_barge_lead
         async with stt_lock:
             if stt_engine_type == "audiocpp":
                 # The sidecar answers in order and RESET has no reply, so a delta or a
@@ -933,6 +944,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 pipeline.reset()
                 audiocpp_last_audio = None      # the quiet flush has nothing to flush
                 audiocpp_preroll.clear()        # pre-stop audio is not an onset pre-roll
+                # A lead-in still armed is for a barge from before the stop: the
+                # first utterance after listen_start is not that barge's.
+                audiocpp_barge_lead = b""
                 audiocpp_endpointer = _new_audiocpp_endpointer()
             elif stt_engine_type == "nemotron":
                 # A fresh NeMo stream: the running hypothesis of the open utterance
