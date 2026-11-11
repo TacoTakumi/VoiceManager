@@ -269,6 +269,21 @@ The session stays lost for the life of the connection: a later opt-in on it is
 refused with ``invalid_request``. Once the sidecar is back, a new connection may opt
 in again.
 
+The barge lead-in
+-----------------
+
+The words of a barge reach the STT decoder with nothing usable in front of them:
+the onset pre-roll is from before the reply, and a client with an echo canceller
+sends digital silence while the reply plays. A streaming decoder that starts on
+speech with no lead-in gives no text for some short answers ("yes", "do it again").
+So a barge the session acts on raises a one-shot mark, in the same step that ends
+the hold at the onset. The handler reads it with ``take_barge_onset`` under the STT
+lock, right before it takes held audio, so whichever taker gets the barge audio
+first (a mic frame, the barge's own release, a turn end) sees the mark with it and
+feeds the decoder ``barge_lead_in`` first: white noise at ``BARGE_LEAD_DBFS``, for
+VM_TYGER_BARGE_LEAD_MS. A listening boundary and the loss of the sidecar clear the
+mark.
+
 The barge capture
 -----------------
 
@@ -348,6 +363,8 @@ MAX_QUEUED_HOPS = 32
 BARGE_LOOKBACK_SAMPLES = 4 * wire.SAMPLE_RATE
 #: Held audio kept past the barge lookback and the start wait, for events that lag.
 HOLD_MARGIN_SAMPLES = wire.SAMPLE_RATE
+#: The level of the noise lead-in the STT decoder gets in front of a barge's audio.
+BARGE_LEAD_DBFS = -61.0
 #: The most mic audio past a barge that the debug capture of it keeps.
 CAPTURE_MAX_SAMPLES = 12 * wire.SAMPLE_RATE
 
@@ -941,6 +958,19 @@ class MicHold:
         return kind, until
 
 
+# --- the barge lead-in ------------------------------------------------------------
+
+def barge_lead_in(ms: int) -> bytes:
+    """``ms`` of white noise at BARGE_LEAD_DBFS, 16 kHz mono 16-bit PCM: what the STT
+    decoder gets in front of a barge's audio (see "The barge lead-in"). Empty for 0."""
+    n = ms * wire.SAMPLE_RATE // 1000
+    if n <= 0:
+        return b""
+    rms = 32768.0 * 10.0 ** (BARGE_LEAD_DBFS / 20.0)
+    noise = np.random.default_rng().standard_normal(n) * rms
+    return np.clip(np.round(noise), -32768, 32767).astype("<i2").tobytes()
+
+
 # --- the barge capture ------------------------------------------------------------
 
 @dataclass
@@ -1032,6 +1062,8 @@ class TurnEngineSession:
         # The mic_sample of the last listening boundary: no event at or before it is
         # acted on. None while the connection never stopped listening.
         self._boundary: int | None = None
+        # A barge the session acted on, not yet seen by the handler's STT path.
+        self._barge_onset = False
         # The debug capture: the directory ("" is off), the capture being collected
         # and the writes under way.
         self._capture_dir = barge_capture_dir
@@ -1194,6 +1226,13 @@ class TurnEngineSession:
             logger.exception("Feeding held mic audio to the STT failed: session=%s",
                              self._label)
 
+    def take_barge_onset(self) -> bool:
+        """True once after a barge the session acted on: the audio ``take_stt_audio``
+        gives next starts at the barge onset. Call it under the STT lock, right
+        before ``take_stt_audio``."""
+        seen, self._barge_onset = self._barge_onset, False
+        return seen
+
     def take_stt_audio(self) -> list[bytes]:
         """The mic audio the STT gets now, in order. Call it under the STT lock.
 
@@ -1278,6 +1317,7 @@ class TurnEngineSession:
         goes out and before the STT is reset; it never waits."""
         dropped = self._hold.clear()  # pre-stop audio never reaches the STT after it
         self._capture = None          # nor a file
+        self._barge_onset = False     # and its barge gets no lead-in after it
         for handle in self._timers:
             handle.cancel()
         self._timers.clear()
@@ -1508,6 +1548,7 @@ class TurnEngineSession:
         self._timers.clear()
         self._finals.clear()
         self._capture = None
+        self._barge_onset = False
         tts = self._tts_session
         if tts is not None and tts.audio_tap is self:
             tts.audio_tap = None
@@ -1578,6 +1619,7 @@ class TurnEngineSession:
         for kept in self._feed.replies():
             if kept.seen_at <= event.mic_sample and kept.barge_at is None:
                 kept.barge_at = feed_from
+        self._barge_onset = True  # the next audio the STT takes starts at the onset
         tts = self._tts_session
         if reply.done or tts is None:
             # Its audio_end already went out: the frame alone clears the speaker.

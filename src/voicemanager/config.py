@@ -363,6 +363,12 @@ class Settings(BaseSettings):
     # also bounds, in mic audio, how long a stopped reply's held audio waits for the
     # sidecar to score up to the stop plus the tail.
     tyger_start_wait_ms: int = Field(default=2000, gt=0)       # VM_TYGER_START_WAIT_MS
+    # At a barge the STT decoder first gets this many ms of low noise, then the mic
+    # audio from the barge onset. A short answer spoken over a reply reaches the
+    # decoder with nothing usable in front of it (stale pre-roll, or digital silence
+    # from a client's echo canceller), and the streaming decoder then gives no text
+    # for some of them. 0 turns the lead-in off.
+    tyger_barge_lead_ms: int = Field(default=600, ge=0)        # VM_TYGER_BARGE_LEAD_MS
     # Debug. A directory: each barge an opted-in session acts on writes the mic audio
     # around it there (a WAV and a JSON note), to measure what the STT got. The files
     # hold the user's voice and nothing limits their number. Empty is off.

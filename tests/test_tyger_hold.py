@@ -142,6 +142,9 @@ def env(monkeypatch):
             monkeypatch.setenv(key, str(value))
         cfg._settings = None
     monkeypatch.setenv("VM_SESSION_TIMEOUT", "60")
+    # These tests pin the mic audio the hold lets go; the noise lead-in a barge
+    # puts in front of it has its own tests.
+    monkeypatch.setenv("VM_TYGER_BARGE_LEAD_MS", "0")
     cfg._settings = None
     yield setenv
     cfg._settings = None

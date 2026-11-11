@@ -23,7 +23,9 @@ from voicemanager.protocol import (
 )
 from voicemanager.session import SessionRegistry, SessionEntry
 from voicemanager.transport.endpoint_hold import EndpointHoldMachine
-from voicemanager.transport.turn_engine import TurnEngineSession, _wav_payload_offset
+from voicemanager.transport.turn_engine import (
+    TurnEngineSession, _wav_payload_offset, barge_lead_in,
+)
 from voicemanager.transport.turns import TurnTracker
 
 logger = logging.getLogger(__name__)
@@ -629,6 +631,25 @@ async def websocket_endpoint(websocket: WebSocket):
         for chunk in chunks:
             await _audiocpp_stt_frame(chunk, send)
 
+    async def _take_engine_audio(send) -> list[bytes]:
+        """The held mic audio the STT gets now, in order. Hold stt_lock.
+
+        When that audio starts at a barge onset, the decoder gets the barge lead-in
+        first: see "The barge lead-in" in the turn engine module.
+        """
+        if turn_engine.take_barge_onset():
+            await _begin_barge_utterance(send)
+        return turn_engine.take_stt_audio()
+
+    async def _begin_barge_utterance(send) -> None:
+        """Feed the decoder the noise lead-in in front of a barge's audio."""
+        nonlocal audiocpp_last_audio
+        lead = barge_lead_in(settings.tyger_barge_lead_ms)
+        if not lead:
+            return
+        await pipeline.feed(lead)
+        audiocpp_last_audio = time.monotonic()
+
     async def _engine_stt_fault(exc: SidecarFault) -> None:
         """A sidecar fault met by the turn engine's STT work: the handler's own surface."""
         logger.warning("audio.cpp sidecar fault, closing session %s: %s", session_id, exc)
@@ -666,7 +687,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.debug("Turn end from before a listen_stop skipped: session=%s",
                                  session_id)
                     return
-                await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
+                await _feed_audiocpp_stt(await _take_engine_audio(send), send)
                 if audiocpp_last_audio is not None:
                     await _finalize_audiocpp_utterance(pipeline, send, session_id=session_id)
                     audiocpp_last_audio = None
@@ -688,7 +709,8 @@ async def websocket_endpoint(websocket: WebSocket):
             async with stt_lock:
                 if epoch != listen.epoch:
                     return
-                await _feed_audiocpp_stt(turn_engine.take_stt_audio(), _fenced_sink(epoch))
+                send = _fenced_sink(epoch)
+                await _feed_audiocpp_stt(await _take_engine_audio(send), send)
         except SidecarFault as exc:
             await _engine_stt_fault(exc)
         except Exception as exc:
@@ -1183,7 +1205,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # straight on.
                     async with stt_lock:
                         if via_hold:
-                            await _feed_audiocpp_stt(turn_engine.take_stt_audio(), send)
+                            await _feed_audiocpp_stt(await _take_engine_audio(send), send)
                         else:
                             await _audiocpp_stt_frame(data, send)
                 elif stt_engine_type == "qwen":

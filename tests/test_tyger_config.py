@@ -193,7 +193,7 @@ def test_env_example_lists_every_turn_engine_key():
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     names = [name for name in Settings.model_fields
              if name == "turn_engine" or name.startswith("tyger_")]
-    assert len(names) == 22
+    assert len(names) == 23
     for name in names:
         assert f"# VM_{name.upper()}=" in text, name
 
