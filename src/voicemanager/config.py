@@ -383,6 +383,23 @@ class Settings(BaseSettings):
     tyger_prefilter: Literal["off", "voxlock"] = Field(default="off")  # VM_TYGER_PREFILTER
     tyger_prefilter_floor_db: float = Field(default=-52.0, le=0.0)  # VM_TYGER_PREFILTER_FLOOR_DB (dBFS)
 
+    # Server-side wake word. "none" (the default) loads nothing, and a client that
+    # asks for a wake word gets an error frame. "sherpa" loads the sherpa-onnx keyword
+    # spotter on the CPU: a connection that opts in is dormant until the spotter hears
+    # one of its phrases. It needs the sherpa-onnx and sentencepiece packages and the
+    # model directory that `python setup_models.py wake` downloads.
+    wake_engine: Literal["none", "sherpa"] = Field(default="none")  # VM_WAKE_ENGINE: none|sherpa
+    wake_model_dir: str = Field(default="")                    # VM_WAKE_MODEL_DIR
+    # The phrases a connection gets when its opt-in names none: plain text, separated
+    # by commas. A phrase is letters, spaces and apostrophes. Two words ("hey
+    # computer") are heard more reliably than one.
+    wake_phrases: str = Field(default="hey computer")          # VM_WAKE_PHRASES
+    # How sure the spotter must be before it reports a phrase (higher = fewer false
+    # wakes and more missed phrases), and how much the decoder is pushed toward a
+    # phrase's words. Both apply to every phrase of every connection.
+    wake_threshold: float = Field(default=0.15, gt=0.0, le=1.0)  # VM_WAKE_THRESHOLD
+    wake_score: float = Field(default=1.5, ge=0.0)             # VM_WAKE_SCORE
+
     # tts_stream "clause" chunking: text is cut at clause marks, word counts and
     # playback-aware deadlines instead of whole sentences. A clause mark cuts only
     # when the piece up to it holds at least mark_min_words words. The first piece
@@ -414,6 +431,7 @@ class Settings(BaseSettings):
         "voxtream_py",
         "voxtream_voices",
         "tyger_py",
+        "wake_model_dir",
     )
 
     def __init__(self, **values) -> None:

@@ -9,6 +9,7 @@ from voicemanager.models import load_models, load_tts_models, load_turn_engine
 from voicemanager.session import SessionRegistry
 from voicemanager.transport.http import http_router
 from voicemanager.transport.websocket import websocket_router
+from voicemanager.wake import load_wake_spotter
 from voicemanager.web.account_routes import account_router
 from voicemanager.web.render import STATIC_DIR
 from voicemanager.web.session import SessionCookieMiddleware, SignInRequired
@@ -35,6 +36,13 @@ async def lifespan(app: FastAPI):
         settings.stt_engine,
         settings.tts_engine,
     )
+    # The wake spotter first: it is small, and a bad wake setting then stops the
+    # server before a large model is loaded or a sidecar is started.
+    try:
+        app.state.wake_spotter = load_wake_spotter(settings)
+    except Exception as e:
+        logger.error("Wake engine startup failed - refusing to start: %s", e)
+        raise
     try:
         models = load_models(settings)
     except Exception as e:
@@ -138,6 +146,8 @@ async def lifespan(app: FastAPI):
         tts_models["tts_engine"].dispose()
     if stt_engine_type == "whisper":
         models["executor"].shutdown(wait=True)
+    if app.state.wake_spotter is not None:
+        app.state.wake_spotter.close()
     logger.info("VoiceManager shutting down")
 
 
