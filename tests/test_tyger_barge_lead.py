@@ -1049,6 +1049,133 @@ def test_take_moves_the_break_marks_as_take_marked_does():
     assert rig.marked() == [_s(18048, 20096)]            # so no break is left for later
 
 
+# A barge at the newest mic sample has no audio of its own in the hold. When the next
+# reply is sent before more mic audio comes and plays from that same sample, the audio
+# at the barge's place is that reply's echo and is dropped. The first audio after the
+# reply is then not the barge's: it gets the break of a reply that played, a gap.
+
+def test_a_barge_with_no_audio_of_its_own_gives_a_gap_break_after_the_next_reply():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # at the mic count: none of its audio is in
+    assert rig.marked() == []
+    rig.reply("r2")                          # sent before the next mic frame
+    rig.playback(_start("r2", 18048))        # and it plays from the barge's own sample
+    rig.mic(30000)
+    rig.playback(_stop("r2", 24000))         # to its stop, with no barge
+    assert rig.marked() == [GAP, _s(24000 + TAIL, 30000)]
+    rig.mic(32048)
+    assert rig.marked() == [_s(30000, 32048)]            # and no break after that one
+
+
+def test_take_also_ends_the_wait_of_a_barge_with_no_audio_of_its_own():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)
+    rig.reply("r2")
+    rig.playback(_start("r2", 18048))
+    rig.mic(26240)
+    rig.playback(_stop("r2", 24000))
+    assert rig.hold.take() == []             # only the reply's echo, dropped
+    rig.mic(30000)
+    assert rig.marked() == [GAP, _s(24000 + TAIL, 30000)]
+
+
+def test_a_barge_with_no_audio_of_its_own_yet_keeps_its_break_when_its_audio_comes():
+    # The later reply starts to play past the barge's place, so the audio in between
+    # is the barge's: it is fed with the barge's break, in front of the reply's gap.
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)
+    assert rig.marked() == []
+    rig.reply("r2")
+    rig.mic(30000)
+    rig.playback(_start("r2", 20000))
+    rig.playback(_stop("r2", 24000))
+    assert rig.marked() == [BARGE, _s(18048, 20000), GAP, _s(24000 + TAIL, 30000)]
+
+
+def test_a_later_reply_does_not_take_the_break_of_a_barge_for_no_audio_of_its_own():
+    # The usual barge, its audio and a later reply's echo all let go in one take: the
+    # barge's audio is fed first, so the echo dropped after it leaves its break alone.
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(10000, 15360)
+    rig.reply("r2")                          # holding from 18048
+    rig.mic(30000)
+    rig.playback(_start("r2", 20000))
+    rig.playback(_stop("r2", 24000))
+    assert rig.marked() == [BARGE, _s(10000, 20000), GAP, _s(24000 + TAIL, 30000)]
+
+
+def test_a_second_barge_from_an_earlier_place_keeps_the_break_for_no_audio_of_its_own():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # none of its audio is in, and no taker runs
+    rig.reply("r2")
+    rig.mic(20096)
+    rig.playback(_start("r2", 19000))
+    rig.barge(17000, 20096)                  # on r2, from before the first one's place
+    # r1's echo is dropped up to the first barge's place, past the second one's. That
+    # is no later reply's echo: the first audio of both barges is still to come.
+    assert rig.marked() == [BARGE, _s(18048, 20096)]
+
+
+def _barge_at_the_mic_count_then_a_second_reply(ws, tyger, dispatched, mic: _Mic) -> None:
+    """r1 plays from sample 3000 and a barge comes at the newest mic sample (18048), so
+    the hold has none of the barge's audio. Then r2 is sent with no mic frame in
+    between, and plays from 18048 to 24000 with no barge. The mic ends at 26240."""
+    mic.send(2048)
+    speak(ws, "r1")
+    mic.send(16000)                          # to 18048
+    ws.send_json(_start("r1", 3000))
+    assert errors(barrier(ws)) == []
+    frames = _events(ws, tyger, dispatched,
+                     wire.BargeEvent(onset_mic_sample=18048, mic_sample=18048))
+    assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+    speak(ws, "r2")                          # holding from sample 18048
+    ws.send_json(_start("r2", 18048))
+    mic.send(8 * FRAME)                      # to 26240, under the reply
+    ws.send_json(_stop("r2", 24000))
+    assert errors(barrier(ws)) == []
+
+
+def test_with_no_vad_a_barge_with_no_audio_of_its_own_gives_no_lead_in_after_the_reply(
+        tyger, client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws)
+        stt = made[0]
+        _barge_at_the_mic_count_then_a_second_reply(ws, tyger, dispatched, mic)
+        assert stt.fed == _s(0, 3000)        # all the rest was a reply's echo
+
+        mic.send(4 * FRAME)                  # to 30336
+        assert errors(barrier(ws)) == []
+        # The audio after r2 follows a reply that played, not a barge: no flush, no
+        # lead-in, only the mic audio from the stop plus the tail on.
+        assert ("finalize",) not in stt.events
+        assert _no_lead_in(stt)
+        assert stt.fed == _s(0, 3000) + _s(24000 + TAIL, 30336)
+
+
+def test_under_the_idle_gate_a_barge_with_no_audio_of_its_own_arms_no_lead_in(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(32000)
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        stt = made[0]
+        _barge_at_the_mic_count_then_a_second_reply(ws, tyger, dispatched, mic)
+        assert stt.feeds == []               # quiet so far: all of it is gated
+
+        mic.send(8 * FRAME)                  # to 34432; the words start at 32000
+        assert errors(barrier(ws)) == []
+        # An utterance of its own: no lead-in, and the usual pre-roll, the last 200 ms
+        # the gate kept before the frame the VAD started on (the one from 31360). An
+        # armed lead-in would keep all the audio gated since the stop plus the tail.
+        assert _no_lead_in(stt)
+        assert len(stt.feeds[0]) == PREROLL
+        assert stt.feeds[0] == stream[2 * 31360 - PREROLL:2 * 31360]
+        assert stt.fed == stream[2 * 31360 - PREROLL:2 * 34432]
+
+
 # --- an utterance still open at the barge --------------------------------------------
 #
 # The reply can start while an utterance is still open: the mic hold keeps the audio

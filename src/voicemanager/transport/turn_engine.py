@@ -293,7 +293,11 @@ a turn end) gets the break right in front of it, and:
 * a barge whose audio continues the audio the STT already has gets no break, so
   no flush and no lead-in. That is a user who talks through the start of a reply:
   the onset is before the playback start, the hold dropped nothing, and the speech
-  stays one utterance.
+  stays one utterance;
+* a barge with no audio of its own gets no break either. That is a barge at the
+  newest mic sample, followed by a reply that is sent before the next mic frame and
+  plays from that sample: the audio at the barge's place is dropped as that reply's
+  echo, and the audio after the reply gets a ``GAP``.
 
 A listening boundary and the loss of the sidecar leave no barge mark behind.
 
@@ -909,9 +913,12 @@ class MicHold:
         Call it in the same step that sets ``barge_at`` on the replies. The next
         audio ``take_marked`` gives from there on is the barge's, and gets a BARGE
         break when it does not continue the audio fed before it."""
-        # Two barges with none of their audio given out yet: the earlier place holds
-        # the first audio of both.
-        if self._barge_from is None or feed_from < self._barge_from:
+        # A barge still marked has none of its audio given out yet, and every reply
+        # sent by then stops holding at its place: the first audio of both barges
+        # comes from there, also when the new one's place is earlier. So the mark
+        # stays where it is, and the echo dropped up to it does not count as audio
+        # dropped at or after a marked place (see ``_dropping``).
+        if self._barge_from is None:
             self._barge_from = feed_from
 
     def take_marked(self) -> list[bytes | StreamBreak]:
@@ -922,7 +929,9 @@ class MicHold:
         (the hold dropped audio in between): BARGE for the first such chunk from a
         marked barge on, else GAP. So audio the hold lets go from before a barge's
         onset comes before the BARGE break, and a barge whose audio continues the
-        audio fed before it gets no break at all."""
+        audio fed before it gets no break at all. A barge loses its mark when audio
+        from its place on is dropped before any is fed: the next audio is then not
+        the barge's, and its break is a GAP."""
         rules = self._rules(self._feed.mic_samples)
         out: list[bytes | StreamBreak] = []
         while self._runs:
@@ -938,12 +947,31 @@ class MicHold:
             else:
                 chunk = run.pcm[:2 * cut]
                 self._runs[0] = _Held(start=run.start + cut, pcm=run.pcm[2 * cut:], raw=None)
+            count = min(cut, n)
             if kind == _FEED:
-                mark = self._feeding(run.start, min(cut, n))
+                mark = self._feeding(run.start, count)
                 if mark is not None:
                     out.append(mark)
                 out.append(chunk)
+            else:
+                self._dropping(run.start, count)
         return out
+
+    def _dropping(self, start: int, count: int) -> None:
+        """``count`` samples from mic sample ``start`` are dropped now.
+
+        When any of them is at or after the place of a marked barge, a later reply
+        played there before the barge got any audio of its own (the barge was at the
+        newest mic sample, and the reply was sent before the next mic frame). The
+        audio after that reply is not the barge's, so the mark goes and that audio
+        gets a GAP. This cannot take the mark of a barge that has audio: a reply
+        sent by the barge stops holding at the barge's place, so what it drops ends
+        there, and a reply sent after the barge drops its echo only behind the
+        audio between the barge's place and its playback start, which is fed first
+        and takes the BARGE break."""
+        if (self._barge_from is not None and count > 0
+                and start + count > self._barge_from):
+            self._barge_from = None
 
     def _feeding(self, start: int, count: int) -> StreamBreak | None:
         """``count`` samples from mic sample ``start`` go to the STT now: the break
