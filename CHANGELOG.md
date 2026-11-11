@@ -15,8 +15,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before the reply, and a client with an echo canceller sends digital silence
   while the reply plays. At a barge the server now drops that pre-roll and feeds
   the decoder a lead-in of low white noise (about -61 dBFS), then the mic audio
-  from the barge onset. No frame and no field changes, and the client gets no
-  part of the noise. The STT language has an effect too: set
+  from the barge onset. No frame and no field is new, and the client gets no
+  part of the noise. A client can see two things in its transcription frames. A
+  barge is now an utterance boundary for the STT: speech from before the reply
+  that the decoder had not flushed gets its own final, on its own
+  `segment_index`, before the frames of the barge audio (before, the barge audio
+  went on in the same segment). And a barge whose audio continues what the STT
+  already has (the user talks through the start of a reply) gets no flush and
+  no lead-in: that speech stays one utterance. The STT language has an effect
+  too: set
   `VM_AUDIOCPP_REQUEST_OPTIONS=language=en-US` (or the code of your language)
   when all users of the server speak one language. On 8 captured barges of one
   session (one speaker, one browser microphone), replayed through the STT
@@ -29,6 +36,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Setting `VM_TYGER_BARGE_LEAD_MS` (600). The length in ms of the noise lead-in
   that the STT decoder gets in front of a barge's audio. 0 turns the lead-in
   off.
+- Manual script `scripts/barge_capture_replay.py`. It replays a directory of
+  barge captures (see `VM_TYGER_BARGE_CAPTURE_DIR` below) through the STT
+  sidecar, with and without the lead-in, and prints the final text of each
+  capture. It needs the GPU and is not part of the automated suite.
 - Setting `VM_LOG_LEVEL` (`INFO`): `DEBUG`, `INFO`, `WARNING` or `ERROR`. It sets
   the level of the `voicemanager` loggers and of the Tyger sidecar's log. `DEBUG`
   adds the per-frame and per-event lines (playback frames, turn engine events,

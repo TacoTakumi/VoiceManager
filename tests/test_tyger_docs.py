@@ -265,3 +265,14 @@ def test_the_newest_changelog_section_records_the_lead_in():
     newest = _newest_release_section()
     assert LEAD_SETTING in newest
     assert LANGUAGE_OPTION in newest
+
+
+def test_the_release_text_says_what_a_client_can_see_at_a_barge():
+    # A barge is an utterance boundary for the STT, and one kind of barge gets no
+    # lead-in: both show in a client's transcription frames.
+    for text in (_newest_release_section(), section(README, "### Tyger")):
+        assert "utterance boundary" in text
+        assert "`segment_index`" in text
+        assert "continues" in text and "no lead-in" in text
+    assert "scripts/barge_capture_replay.py" in _newest_release_section()
+
