@@ -41,6 +41,10 @@ _TURN_ENGINE_REFUSALS = ("invalid_request", "turn_engine_unavailable",
 # The error_type the server sends once when the turn engine's process exits; the
 # session then goes on as one that never opted in.
 _TURN_ENGINE_LOST = "turn_engine_lost"
+# How the message of the server's invalid_request error frame starts when it refuses
+# a wake_word opt-in. The refusal has no error_type of its own, so the message tells
+# it from the other invalid_request frames.
+_WAKE_REFUSAL = "wake_word refused"
 
 
 def _wav_payload_offset(data: bytes) -> int | None:
@@ -104,6 +108,20 @@ class TurnEngineError(VoiceManagerError):
     ``error_type`` is the server's error_type when it refused the opt-in (for
     example ``turn_engine_unavailable``), and None when no answer came (a timeout or
     a lost connection).
+    """
+
+    def __init__(self, message: str, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
+
+class WakeWordError(VoiceManagerError):
+    """Raised when a wake_word opt-in fails.
+
+    ``error_type`` is the server's error_type when it refused the opt-in
+    (``invalid_request``: no wake engine on the server, or a phrase list it cannot
+    use), and None when no answer came (a timeout, for example from a server older
+    than 0.9.0, or a lost connection).
     """
 
     def __init__(self, message: str, error_type: str | None = None) -> None:
@@ -219,6 +237,15 @@ class DuplexSession:
     A connection starts listening, and so does the new connection of a reconnect.
     ``close()`` on a stopped session sends listen_start, so the connection listens
     again for the one-sided methods and the next session.
+
+    Wake word: ``await session.enable_wake_word()`` asks the server to listen for a
+    wake phrase (its default list, or the list passed in), for a consumer with no
+    keyword spotter of its own. The session is then dormant: stopped, but
+    ``send_audio`` keeps sending for the server's spotter, and nothing is
+    transcribed. When the server hears a phrase the session listens and ``wakes()``
+    yields the wake frame. ``listen_stop`` makes it dormant again, ``listen_start``
+    wakes it by hand, and ``dormant`` tells whether it waits for a phrase. A
+    reconnect starts a new connection that has not opted in.
     """
 
     def __init__(self, client: "VoiceManagerClient") -> None:
@@ -265,12 +292,21 @@ class DuplexSession:
 
         While the session is stopped (see ``listen_stop``) the frame is dropped
         here: it is not sent and not counted in ``mic_sample``, as the server
-        would not count it either.
+        would not count it either. A session that opted in to the wake word (see
+        ``enable_wake_word``) is dormant while stopped: the frame is sent, for the
+        server's spotter, and still not counted in ``mic_sample``.
         """
-        if self._client._listen_stopped:
+        client = self._client
+        if client._listen_stopped:
+            if client._wake_phrases is None:
+                return
+            # Dormant: the server gives the frame to its wake word spotter and
+            # counts it as dormant audio, not as mic audio.
+            await client._send_or_raise(pcm, STTError)
+            client._dormant_bytes += len(pcm)
             return
-        await self._client._send_or_raise(pcm, STTError)
-        self._client._count_mic(pcm)
+        await client._send_or_raise(pcm, STTError)
+        client._count_mic(pcm)
 
     @property
     def listening(self) -> bool:
@@ -299,6 +335,16 @@ class DuplexSession:
         client = self._client
         if self.closed:
             raise VoiceManagerError("the duplex session is closed")
+        if client._wake_phrases is not None:
+            if client._listen_stopped:
+                # Sent while dormant. If the server hears a phrase before this frame
+                # reaches it, the frame stops a connection that had just woken; the
+                # wake frame's count then tells which of the two came first.
+                client._dormant_stop_marks.append(client._dormant_bytes)
+            else:
+                # The connection becomes dormant: a new count of dormant audio.
+                client._dormant_bytes = 0
+                client._dormant_stop_marks = []
         client._listen_stopped = True
         client._listen_stops_sent += 1
         number = client._listen_stops_sent
@@ -339,6 +385,76 @@ class DuplexSession:
             raise VoiceManagerError("the duplex session is closed")
         client._listen_stopped = False
         await client._send_or_raise(json.dumps({"type": "listen_start"}), VoiceManagerError)
+
+    @property
+    def wake_phrases(self) -> list[str] | None:
+        """The wake phrases this connection listens for, or None with no opt-in."""
+        phrases = self._client._wake_phrases
+        return None if phrases is None else list(phrases)
+
+    @property
+    def dormant(self) -> bool:
+        """True while the session is stopped and the server listens for a wake phrase."""
+        return self._client._listen_stopped and self._client._wake_phrases is not None
+
+    async def enable_wake_word(self, phrases: list[str] | None = None,
+                               timeout: float = 10.0) -> list[str]:
+        """Opt this connection in to the server's wake word and return its phrases.
+
+        Sends the wake_word frame and waits for wake_word_ready. ``phrases`` is the
+        list of wake phrases for this connection, as plain text ("hey hermes"); None
+        takes the server's default list. The returned list is what the server
+        listens for (lowercased, repeats left out).
+
+        The session is dormant from the answer on: ``listening`` is False,
+        ``send_audio`` keeps sending frames for the server's spotter without counting
+        them in ``mic_sample``, and nothing is transcribed. When the server hears a
+        phrase the session listens again and ``wakes()`` yields the wake frame.
+        ``listen_stop`` makes the session dormant again, and ``listen_start`` wakes
+        it by hand. Calling this again replaces the phrases. Wait for the answer
+        before the next ``listen_stop`` or ``listen_start``.
+
+        Raises:
+            VoiceManagerError: The session is closed; nothing is sent.
+            WakeWordError: The server refused the opt-in (``error_type`` holds its
+                error_type), or no answer came within ``timeout`` or before the
+                connection closed (``error_type`` is None). The session is then as
+                it was before the call.
+        """
+        client = self._client
+        if self.closed:
+            raise VoiceManagerError("the duplex session is closed")
+        frame: dict = {"type": "wake_word"}
+        if phrases is not None:
+            frame["phrases"] = list(phrases)
+        waiter = asyncio.get_running_loop().create_future()
+        client._wake_waiter = waiter
+        # What the session was when the frame went out. The server handles frames in
+        # order, so the audio sent after this point is dormant audio once it accepts.
+        client._wake_sent = (client._listen_stopped, client._wake_phrases is not None,
+                             client._mic_bytes, client._mic_frames, client._dormant_bytes)
+        try:
+            await client._send_or_raise(json.dumps(frame), WakeWordError)
+            try:
+                async with asyncio.timeout(timeout):
+                    return await waiter
+            except TimeoutError:
+                raise WakeWordError(
+                    "Timed out waiting for wake_word_ready (a server older than 0.9.0 "
+                    "does not answer)") from None
+        finally:
+            if client._wake_waiter is waiter:
+                client._wake_waiter = None
+
+    async def wakes(self) -> AsyncIterator[dict]:
+        """Yield every wake frame as it arrives (opted-in connections only).
+
+        A frame has ``phrase``, the phrase the server heard, and ``mic_sample``, the
+        server's mic sample count at the wake. The session is listening again by the
+        time the frame is yielded.
+        """
+        while (frame := await self._client._wake_queue.get()) is not None:
+            yield frame
 
     @property
     def mic_sample(self) -> int:
@@ -540,6 +656,20 @@ class VoiceManagerClient:
         self._listen_stops_sent: int = 0
         self._listen_acks_seen: int = 0
         self._listen_waiters: dict[int, asyncio.Future] = {}
+        # Wake word state for this connection. _wake_phrases is the list the server
+        # confirmed (None until wake_word_ready); an opted-in connection is dormant
+        # while it is stopped. _wake_sent is what the session was when the pending
+        # opt-in went out, and _wake_waiter the future of the call that waits for
+        # its answer. _dormant_bytes counts the dormant audio sent since the
+        # connection last became dormant, as the server counts it for the wake
+        # frame's dormant_sample; _dormant_stop_marks holds that count at each
+        # listen_stop sent while dormant.
+        self._wake_queue: asyncio.Queue = asyncio.Queue()
+        self._wake_phrases: list[str] | None = None
+        self._wake_sent: tuple | None = None
+        self._wake_waiter: asyncio.Future | None = None
+        self._dormant_bytes: int = 0
+        self._dormant_stop_marks: list[int] = []
 
         self.session_id: str | None = None
         self._audio_format: dict = {}
@@ -667,8 +797,13 @@ class VoiceManagerClient:
         self._error_queue = asyncio.Queue()
         self._turn_queue = asyncio.Queue()
         self._turn_end_queue = asyncio.Queue()
+        self._wake_queue = asyncio.Queue()
         # A fresh connection carries no pending cancellations, has not opted in to
-        # a turn engine, has sent no mic audio, and listens.
+        # a turn engine or the wake word, has sent no mic audio, and listens.
+        self._wake_phrases = None
+        self._wake_sent = None
+        self._dormant_bytes = 0
+        self._dormant_stop_marks = []
         self._cancelled_tts = set()
         self._turn_engine_sent = None
         self.turn_engine = None
@@ -738,12 +873,28 @@ class VoiceManagerClient:
                         self._on_turn_engine_ready(frame)
                     elif ftype == "listen_stopped":
                         self._on_listen_stopped(frame)
+                    elif ftype == "wake_word_ready":
+                        self._on_wake_word_ready(frame)
+                    elif ftype == "wake":
+                        if self._on_wake(frame):
+                            await self._wake_queue.put(frame)
                     elif ftype == "error":
                         error_type = frame.get("error_type", "")
                         if error_type == "timeout_warning":
                             self._logger.warning(
                                 "Server timeout warning: %s", frame.get("message", "")
                             )
+                        if (error_type == "invalid_request" and self._wake_sent is not None
+                                and frame.get("message", "").startswith(_WAKE_REFUSAL)):
+                            # The server's answer to the pending wake_word opt-in: it
+                            # goes to enable_wake_word, not to errors(). The session
+                            # is as it was before the opt-in.
+                            self._wake_sent = None
+                            wake_waiter = self._wake_waiter
+                            if wake_waiter is not None and not wake_waiter.done():
+                                wake_waiter.set_exception(WakeWordError(
+                                    frame.get("message", "") or error_type, error_type))
+                            continue
                         waiter = self._turn_engine_waiter
                         if (error_type in _TURN_ENGINE_REFUSALS and waiter is not None
                                 and not waiter.done()):
@@ -771,6 +922,11 @@ class VoiceManagerClient:
             for listen_waiter in self._listen_waiters.values():
                 if not listen_waiter.done():
                     listen_waiter.set_result(None)
+            wake_waiter = self._wake_waiter
+            if wake_waiter is not None and not wake_waiter.done():
+                wake_waiter.set_exception(
+                    WakeWordError("Connection lost waiting for wake_word_ready"))
+            await self._wake_queue.put(None)
             await self._stt_queue.put(None)
             await self._tts_queue.put(None)
             await self._turn_queue.put(None)
@@ -799,6 +955,77 @@ class VoiceManagerClient:
             self._logger.debug("Ignoring a listen_stopped that answers no waiting call")
             return
         waiter.set_result(frame.get("mic_sample"))
+
+    def _on_wake_word_ready(self, frame: dict) -> None:
+        """Make the connection dormant as the server did, and answer a pending opt-in.
+
+        The server made the connection dormant when it handled the wake_word frame,
+        so every frame sent after that frame was dormant audio. What that audio was
+        counted as here depends on what the session was when the frame went out.
+        """
+        sent = self._wake_sent
+        if sent is None:
+            self._logger.debug("Ignoring a wake_word_ready that answers no opt-in")
+            return
+        self._wake_sent = None
+        was_stopped, was_opted_in, mic_bytes, mic_frames, dormant_bytes = sent
+        if not was_stopped:
+            # Listening: the audio sent since then was counted as mic audio.
+            self._dormant_bytes = self._mic_bytes - mic_bytes
+            self._mic_bytes, self._mic_frames = mic_bytes, mic_frames
+            self._dormant_stop_marks = []
+        elif was_opted_in:
+            # Dormant already: the server started a new count of dormant audio.
+            self._dormant_bytes -= dormant_bytes
+            self._dormant_stop_marks = [
+                mark - dormant_bytes for mark in self._dormant_stop_marks
+                if mark >= dormant_bytes]
+        else:
+            # Stopped with no opt-in: its audio was dropped here and never sent.
+            self._dormant_bytes = 0
+            self._dormant_stop_marks = []
+        self._listen_stopped = True
+        # A ready that lands after the opt-in timed out still means the server
+        # opted the connection in.
+        self._wake_phrases = list(frame.get("phrases") or [])
+        waiter = self._wake_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(list(self._wake_phrases))
+
+    def _on_wake(self, frame: dict) -> bool:
+        """Follow the server's wake; True when the frame is one for the application.
+
+        The server took ``dormant_sample`` samples as dormant audio in this dormant
+        period; the audio sent after them reached a connection that was listening,
+        and the server counted it as mic audio, so it is counted here too.
+
+        A listen_stop that was sent while dormant, and that reached the server after
+        it heard the phrase, stopped the connection again right away. The server
+        counted the audio between the two as mic audio and then became dormant on a
+        new count. The session stays stopped then and the wake is not reported.
+        """
+        if self._wake_phrases is None:
+            self._logger.debug("Ignoring a wake frame on a connection with no opt-in")
+            return False
+        taken = 2 * int(frame.get("dormant_sample") or 0)
+        crossed = [mark for mark in self._dormant_stop_marks if mark >= taken]
+        if crossed:
+            mark = min(crossed)
+            self._add_mic(mark - taken)
+            self._dormant_bytes -= mark
+            self._dormant_stop_marks = [m - mark for m in self._dormant_stop_marks if m > mark]
+            return False
+        self._add_mic(self._dormant_bytes - taken)
+        self._dormant_bytes = taken
+        self._dormant_stop_marks = []
+        self._listen_stopped = False
+        return True
+
+    def _add_mic(self, count: int) -> None:
+        """Count ``count`` bytes of sent audio as mic audio the server accepted."""
+        if count > 0:
+            self._mic_bytes += count
+            self._mic_frames += 1
 
     # ------------------------------------------------------------------
     # Full duplex
