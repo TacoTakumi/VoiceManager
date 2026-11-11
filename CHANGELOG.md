@@ -4,6 +4,31 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0]
+
+### Added
+
+- Server-side wake word, for a client that has no keyword spotter of its own. The
+  client sends a `wake_word` frame, with an optional list of phrases, and the
+  server answers `wake_word_ready`. The connection is then dormant: the client
+  keeps streaming its mic, and the audio goes only to a keyword spotter, not to
+  the STT or the turn engine. When the spotter hears a phrase the server sends a
+  `wake` frame and listens. A `listen_stop` makes the connection dormant again,
+  and a `listen_start` wakes it by hand. A phrase is plain text ("hey computer",
+  "hey hermes") and needs no training, so each deployment and each connection can
+  have its own. The engine is the sherpa-onnx keyword spotter, on the CPU. It is
+  off by default: set `VM_WAKE_ENGINE=sherpa`, install `requirements-wake.txt` and
+  run `python setup_models.py wake`. The new settings are `VM_WAKE_ENGINE`,
+  `VM_WAKE_MODEL_DIR`, `VM_WAKE_PHRASES`, `VM_WAKE_THRESHOLD` and `VM_WAKE_SCORE`.
+  A client that does not send `wake_word` sees no change. See
+  [Server-side wake word](docs/client-integration.md#server-side-wake-word).
+- Python client: `DuplexSession.enable_wake_word()` does the opt-in,
+  `DuplexSession.wakes()` yields the `wake` frames, and `dormant` and
+  `wake_phrases` tell the state. A dormant session's `send_audio` keeps sending
+  for the server's spotter and does not count that audio in `mic_sample`.
+- `scripts/wake_probe.py` runs WAV files through the server's wake spotter with
+  the real model, to try a phrase or a threshold with no server running.
+
 ## [0.8.4]
 
 ### Fixed

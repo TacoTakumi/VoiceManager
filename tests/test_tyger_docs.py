@@ -226,9 +226,9 @@ LEAD_SETTING = "VM_TYGER_BARGE_LEAD_MS"
 LANGUAGE_OPTION = "language=en-US"
 
 
-def _newest_release_section() -> str:
-    """The first '## [' section of the CHANGELOG: the release in preparation."""
-    return "## [" + re.split(r"^## \[", CHANGELOG, flags=re.M)[1]
+def _lead_in_release_section() -> str:
+    """The CHANGELOG section of 0.8.4, the release that added the barge lead-in."""
+    return section(CHANGELOG, "## [0.8.4]")
 
 
 def test_the_guide_has_the_barge_lead_in_in_its_settings_table():
@@ -261,18 +261,18 @@ def test_env_example_shows_the_stt_language_as_a_commented_example():
     assert f"# {LEAD_SETTING}=600" in lines
 
 
-def test_the_newest_changelog_section_records_the_lead_in():
-    newest = _newest_release_section()
-    assert LEAD_SETTING in newest
-    assert LANGUAGE_OPTION in newest
+def test_the_changelog_records_the_lead_in_under_its_release():
+    release = _lead_in_release_section()
+    assert LEAD_SETTING in release
+    assert LANGUAGE_OPTION in release
 
 
 def test_the_release_text_says_what_a_client_can_see_at_a_barge():
     # A barge is an utterance boundary for the STT, and one kind of barge gets no
     # lead-in: both show in a client's transcription frames.
-    for text in (_newest_release_section(), section(README, "### Tyger")):
+    for text in (_lead_in_release_section(), section(README, "### Tyger")):
         assert "utterance boundary" in text
         assert "`segment_index`" in text
         assert "continues" in text and "no lead-in" in text
-    assert "scripts/barge_capture_replay.py" in _newest_release_section()
+    assert "scripts/barge_capture_replay.py" in _lead_in_release_section()
 

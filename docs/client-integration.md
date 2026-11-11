@@ -18,6 +18,7 @@ implementation of it. Every symbol named here exists in current source - see
 - [Turn-taking protocol surface](#turn-taking-protocol-surface)
 - [Turn engine](#turn-engine)
 - [Listening boundary: stop and start listening on one connection](#listening-boundary-stop-and-start-listening-on-one-connection)
+- [Server-side wake word](#server-side-wake-word)
 - [WebSocket message-schema reference](#websocket-message-schema-reference)
 - [Client method reference](#client-method-reference)
   - [Full duplex: `duplex()`](#full-duplex-duplex)
@@ -1176,6 +1177,78 @@ The `playback` `stop` goes first because a `playback` frame sent while stopped i
 
 A stopped connection is exempt from `VM_SESSION_TIMEOUT`: it gets no `timeout_warning` and no `1001` close, however long it stays stopped. After `listen_start` the inactivity timer runs again from that frame. The `VM_TTS_STREAM_FLUSH_TIMEOUT` idle flush of an open `tts_stream` request still runs while stopped.
 
+## Server-side wake word
+
+A client that has no keyword spotter of its own can ask the server to listen for a wake phrase. The client streams its mic all the time. The server keeps the connection dormant, with the audio going only to a keyword spotter, until it hears one of the connection's phrases. Then it tells the client and starts to listen. Three frame types are added to `MessageType`: `wake_word` goes from client to server, `wake_word_ready` and `wake` go from server to client. Their fields and examples are in the [message-schema reference](#websocket-message-schema-reference): [`wake_word`](#wake_word---wakewordmessage), [`wake_word_ready`](#wake_word_ready---wakewordreadymessage) and [`wake`](#wake---wakemessage). The models are in `protocol.py`.
+
+The wake word is opt-in for the server and for the connection. The server has a wake engine only with `VM_WAKE_ENGINE=sherpa` (see [Configuration](#configuration)); the default is `none`. A client that never sends `wake_word` sees no change and none of these frames. A client with its own on-device spotter does not need this: it uses the [listening boundary](#listening-boundary-stop-and-start-listening-on-one-connection) alone and sends no audio while it waits. The Python client does the opt-in with `DuplexSession.enable_wake_word()` and gives the wake frames from `DuplexSession.wakes()`.
+
+```text
+client -> { "type": "wake_word", "phrases": ["hey hermes"] }
+                                 server -> { "type": "wake_word_ready", "phrases": ["hey hermes"] }
+client -> binary mic PCM ...     (dormant: to the spotter only, nothing comes back)
+client -> binary mic PCM ...     (the user says "hey hermes")
+                                 server -> { "type": "wake", "phrase": "hey hermes", "mic_sample": 0, "dormant_sample": 482560 }
+client -> binary mic PCM ...     (listening: transcription frames as usual)
+client -> { "type": "listen_stop" }                         (the conversation ended)
+                                 server -> { "type": "listen_stopped", "mic_sample": 96000 }
+client -> binary mic PCM ...     (dormant again)
+```
+
+### The dormant state
+
+Dormant is the stopped state of the listening boundary on a connection that opted in. Everything the listening boundary says about a stopped connection holds, with one difference: a stopped mic frame is not dropped, it goes to the connection's spotter.
+
+- `wake_word` makes the connection dormant. If the connection was listening, the server cuts the transcription at that point exactly as it does [at `listen_stop`](#what-the-server-does-at-listen_stop), and then answers `wake_word_ready`.
+- While dormant, binary mic frames go to the spotter and to nothing else. They are not sent to the STT or the turn engine, not counted in `mic_sample`, and not checked as the first audio frame, so a `turn_engine` opt-in still succeeds after them. No transcription frame is made from dormant audio.
+- Dormant audio is the same format as mic audio: 16 kHz mono 16-bit PCM. It is not validated, so send raw PCM and no WAV header.
+- When the spotter hears a phrase, the server sends one `wake` frame and listens, as for a `listen_start`. The mic frames after the one the phrase was heard in go to the STT. The audio of the phrase itself is not transcribed.
+- `listen_stop` makes an awake connection dormant again. It gets its `listen_stopped` answer as usual, and the spotter starts on a new stream that has heard nothing of the conversation.
+- `listen_start` wakes a dormant connection by hand, for example from a button. The server sends no `wake` frame for it. The connection stays opted in.
+- A second `wake_word` replaces the phrases and makes the connection dormant again.
+- A dormant connection is exempt from `VM_SESSION_TIMEOUT`, as a stopped one is. The inactivity timer runs again from the wake.
+- TTS is not affected. A reply can play while the connection is dormant.
+
+### The phrases
+
+A phrase is plain text, for example `hey computer` or `hey hermes`. No model is trained for it: the server cuts the text into the tokens of its spotter model. So a deployment, and each connection, can choose its own phrases.
+
+- With no `phrases` (or `null`) the connection gets the server's default list, `VM_WAKE_PHRASES`.
+- With `phrases` the connection gets that list and no other. It applies to that connection only.
+- The server lowercases each phrase, makes each run of white space one space and leaves out a repeated phrase. `wake_word_ready` has the list in that form, and the `phrase` of a `wake` frame is one of its entries.
+- A phrase can have letters, spaces and apostrophes. A list can have 1 to 8 phrases, each of 64 characters or less.
+- The model is English. A phrase of two words ("hey computer") is heard more reliably than one word, mostly because the first word after a silence can be missed.
+- One threshold and one boost apply to all phrases: `VM_WAKE_THRESHOLD` and `VM_WAKE_SCORE` on the server. A client cannot set them.
+
+### A refused `wake_word`
+
+A `wake_word` frame the server cannot use gets one `error` frame with `error_type` `invalid_request` and changes nothing: a connection that was listening keeps listening, and a dormant one keeps its phrases. The `message` starts with `wake_word refused`, which tells this refusal from other `invalid_request` frames. The causes are:
+
+- The server has no wake engine (`VM_WAKE_ENGINE=none`).
+- `phrases` is not a list of strings.
+- The list is empty, has an empty phrase, has more than 8 phrases, or has a phrase that is too long or has a character that is not a letter, a space or an apostrophe.
+- The spotter model has no tokens for a phrase.
+
+```json
+{ "type": "error", "error_type": "invalid_request", "message": "wake_word refused: the phrase list is empty; the frame was dropped." }
+```
+
+A server older than 0.9.0 drops the frame with no answer, as it drops any unknown frame type. A client that gets no `wake_word_ready` must not treat the connection as dormant.
+
+### The counts in the `wake` frame
+
+`mic_sample` is the number of mic samples the server accepted on the connection at the wake. Dormant audio is not in it, so it is the same number as in the last `listen_stopped`, or 0 on a connection that was dormant from the start.
+
+`dormant_sample` is the number of samples of dormant audio the server gave the spotter since the connection last became dormant, up to and including the frame the phrase was heard in. The count starts at 0 at each `wake_word` and at each `listen_stop` that stops a listening connection. It does not start again at a `listen_stop` on a connection that is dormant already.
+
+A client keeps sending audio while the `wake` frame is on its way. The server took the first `dormant_sample` samples of the dormant period as dormant audio and counted everything after them as mic audio. A client that keeps its own mic count, for the `mic_sample` of its [`playback` frames](#turn-engine-frames), must do the same: when it reads the `wake` frame, it adds the samples it sent in this dormant period beyond `dormant_sample` to its count. A client that does not report playback can ignore the field.
+
+### What to expect from the spotter
+
+The engine is the sherpa-onnx keyword spotter with its English model of 3.3 million parameters. It runs on the CPU, and one core serves about 20 dormant connections. On synthesized speech with no room noise, "hey computer" and "hey hermes" after a pause were heard in 95% of trials at a normal speech level and in 82 to 90% at a very low level (-45 dBFS), and no phrase gave a false wake in 5.4 hours of read speech. Real rooms give lower recall and more false wakes; these numbers are not a measurement of them. The `wake` frame comes a few tenths of a second after the end of the phrase.
+
+The server sends room audio to no other component while the connection is dormant, and it keeps none of it.
+
 ## WebSocket message-schema reference
 
 All WebSocket **text** frames are JSON objects with a `type` field that routes
@@ -1193,6 +1266,9 @@ and `turn_end`) are documented with their fields and examples in
 The listen frames (`listen_stop`, `listen_start` and `listen_stopped`) are listed
 below with their neighbours; what they do is in
 [Listening boundary](#listening-boundary-stop-and-start-listening-on-one-connection).
+
+The wake word frames (`wake_word`, `wake_word_ready` and `wake`) are listed below
+too; what they do is in [Server-side wake word](#server-side-wake-word).
 
 `MessageType` also declares `audio_chunk`, which is **reserved and currently
 unused**: no frame of that type is ever sent in either direction. STT input and
@@ -1284,6 +1360,37 @@ The server's answer to every `listen_stop`, sent while it handles that frame. Se
 { "type": "listen_stopped", "mic_sample": 482560 }
 ```
 
+#### `wake_word_ready` - `WakeWordReadyMessage`
+
+The answer to a `wake_word` the server accepted. The connection is dormant from
+this frame on. See [Server-side wake word](#server-side-wake-word).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"wake_word_ready"` | Frame discriminator. |
+| `phrases` | array of strings | *(required)* | The phrases the connection's spotter listens for: the list of the `wake_word` frame, or the server's default list, lowercased and with repeats left out. |
+
+```json
+{ "type": "wake_word_ready", "phrases": ["hey computer"] }
+```
+
+#### `wake` - `WakeMessage`
+
+Sent when the server hears a wake phrase on a dormant connection. The connection
+listens from this frame on. Sent only to a connection that opted in with
+`wake_word`. Both counts are strict integers of 0 or more.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"wake"` | Frame discriminator. |
+| `phrase` | string | *(required)* | The phrase that was heard, one of the `phrases` of `wake_word_ready`. |
+| `mic_sample` | integer | *(required)* | Mic samples the server accepted on the connection at the wake. Dormant audio is not counted in it. |
+| `dormant_sample` | integer | *(required)* | Samples of dormant audio the server gave the spotter since the connection last became dormant, up to and including the frame the phrase was heard in. Audio the client sent after them was counted as mic audio. |
+
+```json
+{ "type": "wake", "phrase": "hey computer", "mic_sample": 0, "dormant_sample": 482560 }
+```
+
 #### `error` - `ErrorMessage`
 
 Sent before the server closes on a protocol violation, and for non-fatal notices
@@ -1371,6 +1478,26 @@ other fields; extra fields are ignored.
 { "type": "listen_start" }
 ```
 
+#### `wake_word` - `WakeWordMessage`
+
+Ask the server to listen for a wake phrase on this connection. The server answers
+`wake_word_ready` and the connection is dormant, or it answers an
+`invalid_request` error frame and nothing changes. See
+[Server-side wake word](#server-side-wake-word).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"wake_word"` | Frame discriminator. |
+| `phrases` | array of strings or null | `null` | The wake phrases for this connection, as plain text: 1 to 8 phrases of letters, spaces and apostrophes. Left out or `null`, the connection gets the server's default list (`VM_WAKE_PHRASES`). |
+
+```json
+{ "type": "wake_word" }
+```
+
+```json
+{ "type": "wake_word", "phrases": ["hey hermes", "hey computer"] }
+```
+
 ### Binary frames
 
 Audio never travels as a JSON frame. In both directions it is sent as raw binary
@@ -1455,6 +1582,10 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `DuplexSession.listen_stop` | `(timeout=5.0)` | `int \| None` | Stop listening: the session stops first, so `send_audio` drops frames from then on, then it sends `listen_stop` and returns the `mic_sample` of `listen_stopped`. Logs a warning when that count differs from `mic_sample`. Returns `None`, still stopped, when no answer comes within `timeout` (a server older than 0.8.0) or the connection closes. Sends the frame again when already stopped. |
 | `DuplexSession.listen_start` | `()` | `None` | Send `listen_start` and listen again; returns at once (the server sends no answer). Sends the frame again when already listening. |
 | `DuplexSession.listening` | property | `bool` | `False` between a `listen_stop` and the next `listen_start`. While stopped, `send_audio` sends and counts nothing, so `mic_sample` keeps matching the server's count. A reconnect starts listening, and so does `close()`. |
+| `DuplexSession.enable_wake_word` | `(phrases=None, timeout=10.0)` | `list[str]` | Send the `wake_word` opt-in, with the phrase list or with none for the server's default, and wait for `wake_word_ready`; returns the phrases the server listens for. The session is then dormant. Raises `WakeWordError` (its `error_type` is the server's, or `None` on a timeout, for example from a server older than 0.9.0) and leaves the session as it was. |
+| `DuplexSession.wakes` | `()` | `AsyncIterator[dict]` | Yield each `wake` frame of an opted-in connection. The session listens again by the time the frame is yielded. |
+| `DuplexSession.dormant` | property | `bool` | `True` while the session is stopped and the server listens for a wake phrase. A dormant session's `send_audio` sends its frames, for the server's spotter, and does not count them in `mic_sample`. At a wake the session adds the audio it sent beyond the frame's `dormant_sample` to `mic_sample`, as the server counted it. |
+| `DuplexSession.wake_phrases` | property | `list[str] \| None` | The phrases the connection listens for, or `None` with no opt-in. A reconnect starts a connection with no opt-in. |
 | `DuplexSession.close` | `()` | `None` | End the session; the one-sided methods work again. Closing a stopped session sends `listen_start`, so `stream_stt`, `stream_stt_live` and the next session listen and count as the server does; closing a listening session sends nothing. If the connection is already gone nothing is sent or raised (the reconnect listens). A second `close()` does nothing. |
 
 On an opted-in connection, `DuplexSession.audio` also yields `("barge", frame)`,
@@ -1617,6 +1748,10 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_TYGER_BARGE_LEAD_MS` | `600` | Turn engine: at a barge the STT decoder first gets this many ms of low white noise (about -61 dBFS), then the mic audio from the barge onset. Without it the decoder gives no text for some short answers spoken over a reply. The client gets no part of the noise. `0` is off. See [The mic hold](#the-mic-hold). |
 | `VM_TYGER_BARGE_CAPTURE_DIR` | (empty) | Debug. A directory: each barge the server acts on writes the mic audio around it there, as a WAV and a JSON note, to measure what the STT got after the barge. The files hold the user's voice. Empty is off. |
 | `VM_TYGER_SILENCE_FALLBACK_MS` | `1200` | Turn engine: this many ms of silence after speech end the turn with `by: "silence"` when the model has not ended it. |
+| `VM_WAKE_ENGINE` | `none` | `sherpa` loads the keyword spotter, and a connection may then [opt in to the wake word](#server-side-wake-word); with `none` every `wake_word` frame gets `invalid_request`. It needs the packages of `requirements-wake.txt` and the model in `VM_WAKE_MODEL_DIR`, which `python setup_models.py wake` downloads. |
+| `VM_WAKE_PHRASES` | `hey computer` | Wake word: the phrases a connection gets when its `wake_word` frame names none, separated by commas. |
+| `VM_WAKE_THRESHOLD` | `0.15` | Wake word: how sure the spotter must be before it reports a phrase, above 0 and up to 1. A higher value gives fewer false wakes and more missed phrases; at 0.5 many phrases are missed. |
+| `VM_WAKE_SCORE` | `1.5` | Wake word: how much the spotter's decoder is pushed toward the words of a phrase. A higher value gives fewer missed phrases and more false wakes. |
 
 The server has many more `VM_` variables for model selection and tuning
 (Whisper, Qwen, Nemotron, OpenVoice, and VibeVoice parameters). Those are

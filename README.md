@@ -13,6 +13,7 @@ VoiceManager is made for voice agents that talk with a person in real time. One 
 - **Barge-in.** `tts_cancel` stops a reply at once. The server sends one `audio_end` with `reason: "cancelled"` and no more audio for that request, so the agent can stop talking when the person starts.
 - **Turns.** `turn_start` opens a new turn, and each transcript carries the `turn_id` of the audio it came from. A client can then drop late transcripts that belong to a turn it already ended.
 - **Turn engine.** With `VM_TURN_ENGINE=tyger`, a client can opt in to a turn-taking model that hears the mic and the reply as it plays. The server then sends `turn_end` when the user's turn ended and `barge` when the user cut in over the reply, which it stops itself (`audio_end` reason `interrupted`). See [Tyger](#tyger).
+- **Wake word.** With `VM_WAKE_ENGINE=sherpa`, a client with no keyword spotter of its own can opt in to a wake word that the server detects. The connection stays dormant until the server hears one of its phrases, then the server sends `wake` and listens. A phrase is plain text and needs no training. See [Server-side wake word](#server-side-wake-word).
 - **Flush.** A `tts_stream` frame with `flush: true` speaks the buffered text now and keeps the request open for more text.
 - **Clause mode.** A client that streams a few words at a time can set `chunking: "clause"` on the first `tts_stream` frame. The server then holds the text and cuts pieces by clause marks, word counts and how much audio is still unplayed, so the speech is smoother. The default is `"sentence"`. `flush` and `done` keep their meaning. Six settings tune it: `VM_TTS_CLAUSE_FIRST_WORDS` (3), `VM_TTS_CLAUSE_FIRST_DEADLINE_MS` (300), `VM_TTS_CLAUSE_LATER_WORDS` (12), `VM_TTS_CLAUSE_MARGIN_MS` (1000), `VM_TTS_CLAUSE_MARK_MIN_WORDS` (3) and `VM_TTS_CLAUSE_WORD_GRACE_MS` (250). See [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause).
 
@@ -86,6 +87,7 @@ cp .env.example .env
 | `requirements-vibevoice.txt` | `vibevoice` | VibeVoice from GitHub and diffusers. |
 | `requirements-nemotron.txt` | `nemotron` | NeMo from a pinned git commit. Large. |
 | `requirements-qwen.txt` | `qwen` | qwen-asr and vLLM. Large. |
+| `requirements-wake.txt` | wake word (`VM_WAKE_ENGINE=sherpa`) | sherpa-onnx and sentencepiece. Small, CPU only. |
 
 `python setup_models.py` checks the engines you configure or name. If their packages are missing, it asks before it installs the file.
 
@@ -242,6 +244,24 @@ Short answers over a reply. When all users of the server speak one language, set
 Experimental: barge-in on speakers. On speakers Tyger may not hear a barge in the middle of a long reply, because the reply's echo is in the mic with the user. `VM_TYGER_PREFILTER=voxlock` puts a target-speaker filter (VoxLock, https://huggingface.co/arbazsiddiqui/voxlock) in the sidecar: each connection first calibrates its voice gate, then learns the user's voice from its first 3 s of speech above that gate while no reply plays (until then no barge fires), and from then on, while a reply plays, Tyger hears only that voice, with noise at `VM_TYGER_PREFILTER_FLOOR_DB` (default -52 dBFS) and no reply channel. It needs `onnxruntime-gpu` with its CUDA libraries in `venv-tyger` (it is in `requirements-tyger.txt`) and its models: run `python setup_models.py tyger` again with the setting on. It runs on the sidecar's GPU only, never on the CPU, and adds about 0.5 GiB. Nothing changes for clients. See [Barge-in on speakers](docs/client-integration.md#barge-in-on-speakers-the-experimental-pre-filter).
 
 Licences. The bundle is under the OpenMDW License Agreement, version 1.1 (OpenMDW-1.1), and has two parts. The Tyger turn-taker (the `turn_taker.*` tensors) and Tyger's configuration and documentation are NineNineSix's, under OpenMDW-1.1. The ASR encoder is NVIDIA's Nemotron 3.5 ASR Streaming 0.6B (the `nemotron.*` tensors and the files in `nemotron/`), unchanged, under NVIDIA's own licence grant for it, also OpenMDW-1.1 (https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b). `setup_models.py` fetches only the files the sidecar loads, so read `LICENSE.md`, `NOTICE.md` and `licenses/OpenMDW-1.1.txt` on the model page before you use or share the weights. The turn rules in `src/voicemanager/pipeline/tyger/` (`rules.py` and parts of `scorer.py`) are adapted from tyger-s2s (https://github.com/nineninesix-ai/tyger-s2s), which is under the Apache License 2.0 (Apache-2.0); its `LICENSE` and a `NOTICE` that names the source files and the changes are next to that code.
+
+### Server-side wake word
+
+A client that has no keyword spotter of its own can let the server listen for a wake phrase. The client streams its mic all the time and sends a `wake_word` frame. The connection is then dormant: its audio goes only to a keyword spotter, not to the STT. When the spotter hears a phrase, the server sends a `wake` frame and starts to listen. A `listen_stop` frame makes the connection dormant again. A client that does not send `wake_word` sees no change. The frames are in [Server-side wake word](docs/client-integration.md#server-side-wake-word).
+
+A wake phrase is plain text, for example `hey computer` or `hey hermes`. No model is trained for it, so each deployment and each connection can have its own phrases. The engine is the sherpa-onnx keyword spotter (https://github.com/k2-fsa/sherpa-onnx) with its English model of 3.3 million parameters. It runs on the CPU in the server process and needs no GPU. It is off by default. To turn it on:
+
+```bash
+pip install -r requirements-wake.txt
+# in .env: VM_WAKE_ENGINE=sherpa and VM_WAKE_MODEL_DIR=models/kws
+python setup_models.py wake
+```
+
+`python setup_models.py wake` downloads the model (about 17 MB) into `VM_WAKE_MODEL_DIR` and checks it against a pinned SHA-256. `VM_WAKE_PHRASES` (default `hey computer`) is the list a connection gets when it names no phrases. The server does not start if the model or the packages are missing; the error names what to fix. To try a phrase or a threshold on a recording with no server running, use `scripts/wake_probe.py`.
+
+A phrase of two words is heard more reliably than one word. The numbers in the guide come from synthesized speech with no room noise, so expect lower recall and some false wakes in a real room.
+
+Licences. sherpa-onnx is under the Apache License 2.0. The model comes from the sherpa-onnx project's model releases and was trained on the GigaSpeech corpus. VoiceManager does not ship it; check the terms of the model and of GigaSpeech for your use.
 
 ## Configuration
 
