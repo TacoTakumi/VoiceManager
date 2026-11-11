@@ -38,6 +38,12 @@ handled one at X it has handled every barge up to X. The sidecar sends one at 0 
 the session opens; a sidecar that sends none reports no progress, and the mic hold
 then works as if every hop were scored at once (see "The mic hold").
 
+A barge-state line (``wire.BargeStateEvent``) comes only from a sidecar that runs the
+pre-filter, which gives no barge until it has learned the user's voice. The server
+sends each one on to the client as a barge_state frame ({"type": "barge_state",
+"state": "learning" | "ready"}), never before the connection's turn_engine_ready:
+one that the reader gets earlier waits for it.
+
 The hop feed
 ------------
 
@@ -354,7 +360,7 @@ from websockets.protocol import State
 
 from voicemanager.pipeline.tyger import wire
 from voicemanager.protocol import (
-    BargeMessage, ErrorMessage, PlaybackMessage, TurnEndMessage, TurnEngineMessage,
+    BargeMessage, BargeStateMessage, ErrorMessage, PlaybackMessage, TurnEndMessage, TurnEngineMessage,
     TurnEngineReadyMessage,
     INVALID_REQUEST, TURN_ENGINES, TURN_ENGINE_LOST, TURN_ENGINE_UNAVAILABLE,
     TURN_ENGINE_UNSUPPORTED,
@@ -1162,6 +1168,10 @@ class TurnEngineSession:
         self._start_wait_s = start_wait_ms / 1000.0
         self._finals: list[tuple[str, int]] = []  # (text, turn_id) since the last turn_end
         self.engine: str | None = None
+        # The pre-filter's state: the last one the sidecar reported, and whether the
+        # client may get it yet (only after its turn_engine_ready).
+        self._barge_state: str | None = None
+        self._ready_sent = False
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._closed = False
@@ -1230,6 +1240,14 @@ class TurnEngineSession:
         self.engine = engine
         logger.info("Turn engine ready: session=%s engine=%s", self._label, engine)
         await self._send_text(TurnEngineReadyMessage(engine=engine).model_dump_json())
+        self._ready_sent = True
+        if self._barge_state is not None:
+            # The sidecar reported it while turn_engine_ready was on its way out.
+            await self._send_barge_state(self._barge_state)
+
+    async def _send_barge_state(self, state: str) -> None:
+        logger.info("Barge state: session=%s %s", self._label, state)
+        await self._send_text(BargeStateMessage(state=state).model_dump_json())
 
     def _refusal(self, frame: dict, audio_started: bool) -> tuple[str, str] | None:
         """The (error_type, message) that refuses this opt-in, or None to go ahead."""
@@ -1712,6 +1730,10 @@ class TurnEngineSession:
                 await self._release()
         elif isinstance(event, wire.EndpointEvent):
             await self._handle_endpoint(event)
+        elif isinstance(event, wire.BargeStateEvent):
+            self._barge_state = event.state
+            if self._ready_sent:
+                await self._send_barge_state(event.state)
         if self._on_event is not None:
             await self._on_event(event)
 

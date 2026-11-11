@@ -26,6 +26,10 @@ Wire protocol (``wire`` has the formats):
 - A session that asked for progress gets a scored line at 0 when it opens, and one
   at the hop's mic_sample last in the message of every valid hop, scored or failed,
   so each hop then gets a message.
+- A session behind the pre-filter gets a barge_state line: ``learning`` when it
+  opens (the pre-filter gives no barge before it has the user's voice), and
+  ``ready`` in the message of the hop at which the pre-filter enrolled. A session
+  with no pre-filter gets neither.
 
 Each session has its own turn rules and scorer state; the model is shared. Scoring
 runs on one thread, so the GPU serves one hop at a time and the event loop keeps
@@ -110,6 +114,16 @@ class Session:
         self.rules = rules_engine
         self.scorer = session_scorer
         self.hops = 0
+        # The pre-filter still learns the user's voice. False with no pre-filter
+        # (the scorer has no ``enrolled``) and once it has enrolled.
+        self.learning = getattr(session_scorer, "enrolled", None) is False
+
+    def take_enrolled(self) -> bool:
+        """True once, the first time the pre-filter is found enrolled."""
+        if self.learning and self.scorer.enrolled:
+            self.learning = False
+            return True
+        return False
 
 
 def session_scorer(inner: "scorer.SessionScorer", key: str,
@@ -221,7 +235,12 @@ def create_app(settings: "rules.TurnRuleSettings | None" = None,
         app.state.sessions += 1
         logger.info("session %s opened", key)
         try:
-            if progress and not await _send_events(ws, [wire.ScoredEvent(mic_sample=0)]):
+            opening: list = []
+            if session.learning:
+                opening.append(wire.BargeStateEvent(wire.BARGE_LEARNING))
+            if progress:
+                opening.append(wire.ScoredEvent(mic_sample=0))
+            if opening and not await _send_events(ws, opening):
                 return
             await _serve_session(ws, session, app.state.executor, progress)
         finally:
@@ -268,6 +287,8 @@ async def _serve_session(ws: WebSocket, session: Session, executor: ThreadPoolEx
                 except Exception as exc:  # one hop's failure; the session goes on
                     logger.exception("session %s: scoring a hop failed", session.key)
                     events = [wire.ErrorEvent(f"scoring failed: {exc or type(exc).__name__}")]
+                if session.take_enrolled():
+                    events.append(wire.BargeStateEvent(wire.BARGE_READY))
                 if progress:
                     events.append(wire.ScoredEvent(mic_sample=hop.mic_sample))
         if events and not await _send_events(ws, events):

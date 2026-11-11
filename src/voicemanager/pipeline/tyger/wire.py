@@ -43,6 +43,7 @@ Sidecar to server: text messages holding event lines, one JSON object per line
     {"event": "barge", "onset_mic_sample": int, "mic_sample": int}
     {"event": "error", "message": str}
     {"event": "scored", "mic_sample": int}
+    {"event": "barge_state", "state": "learning" | "ready"}
 
 ``mic_sample`` is the hop end at which the sidecar decided; ``onset_mic_sample`` is
 where the user's speech began, never after ``mic_sample``. Unknown keys are ignored
@@ -56,6 +57,12 @@ as soon as the session opens (it says the sidecar sends them), and one after eac
 hop, last in that hop's message, whether the hop scored or failed with an error
 line. A hop that is not a valid hop message gets none. So once the server has read
 a scored line at X, it has read every barge and endpoint up to X.
+
+A ``barge_state`` line comes only from a sidecar that runs the pre-filter. The
+pre-filter gives no barge until it has learned the user's voice: ``learning`` goes
+out when such a session opens, before its first scored line, and ``ready`` once, in
+the message of the hop at which the pre-filter enrolled, before that hop's scored
+line. A session with no pre-filter gets neither.
 """
 import array
 import json
@@ -80,6 +87,10 @@ _MODE_CODES = {MODE_LISTENING: 0, MODE_SPEAKING: 1}
 _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}
 
 ENDPOINT_BY: tuple[str, ...] = ("model", "silence")
+
+BARGE_LEARNING = "learning"
+BARGE_READY = "ready"
+BARGE_STATES: tuple[str, ...] = (BARGE_LEARNING, BARGE_READY)
 
 #: The session URL's query parameter that asks for progress lines, set to "1".
 PROGRESS_PARAM = "progress"
@@ -138,7 +149,14 @@ class ScoredEvent:
     mic_sample: int
 
 
-Event = EndpointEvent | BargeEvent | ErrorEvent | ScoredEvent
+@dataclass(frozen=True)
+class BargeStateEvent:
+    """Whether the session's pre-filter can give a barge yet: ``learning`` until it
+    has the user's voice, ``ready`` from then on."""
+    state: str
+
+
+Event = EndpointEvent | BargeEvent | ErrorEvent | ScoredEvent | BargeStateEvent
 
 
 # --- hops ---------------------------------------------------------------------
@@ -276,6 +294,8 @@ def format_event(event: Event) -> str:
                "mic_sample": event.mic_sample}
     elif isinstance(event, ScoredEvent):
         obj = {"event": "scored", "mic_sample": event.mic_sample}
+    elif isinstance(event, BargeStateEvent):
+        obj = {"event": "barge_state", "state": event.state}
     else:
         obj = {"event": "error", "message": event.message}
     # json.dumps escapes a newline inside a string, so the line stays one line.
@@ -307,6 +327,8 @@ def parse_event_line(line: str) -> Event:
         event = ErrorEvent(message=_get(obj, "message", str))
     elif kind == "scored":
         event = ScoredEvent(mic_sample=_get(obj, "mic_sample", int))
+    elif kind == "barge_state":
+        event = BargeStateEvent(state=_get(obj, "state", str))
     else:
         raise ValueError(f"unknown event {kind!r}")
     _check_event(event)
@@ -347,5 +369,9 @@ def _check_event(event) -> None:
             raise ValueError("error message must be a string")
     elif isinstance(event, ScoredEvent):
         _check_sample_index("mic_sample", event.mic_sample)
+    elif isinstance(event, BargeStateEvent):
+        if event.state not in BARGE_STATES:
+            raise ValueError(
+                f"barge_state state must be one of {BARGE_STATES}, got {event.state!r}")
     else:
         raise ValueError(f"not a turn-engine event: {event!r}")

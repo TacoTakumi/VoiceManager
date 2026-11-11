@@ -950,7 +950,7 @@ For a complete client, see `scripts/voice_agent.py classic --turn-engine tyger`.
 
 On speakers the mic hears the reply as well as the user. Tyger compares the mic with the reply it is told is playing, which keeps the reply's echo from counting as a barge, but it also scores the user's own speech low while it overlaps the reply. On a speakers call a barge in the middle of a long reply may then not fire. On headphones it does.
 
-`VM_TYGER_PREFILTER=voxlock` is an experimental server setting for that case. It changes nothing in the protocol and needs nothing from the client. The server first calibrates the connection's voice gate from its first 2 s of mic audio heard while no reply plays (the room level plus `VM_TYGER_GATE_MARGIN_DB`, kept between `VM_TYGER_VOICE_GATE_DB` and `VM_TYGER_GATE_MAX_DB`). Then it learns the user's voice from the first 3 s of speech above that gate it hears on the connection while no reply plays. Until it has that sample, no barge fires: Tyger would hear the reply's echo on the raw mic, and an agent that speaks first could stop its own reply. So the user cannot cut into the agent's replies until they have spoken for about 3 s with no reply playing. From then on, while a reply plays, Tyger hears only that voice, filtered out of the mic by a target-speaker model (VoxLock), with noise added at `VM_TYGER_PREFILTER_FLOOR_DB`. While no reply plays, Tyger hears the mic as before. Until the server has those 3 s, the connection works exactly as without the setting. The filter assumes one speaker at the mic, and its first seconds of speech should be that speaker.
+`VM_TYGER_PREFILTER=voxlock` is an experimental server setting for that case. It needs nothing from the client and adds one server frame, [`barge_state`](#barge_state---bargestatemessage), which tells the client when barge-in is off and when it is ready. The server first calibrates the connection's voice gate from its first 2 s of mic audio heard while no reply plays (the room level plus `VM_TYGER_GATE_MARGIN_DB`, kept between `VM_TYGER_VOICE_GATE_DB` and `VM_TYGER_GATE_MAX_DB`). Then it learns the user's voice from the first 3 s of speech above that gate it hears on the connection while no reply plays. Until it has that sample, no barge fires: Tyger would hear the reply's echo on the raw mic, and an agent that speaks first could stop its own reply. So the user cannot cut into the agent's replies until they have spoken for about 3 s with no reply playing. From then on, while a reply plays, Tyger hears only that voice, filtered out of the mic by a target-speaker model (VoxLock), with noise added at `VM_TYGER_PREFILTER_FLOOR_DB`. While no reply plays, Tyger hears the mic as before. Until the server has those 3 s, the connection works exactly as without the setting. The filter assumes one speaker at the mic, and its first seconds of speech should be that speaker.
 
 ### Opting in
 
@@ -1058,6 +1058,30 @@ On a `barge` the client must:
 3. Not send `tts_cancel` for it. The request is cancelled and its `request_id` is dead (see [Turn-taking](#7-a-cancelled-request_id-is-permanently-dead)); mint a new one for the next reply.
 
 The user's words from the onset reach the STT (see [The mic hold](#the-mic-hold)) and end with a `turn_end` as usual.
+
+#### `barge_state` - `BargeStateMessage`
+
+Server to client. Sent only by a server that runs the [experimental pre-filter](#barge-in-on-speakers-the-experimental-pre-filter), and only to a connection that opted in. With the pre-filter the server sends no `barge` until it has learned the user's voice, and this frame tells the client which state the connection is in, so that it can tell the user.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `type` | string | `"barge_state"` | Frame discriminator. |
+| `state` | string | *(required)* | `"learning"`: the server still learns the user's voice, and no `barge` comes. `"ready"`: the server has the voice, and a `barge` can come from now on. |
+
+```json
+{ "type": "barge_state", "state": "learning" }
+```
+
+```json
+{ "type": "barge_state", "state": "ready" }
+```
+
+Each state comes at most once per connection, in this order:
+
+1. `learning` comes after `turn_engine_ready`, before the server has heard any mic audio.
+2. `ready` comes when the server has the 3 s of the user's speech it learns the voice from. The server takes that speech only while no reply plays, so `ready` comes while the user speaks or shortly after, not as an answer to a frame from the client.
+
+A server with no pre-filter sends neither frame: barge-in works from the start there, and a client shows nothing. A [listening boundary](#listening-boundary-stop-and-start-listening-on-one-connection) keeps the learned voice, so `listen_start` brings no new `barge_state` frame. After a `turn_engine_lost` error no `barge_state` frame comes, and no `barge` either. A client must ignore keys it does not know in this frame: a later version can add one.
 
 #### `turn_end` - `TurnEndMessage`
 

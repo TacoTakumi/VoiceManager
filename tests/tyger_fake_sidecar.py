@@ -31,6 +31,9 @@ Two ways to use it:
   the per-hop lines back (the opening line still goes out); a test then sends its
   own with ``send(i, wire.ScoredEvent(...))``.
 
+  ``opening=[Event, ...]`` gives every session those events as soon as it opens,
+  before the opening scored line, as the real sidecar sends a barge-state line.
+
 * As a process, for the spawn and watch tests: run it with the test interpreter
   as if it were the Tyger environment's python::
 
@@ -102,7 +105,7 @@ class FakeTygerSidecar:
                  on_hop: Callable[[FakeSession, int, "wire.Hop"], list | None] | None = None,
                  host: str = "127.0.0.1", port: int = 0,
                  record: Callable[[FakeSession, int, "wire.Hop"], None] | None = None,
-                 progress: bool = False) -> None:
+                 progress: bool = False, opening: list | None = None) -> None:
         self.events = {str(k): {int(n): list(v) for n, v in hops.items()}
                        for k, hops in (events or {}).items()}
         self.on_hop = on_hop
@@ -112,6 +115,7 @@ class FakeTygerSidecar:
         self._bind_port = port
         self.ready = True
         self.progress = progress
+        self.opening = list(opening or [])
         self.withhold_progress = False
         self.sessions: list[FakeSession] = []
         self._lock = threading.Lock()
@@ -223,6 +227,7 @@ class FakeTygerSidecar:
                                   ws=ws)
             self.sessions.append(session)
         try:
+            await self._send(session, list(self.opening))
             if progress:
                 await self._send(session, [wire.ScoredEvent(mic_sample=0)])
             async for message in ws:

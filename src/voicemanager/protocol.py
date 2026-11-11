@@ -31,6 +31,9 @@ class MessageType(str, enum.Enum):
     playback = "playback"
     barge = "barge"
     turn_end = "turn_end"
+    # Sent only to an opted-in session on a server that runs the pre-filter:
+    # whether barge-in works yet.
+    barge_state = "barge_state"
     # Listening-boundary frames: a client that stops sending mic audio sends
     # listen_stop and the server acks with listen_stopped; listen_start resumes
     # listening on the same connection and gets no ack. A client that never sends
@@ -257,6 +260,17 @@ class BargeMessage(BaseModel):
     request_id: str
     onset_mic_sample: int
     mic_sample: int
+
+
+class BargeStateMessage(BaseModel):
+    """Server report of whether barge-in works yet on a session behind the pre-filter.
+
+    ``learning``: the server still learns the user's voice and sends no barge.
+    ``ready``: it has the voice, and a barge can come from now on. A server with no
+    pre-filter sends neither.
+    """
+    type: Literal["barge_state"] = "barge_state"
+    state: Literal["learning", "ready"]
 
 
 class TurnEndMessage(BaseModel):

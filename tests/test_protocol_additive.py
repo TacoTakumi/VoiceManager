@@ -59,9 +59,10 @@ _LEGACY_MESSAGE_TYPES = frozenset({
 _TURN_MESSAGE_TYPES = frozenset({"turn_start", "turn_started"})
 # The turn-engine frames, added later and also opt-in: turn_engine and playback are
 # client->server; turn_engine_ready answers a turn_engine opt-in, and barge and
-# turn_end are sent only to a session that opted in.
+# turn_end are sent only to a session that opted in. barge_state, added after them,
+# goes only to such a session too, and only from a server that runs the pre-filter.
 _TURN_ENGINE_MESSAGE_TYPES = frozenset({
-    "turn_engine", "turn_engine_ready", "playback", "barge", "turn_end",
+    "turn_engine", "turn_engine_ready", "playback", "barge", "turn_end", "barge_state",
 })
 # The listening-boundary frames, added later still: listen_stop and listen_start are
 # client->server; listen_stopped answers a listen_stop. A client that never sends

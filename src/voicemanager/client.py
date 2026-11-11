@@ -228,6 +228,11 @@ class DuplexSession:
     gone and the session goes on as one that never opted in. A reconnect starts a
     new connection that has not opted in, with ``mic_sample`` back at 0.
 
+    Barge state: a server that runs the pre-filter for speakers sends no barge until
+    it has learned the user's voice. ``barge_state`` is then ``"learning"`` and later
+    ``"ready"``, and ``barge_states()`` yields each barge_state frame. On a server
+    with no pre-filter ``barge_state`` stays None and nothing is yielded.
+
     Listening boundary: ``await session.listen_stop()`` when the mic stops (the user
     stops listening, a conversation ends) keeps the connection open but stopped. It
     returns the server's count of mic samples accepted, or None from a server older
@@ -615,6 +620,17 @@ class DuplexSession:
         while (frame := await self._client._turn_end_queue.get()) is not None:
             yield frame
 
+    @property
+    def barge_state(self) -> str | None:
+        """``"learning"`` or ``"ready"`` from the server's last barge_state frame, or
+        None when it sent none (no pre-filter, or no turn engine)."""
+        return self._client.barge_state
+
+    async def barge_states(self) -> AsyncIterator[dict]:
+        """Yield every barge_state frame as it arrives (a server with the pre-filter)."""
+        while (frame := await self._client._barge_state_queue.get()) is not None:
+            yield frame
+
     async def errors(self) -> AsyncIterator[dict]:
         """Yield the server's error frames (timeout warnings, invalid requests)."""
         while (frame := await self._client._error_queue.get()) is not None:
@@ -661,6 +677,10 @@ class VoiceManagerClient:
         self._turn_queue: asyncio.Queue = asyncio.Queue()
         # turn_end frames, for a connection that opted in to a turn engine.
         self._turn_end_queue: asyncio.Queue = asyncio.Queue()
+        # barge_state frames, from a server that runs the pre-filter, and the state
+        # of the last one (None until one comes, and again after turn_engine_lost).
+        self._barge_state_queue: asyncio.Queue = asyncio.Queue()
+        self.barge_state: str | None = None
 
         # Turn engine state for this connection: the engine named in the opt-in
         # sent (at most one per connection), the waiter for its answer, and the
@@ -802,7 +822,7 @@ class VoiceManagerClient:
 
         # Drain all queues - put sentinel None to unblock any waiters
         for q in (self._stt_queue, self._tts_queue, self._error_queue, self._turn_queue,
-                  self._turn_end_queue):
+                  self._turn_end_queue, self._barge_state_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -825,6 +845,8 @@ class VoiceManagerClient:
         self._error_queue = asyncio.Queue()
         self._turn_queue = asyncio.Queue()
         self._turn_end_queue = asyncio.Queue()
+        self._barge_state_queue = asyncio.Queue()
+        self.barge_state = None
         self._wake_queue = asyncio.Queue()
         # A fresh connection carries no pending cancellations, has not opted in to
         # a turn engine or the wake word, has sent no mic audio, and listens.
@@ -899,6 +921,9 @@ class VoiceManagerClient:
                         await self._tts_queue.put(frame)
                     elif ftype == "turn_engine_ready":
                         self._on_turn_engine_ready(frame)
+                    elif ftype == "barge_state":
+                        self.barge_state = frame.get("state")
+                        await self._barge_state_queue.put(frame)
                     elif ftype == "listen_stopped":
                         self._on_listen_stopped(frame)
                     elif ftype == "wake_word_ready":
@@ -935,6 +960,7 @@ class VoiceManagerClient:
                             self._logger.warning(
                                 "Turn engine lost: %s", frame.get("message", ""))
                             self.turn_engine = None
+                            self.barge_state = None
                         await self._error_queue.put(frame)
                     else:
                         self._logger.debug("Unhandled message type: %s", ftype)
@@ -959,6 +985,7 @@ class VoiceManagerClient:
             await self._tts_queue.put(None)
             await self._turn_queue.put(None)
             await self._turn_end_queue.put(None)
+            await self._barge_state_queue.put(None)
             await self._error_queue.put(None)
 
     def _on_turn_engine_ready(self, frame: dict) -> None:

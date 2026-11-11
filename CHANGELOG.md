@@ -26,6 +26,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DuplexSession.wakes()` yields the `wake` frames, and `dormant` and
   `wake_phrases` tell the state. A dormant session's `send_audio` keeps sending
   for the server's spotter and does not count that audio in `mic_sample`.
+- `barge_state` frame, for a turn-engine client of a server that runs the
+  experimental pre-filter (`VM_TYGER_PREFILTER=voxlock`). The pre-filter gives no
+  barge until it has learned the user's voice from 3 s of speech, and the client
+  had no way to know. The server now sends
+  `{"type": "barge_state", "state": "learning"}` after `turn_engine_ready` and
+  `{"type": "barge_state", "state": "ready"}` once it has the voice. A server with
+  no pre-filter sends neither, and a client that does not know the frame can
+  ignore it. See
+  [`barge_state`](docs/client-integration.md#barge_state---bargestatemessage).
+- Python client: `DuplexSession.barge_state` holds the last state and
+  `DuplexSession.barge_states()` yields the `barge_state` frames.
 - `scripts/wake_probe.py` runs WAV files through the server's wake spotter with
   the real model, to try a phrase or a threshold with no server running.
 
