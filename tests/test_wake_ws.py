@@ -65,8 +65,8 @@ def _ready_frame(phrases=DEFAULT_PHRASES) -> dict:
     return {"type": "wake_word_ready", "phrases": list(phrases)}
 
 
-def _wake(phrase: str, n: int) -> dict:
-    return {"type": "wake", "phrase": phrase, "mic_sample": n}
+def _wake(phrase: str, n: int, dormant: int) -> dict:
+    return {"type": "wake", "phrase": phrase, "mic_sample": n, "dormant_sample": dormant}
 
 
 def _stopped(n: int) -> dict:
@@ -279,7 +279,7 @@ def test_a_heard_phrase_sends_one_wake_frame_and_the_connection_listens(
         assert _opt_in(ws) == _ready_frame()
         ws.send_bytes(_pcm(160))
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey computer", 0)
+        assert ws.receive_json() == _wake("hey computer", 0, 320)
         after = [_pcm(200, 0x0404), _pcm(300, 0x0505)]
         for f in after:
             _send_and_read_final(ws, f)
@@ -296,7 +296,7 @@ def test_the_wake_frame_names_the_phrase_that_was_heard(client, spotter):
         assert _opt_in(ws, ["Hey Hermes", "hey computer"]) == _ready_frame(
             ["hey hermes", "hey computer"])
         ws.send_bytes(_pcm(160, HEAR_LAST))
-        assert ws.receive_json() == _wake("hey computer", 0)
+        assert ws.receive_json() == _wake("hey computer", 0, 160)
 
 
 def test_the_wake_count_is_the_audio_accepted_before_the_connection_was_dormant(
@@ -310,9 +310,38 @@ def test_the_wake_count_is_the_audio_accepted_before_the_connection_was_dormant(
         ws.send_bytes(_pcm(4000))
         ws.send_bytes(_pcm(160, HEAR_FIRST))
         # Dormant audio is not counted: the next accepted frame starts at 556.
-        assert ws.receive_json() == _wake("hey computer", 556)
+        assert ws.receive_json() == _wake("hey computer", 556, 4160)
         _send_and_read_final(ws, _pcm(100))
         assert _stop(ws) == [_stopped(656)]
+
+
+def test_the_dormant_count_goes_on_over_a_listen_stop_while_dormant(client, spotter):
+    """A listen_stop on a dormant connection opens no new stream, so the count of
+    dormant audio is not started again."""
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        assert _opt_in(ws) == _ready_frame()
+        ws.send_bytes(_pcm(1000))
+        assert _stop(ws) == [_stopped(0)]
+        ws.send_bytes(_pcm(160, HEAR_FIRST))
+        assert ws.receive_json() == _wake("hey computer", 0, 1160)
+
+
+def test_the_dormant_count_starts_again_at_a_second_wake_word(client, spotter):
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        assert _opt_in(ws) == _ready_frame()
+        ws.send_bytes(_pcm(1000))
+        ws.send_json(WAKE_WORD)
+        assert ws.receive_json() == _ready_frame()
+        ws.send_bytes(_pcm(160, HEAR_FIRST))
+        assert ws.receive_json() == _wake("hey computer", 0, 160)
+
+
+def test_the_dormant_count_is_in_whole_samples(client, spotter):
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        assert _opt_in(ws) == _ready_frame()
+        ws.send_bytes(b"\x01\x02\x03")
+        ws.send_bytes(_pcm(160, HEAR_FIRST))
+        assert ws.receive_json() == _wake("hey computer", 0, 161)
 
 
 # --- back to dormant, and a wake by hand --------------------------------------------
@@ -322,14 +351,14 @@ def test_listen_stop_after_a_wake_makes_the_connection_dormant_on_a_new_stream(
     with authkit.ws_connect(client, "/ws/stream") as ws:
         assert _opt_in(ws, ["hey hermes"]) == _ready_frame(["hey hermes"])
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey hermes", 0)
+        assert ws.receive_json() == _wake("hey hermes", 0, 160)
         _send_and_read_final(ws, _pcm(256))
         assert _stop(ws) == [_stopped(256)]
         # Dormant again: the frames go to a new stream with the same phrases.
         ws.send_bytes(_pcm(160, 0x0606))
         assert barrier(ws) == []
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey hermes", 256)
+        assert ws.receive_json() == _wake("hey hermes", 256, 320)
         _send_and_read_final(ws, _pcm(64))
         assert _stop(ws) == [_stopped(320)]
     first, second, third = spotter.streams
@@ -367,7 +396,7 @@ def test_listen_start_wakes_a_dormant_connection_with_no_wake_frame(
         # The connection is still opted in: a stop makes it dormant again.
         assert _stop(ws) == [_stopped(360)]
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey computer", 360)
+        assert ws.receive_json() == _wake("hey computer", 360, 160)
     assert whispers[0].fed == after
     assert spotter.streams[0].fed == [_pcm(160)]
     assert spotter.streams[1].fed == [_pcm(160, HEAR_FIRST)]
@@ -397,7 +426,7 @@ def test_a_second_wake_word_replaces_the_phrases(client, spotter):
         ws.send_json({"type": "wake_word", "phrases": ["hey hermes"]})
         assert ws.receive_json() == _ready_frame(["hey hermes"])
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey hermes", 0)
+        assert ws.receive_json() == _wake("hey hermes", 0, 160)
     assert spotter.streams[0].fed == []
 
 
@@ -435,7 +464,7 @@ def test_a_refused_second_wake_word_keeps_the_first_phrases_and_the_dormant_stat
         answer = ws.receive_json()
         assert answer["error_type"] == "invalid_request", answer
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey hermes", 0)
+        assert ws.receive_json() == _wake("hey hermes", 0, 160)
     assert len(spotter.streams) == 1
 
 
@@ -498,7 +527,7 @@ def test_dormant_audio_is_not_fed_to_the_turn_engine(tyger, turn_engines, spotte
         assert tyger.wait_for(lambda: len(tyger.sessions) == 1)
         ws.send_bytes(_pcm(2000))
         ws.send_bytes(_pcm(160, HEAR_FIRST))
-        assert ws.receive_json() == _wake("hey computer", 0)
+        assert ws.receive_json() == _wake("hey computer", 0, 6160)
         ws.send_bytes(_pcm(1500))
         ws.send_bytes(_pcm(700))
         assert errors(barrier(ws)) == []
@@ -549,7 +578,7 @@ def test_the_session_timeout_runs_again_from_the_wake(client, short_timeout):
         time.sleep(TIMEOUT + 0.3)
         ws.send_bytes(_pcm(160, HEAR_FIRST))
         since = time.monotonic()
-        assert ws.receive_json() == _wake("hey computer", 0)
+        assert ws.receive_json() == _wake("hey computer", 0, 160)
         warning = ws.receive_json()
         assert warning.get("error_type") == "timeout_warning", warning
         assert time.monotonic() - since >= TIMEOUT - LEAD - 0.1

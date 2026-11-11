@@ -38,13 +38,14 @@ def test_the_three_frame_types_are_message_types():
 def test_each_model_carries_its_own_type():
     assert WakeWordMessage().type == MessageType.wake_word.value
     assert WakeWordReadyMessage(phrases=["hey computer"]).type == MessageType.wake_word_ready.value
-    assert WakeMessage(phrase="hey computer", mic_sample=0).type == MessageType.wake.value
+    assert WakeMessage(
+        phrase="hey computer", mic_sample=0, dormant_sample=0).type == MessageType.wake.value
 
 
 def test_the_models_have_exactly_their_documented_fields():
     assert list(WakeWordMessage.model_fields) == ["type", "phrases"]
     assert list(WakeWordReadyMessage.model_fields) == ["type", "phrases"]
-    assert list(WakeMessage.model_fields) == ["type", "phrase", "mic_sample"]
+    assert list(WakeMessage.model_fields) == ["type", "phrase", "mic_sample", "dormant_sample"]
 
 
 # --- wake_word -----------------------------------------------------------------
@@ -104,21 +105,24 @@ def test_wake_word_ready_requires_the_phrase_list():
 # --- wake ------------------------------------------------------------------------
 
 def test_wake_round_trips():
-    msg = WakeMessage(phrase="hey hermes", mic_sample=48000)
-    assert _wire(msg) == {"type": "wake", "phrase": "hey hermes", "mic_sample": 48000}
+    msg = WakeMessage(phrase="hey hermes", mic_sample=48000, dormant_sample=9600)
+    assert _wire(msg) == {
+        "type": "wake", "phrase": "hey hermes", "mic_sample": 48000, "dormant_sample": 9600}
     assert WakeMessage.model_validate_json(msg.model_dump_json()) == msg
 
 
-@pytest.mark.parametrize("missing", ["phrase", "mic_sample"])
+@pytest.mark.parametrize("missing", ["phrase", "mic_sample", "dormant_sample"])
 def test_wake_requires_each_field(missing):
-    frame = {"type": "wake", "phrase": "hey hermes", "mic_sample": 0}
+    frame = {"type": "wake", "phrase": "hey hermes", "mic_sample": 0, "dormant_sample": 0}
     del frame[missing]
     with pytest.raises(ValidationError):
         WakeMessage.model_validate(frame)
 
 
-@pytest.mark.parametrize("mic_sample", [-1, "16000", 1.5, True, None])
-def test_wake_mic_sample_is_a_strict_int_not_below_zero(mic_sample):
+@pytest.mark.parametrize("field", ["mic_sample", "dormant_sample"])
+@pytest.mark.parametrize("value", [-1, "16000", 1.5, True, None])
+def test_wake_counts_are_strict_ints_not_below_zero(field, value):
+    frame = {"type": "wake", "phrase": "hey hermes", "mic_sample": 0, "dormant_sample": 0}
+    frame[field] = value
     with pytest.raises(ValidationError):
-        WakeMessage.model_validate(
-            {"type": "wake", "phrase": "hey hermes", "mic_sample": mic_sample})
+        WakeMessage.model_validate(frame)

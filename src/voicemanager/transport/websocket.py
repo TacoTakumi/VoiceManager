@@ -1063,14 +1063,22 @@ async def websocket_endpoint(websocket: WebSocket):
     # model and run in its executor, one at a time for this connection.
     wake_spotter = getattr(websocket.app.state, "wake_spotter", None)
     wake_stream = None
+    # Bytes of dormant audio given to the current spotter stream. The wake frame
+    # reports it in samples, so a client that sent more audio than that before it
+    # read the frame knows the rest was counted as mic audio.
+    wake_dormant_bytes = 0
 
     async def _open_wake_stream(phrases: list[str] | None) -> None:
-        """Give the connection a new spotter stream for ``phrases``; None does nothing."""
-        nonlocal wake_stream
+        """Give the connection a new spotter stream for ``phrases``; None does nothing.
+
+        A new stream is a new dormant period: its count of dormant audio starts at 0.
+        """
+        nonlocal wake_stream, wake_dormant_bytes
         if phrases is None:
             return
         wake_stream = await asyncio.get_running_loop().run_in_executor(
             wake_spotter.executor, wake_spotter.open_stream, phrases)
+        wake_dormant_bytes = 0
 
     async def _apply_wake_word(parsed: dict) -> None:
         """Opt the connection in to the wake word and make it dormant.
@@ -1106,15 +1114,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def _feed_wake(data: bytes) -> None:
         """Give a dormant connection's mic frame to its spotter; wake on a phrase."""
+        nonlocal wake_dormant_bytes
+        wake_dormant_bytes += len(data)
         phrase = await asyncio.get_running_loop().run_in_executor(
             wake_spotter.executor, wake_stream.feed, data)
         if phrase is None:
             return
         _apply_listen_start()
-        logger.info("Wake: session=%s phrase=%r mic_sample=%d",
-                    session_id, phrase, listen.mic_samples)
+        logger.info("Wake: session=%s phrase=%r mic_sample=%d dormant_sample=%d",
+                    session_id, phrase, listen.mic_samples, wake_dormant_bytes // 2)
         await websocket.send_text(
-            WakeMessage(phrase=phrase, mic_sample=listen.mic_samples).model_dump_json())
+            WakeMessage(phrase=phrase, mic_sample=listen.mic_samples,
+                        dormant_sample=wake_dormant_bytes // 2).model_dump_json())
 
     try:
         loop = asyncio.get_event_loop()

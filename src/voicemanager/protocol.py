@@ -344,12 +344,22 @@ class WakeMessage(BaseModel):
 
     ``phrase`` is the phrase that matched, as the connection's list has it.
     ``mic_sample`` is how many mic samples the server accepted on the connection at
-    the wake: the first mic frame after this frame starts at that count. Audio sent
-    while dormant is not counted. Integers are strict, as in listen_stopped.
+    the wake: the first mic frame after the dormant audio starts at that count. Audio
+    sent while dormant is not counted in it.
+
+    ``dormant_sample`` is how many samples of dormant audio the server gave the
+    spotter on the connection since it last became dormant, up to and including the
+    frame the phrase was heard in. A client keeps sending while this frame is on its
+    way: the audio it sent after those ``dormant_sample`` samples was not dormant
+    audio any more, and the server counted it as mic audio. A client that keeps its
+    own mic count (for playback frames) adds that audio to it.
+
+    Integers are strict, as in listen_stopped.
     """
     type: Literal["wake"] = "wake"
     phrase: str
     mic_sample: int = Field(ge=0, strict=True)
+    dormant_sample: int = Field(ge=0, strict=True)
 
 
 # Audio format specification for handshake
