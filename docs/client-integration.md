@@ -1607,6 +1607,7 @@ timeouts that end a session. Defaults are the server's built-in values.
 | `VM_TYGER_PREFILTER` | `off` | Experimental. `voxlock` filters the mic to the user's voice for the turn engine while a reply plays, for barge-in on speakers. See [Barge-in on speakers](#barge-in-on-speakers-the-experimental-pre-filter). |
 | `VM_TYGER_HOLD_TAIL_MS` | `150` | Turn engine: mic audio up to a `playback` `stop` plus this many ms stays out of the STT. |
 | `VM_TYGER_START_WAIT_MS` | `2000` | Turn engine: with no `playback` `start` this many ms after a reply's `audio_end`, the held mic audio goes to the STT as if the reply never played. After a `stop`, it is also the most mic audio past the stop plus the hold tail that the server waits for the turn engine's scoring before it drops the reply's echo. |
+| `VM_TYGER_BARGE_CAPTURE_DIR` | (empty) | Debug. A directory: each barge the server acts on writes the mic audio around it there, as a WAV and a JSON note, to measure what the STT got after the barge. The files hold the user's voice. Empty is off. |
 | `VM_TYGER_SILENCE_FALLBACK_MS` | `1200` | Turn engine: this many ms of silence after speech end the turn with `by: "silence"` when the model has not ended it. |
 
 The server has many more `VM_` variables for model selection and tuning

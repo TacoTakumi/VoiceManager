@@ -728,6 +728,7 @@ async def websocket_endpoint(websocket: WebSocket):
         release_held=_release_held,
         hold_tail_ms=settings.tyger_hold_tail_ms,
         start_wait_ms=settings.tyger_start_wait_ms,
+        barge_capture_dir=settings.tyger_barge_capture_dir,
     )
 
     # Track last streaming STT text update for silence-triggered finalization (qwen)

@@ -363,6 +363,10 @@ class Settings(BaseSettings):
     # also bounds, in mic audio, how long a stopped reply's held audio waits for the
     # sidecar to score up to the stop plus the tail.
     tyger_start_wait_ms: int = Field(default=2000, gt=0)       # VM_TYGER_START_WAIT_MS
+    # Debug. A directory: each barge an opted-in session acts on writes the mic audio
+    # around it there (a WAV and a JSON note), to measure what the STT got. The files
+    # hold the user's voice and nothing limits their number. Empty is off.
+    tyger_barge_capture_dir: str = Field(default="")           # VM_TYGER_BARGE_CAPTURE_DIR
     # Seconds to wait for the sidecar's /health to answer 200 after the spawn.
     tyger_ready_timeout: float = Field(default=180.0, gt=0)    # VM_TYGER_READY_TIMEOUT
     # Experimental. "voxlock" puts a target-speaker filter in the sidecar in front of

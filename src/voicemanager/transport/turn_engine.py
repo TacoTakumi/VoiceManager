@@ -268,15 +268,40 @@ one, whichever comes first, degrades the session once:
 The session stays lost for the life of the connection: a later opt-in on it is
 refused with ``invalid_request``. Once the sidecar is back, a new connection may opt
 in again.
+
+The barge capture
+-----------------
+
+A debug aid, off unless ``barge_capture_dir`` is given (VM_TYGER_BARGE_CAPTURE_DIR).
+For each barge the session acts on it writes two files into that directory,
+``barge-<session>-<mic_sample>.wav`` and ``.json``:
+
+* the WAV is the client's mic stream (16 kHz mono 16-bit, as received, with the
+  reply's echo): everything the hold kept when the barge came in, which reaches
+  back before the onset by up to the barge lookback plus the margin, and every mic
+  frame after it up to the end of the capture;
+* the capture ends at the first endpoint event past the barge (with or without a
+  turn_end frame), at ``CAPTURE_MAX_SAMPLES`` of mic audio past the barge, at the
+  next barge, or when the connection closes; a listening boundary or the loss of
+  the sidecar drops it;
+* the note gives the positions on the mic stream (the WAV's first sample, the
+  onset, the barge, where the STT was fed from, the reply's playback stop if it
+  came), the finals the connection sent meanwhile and the turn end.
+
+The files hold the user's voice: the operator turns the capture on for a diagnosis
+and removes the files after it. Nothing limits their number.
 """
 import asyncio
 import collections
+import datetime
 import functools
 import json
 import logging
 import math
 import urllib.parse
+import wave
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable
 
 import numpy as np
@@ -323,6 +348,8 @@ MAX_QUEUED_HOPS = 32
 BARGE_LOOKBACK_SAMPLES = 4 * wire.SAMPLE_RATE
 #: Held audio kept past the barge lookback and the start wait, for events that lag.
 HOLD_MARGIN_SAMPLES = wire.SAMPLE_RATE
+#: The most mic audio past a barge that the debug capture of it keeps.
+CAPTURE_MAX_SAMPLES = 12 * wire.SAMPLE_RATE
 
 
 # --- the agent channel ----------------------------------------------------------
@@ -847,6 +874,15 @@ class MicHold:
         self._runs.clear()
         return out
 
+    def snapshot(self) -> tuple[int, bytes]:
+        """The audio in the hold now, in order, and the mic sample of its first one.
+
+        The runs are one stretch of the mic stream: each frame is pushed at the mic
+        count before it, and audio only leaves from the front."""
+        if not self._runs:
+            return self._feed.mic_samples, b""
+        return self._runs[0].start, b"".join(run.pcm for run in self._runs)
+
     def clear(self) -> int:
         """Drop everything in the hold; the samples dropped."""
         n = self.held_samples
@@ -905,6 +941,37 @@ class MicHold:
         return kind, until
 
 
+# --- the barge capture ------------------------------------------------------------
+
+@dataclass
+class _BargeCapture:
+    """The mic audio around one barge, while it is collected (see "The barge capture")."""
+    request_id: str
+    start: int                        # the mic sample of the first sample kept
+    onset: int
+    mic_sample: int                   # the barge's own
+    fed_from: int                     # where the STT was fed from
+    pcm: bytearray
+    finals: list[str] = field(default_factory=list)
+    turn_end_text: str | None = None  # the text of a turn_end frame sent meanwhile
+
+    @property
+    def end(self) -> int:
+        return self.start + len(self.pcm) // 2
+
+
+def _write_capture(directory: str, name: str, pcm: bytes, note: dict) -> None:
+    """Write one capture: <name>.wav (16 kHz mono 16-bit) and <name>.json."""
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(folder / f"{name}.wav"), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(wire.SAMPLE_RATE)
+        wav.writeframes(pcm)
+    (folder / f"{name}.json").write_text(json.dumps(note, indent=2) + "\n")
+
+
 def _asking_progress(url: str) -> str:
     """The session URL with the query parameter that asks for progress lines."""
     parts = urllib.parse.urlsplit(url)
@@ -919,7 +986,8 @@ class TurnEngineSession:
     def __init__(self, *, sidecar, stt_engine_type: str, label: str,
                  send_text: SendText, on_event: EventHandler | None = None,
                  end_turn: EndTurn | None = None, release_held: ReleaseHeld | None = None,
-                 hold_tail_ms: int = 150, start_wait_ms: int = 2000) -> None:
+                 hold_tail_ms: int = 150, start_wait_ms: int = 2000,
+                 barge_capture_dir: str = "") -> None:
         """``sidecar`` is app.state.turn_engine_sidecar (None when the setting is off):
         anything with ``up`` and ``session_url(label)``. ``label`` names this
         connection's session on the sidecar (the connection's session id).
@@ -931,7 +999,8 @@ class TurnEngineSession:
         handler's STT lock; it is called when the hold may have let audio go
         without a new mic frame (a playback frame, a barge, the start wait). The
         hold keeps ``hold_tail_ms`` past a stop and waits ``start_wait_ms`` after
-        a reply's audio_end for its playback start."""
+        a reply's audio_end for its playback start. ``barge_capture_dir``, when not
+        empty, turns on the debug capture of the mic around each barge."""
         self._sidecar = sidecar
         self._stt_engine_type = stt_engine_type
         self._label = label
@@ -963,6 +1032,11 @@ class TurnEngineSession:
         # The mic_sample of the last listening boundary: no event at or before it is
         # acted on. None while the connection never stopped listening.
         self._boundary: int | None = None
+        # The debug capture: the directory ("" is off), the capture being collected
+        # and the writes under way.
+        self._capture_dir = barge_capture_dir
+        self._capture: _BargeCapture | None = None
+        self._capture_writes: set[asyncio.Task] = set()
 
     @property
     def active(self) -> bool:
@@ -1143,7 +1217,13 @@ class TurnEngineSession:
             self._hold.push(self._feed.mic_samples, data, data)
             return
         at = self._feed.mic_samples
-        self._hold.push(at, data, self._feed.feed_mic(data))
+        pcm = self._feed.feed_mic(data)
+        self._hold.push(at, data, pcm)
+        capture = self._capture
+        if capture is not None:
+            capture.pcm += pcm
+            if capture.end - capture.mic_sample >= CAPTURE_MAX_SAMPLES:
+                self._finish_capture("cap")
         self._queue_due_hops()
 
     def _queue_due_hops(self) -> None:
@@ -1197,6 +1277,7 @@ class TurnEngineSession:
         docstring. Call it on a real listening -> stopped change, before the answer
         goes out and before the STT is reset; it never waits."""
         dropped = self._hold.clear()  # pre-stop audio never reaches the STT after it
+        self._capture = None          # nor a file
         for handle in self._timers:
             handle.cancel()
         self._timers.clear()
@@ -1247,6 +1328,8 @@ class TurnEngineSession:
         text = text.strip()
         if self.active and text:
             self._finals.append((text, turn_id))
+            if self._capture is not None:
+                self._capture.finals.append(text)
 
     async def send_turn_end(self, event: wire.EndpointEvent) -> bool:
         """Send the turn_end for every final since the previous one; False when none.
@@ -1270,6 +1353,8 @@ class TurnEngineSession:
                              mic_sample=event.mic_sample, by=event.by)
         logger.info("Turn end: session=%s turn_id=%s by=%s mic_sample=%s finals=%d",
                     self._label, msg.turn_id, msg.by, msg.mic_sample, len(finals))
+        if self._capture is not None:
+            self._capture.turn_end_text = msg.text
         await self._send_text(msg.model_dump_json())
         return True
 
@@ -1282,6 +1367,65 @@ class TurnEngineSession:
                 await self.send_turn_end(event)
         except Exception:
             logger.exception("Handling a turn end failed: session=%s", self._label)
+        capture = self._capture
+        if capture is not None and event.mic_sample > capture.mic_sample:
+            self._finish_capture("turn_end", event)
+
+    # --- the barge capture ----------------------------------------------------------
+
+    def _begin_capture(self, event: wire.BargeEvent, reply: _Reply, fed_from: int) -> None:
+        """Start the capture of one barge with everything the hold keeps now."""
+        if self._capture is not None:
+            self._finish_capture("next_barge")
+        start, pcm = self._hold.snapshot()
+        self._capture = _BargeCapture(
+            request_id=reply.request_id, start=start, onset=event.onset_mic_sample,
+            mic_sample=event.mic_sample, fed_from=fed_from, pcm=bytearray(pcm))
+
+    def _finish_capture(self, reason: str, event: wire.EndpointEvent | None = None) -> None:
+        """End the capture being collected and write it, off the loop."""
+        capture, self._capture = self._capture, None
+        if capture is None:
+            return
+        reply = self._feed.reply(capture.request_id)
+        rate = wire.SAMPLE_RATE
+        note = {
+            "session": self._label,
+            "request_id": capture.request_id,
+            "written": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "reason": reason,
+            "sample_rate": rate,
+            "start_mic_sample": capture.start,
+            "end_mic_sample": capture.end,
+            "onset_mic_sample": capture.onset,
+            "barge_mic_sample": capture.mic_sample,
+            "stt_fed_from_mic_sample": capture.fed_from,
+            "playback_stop_mic_sample": None if reply is None else reply.stop_mic,
+            "onset_offset_s": round((capture.onset - capture.start) / rate, 3),
+            "barge_offset_s": round((capture.mic_sample - capture.start) / rate, 3),
+            "finals": capture.finals,
+            "turn_end": None if event is None else {
+                "by": event.by, "mic_sample": event.mic_sample,
+                "offset_s": round((event.mic_sample - capture.start) / rate, 3),
+                "text": capture.turn_end_text},
+        }
+        name = f"barge-{self._label}-{capture.mic_sample}"
+        logger.info("Barge capture: session=%s %s.wav (%.1f s, %s)", self._label, name,
+                    len(capture.pcm) / 2 / rate, reason)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._write_capture(name, bytes(capture.pcm), note))
+        self._capture_writes.add(task)
+        task.add_done_callback(self._capture_writes.discard)
+
+    async def _write_capture(self, name: str, pcm: bytes, note: dict) -> None:
+        try:
+            await asyncio.to_thread(_write_capture, self._capture_dir, name, pcm, note)
+        except Exception as exc:
+            logger.warning("Writing the barge capture %s failed: session=%s: %s",
+                           name, self._label, exc)
 
     # --- the sidecar link -----------------------------------------------------------
 
@@ -1363,6 +1507,7 @@ class TurnEngineSession:
             handle.cancel()
         self._timers.clear()
         self._finals.clear()
+        self._capture = None
         tts = self._tts_session
         if tts is not None and tts.audio_tap is self:
             tts.audio_tap = None
@@ -1428,6 +1573,8 @@ class TurnEngineSession:
         # The user talks from the onset: no reply sent by now holds the mic from there.
         # Marked before any await, so the next mic frame already sees it.
         feed_from = max(event.onset_mic_sample, event.mic_sample - BARGE_LOOKBACK_SAMPLES)
+        if self._capture_dir:
+            self._begin_capture(event, reply, feed_from)  # before the hold lets go
         for kept in self._feed.replies():
             if kept.seen_at <= event.mic_sample and kept.barge_at is None:
                 kept.barge_at = feed_from
@@ -1454,6 +1601,7 @@ class TurnEngineSession:
         if self._closed:
             return
         self._closed = True
+        self._finish_capture("closed")  # its write is not cancelled below
         if self._remove_listener is not None:
             self._remove_listener()
             self._remove_listener = None

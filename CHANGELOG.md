@@ -12,6 +12,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the level of the `voicemanager` loggers and of the Tyger sidecar's log. `DEBUG`
   adds the per-frame and per-event lines (playback frames, turn engine events,
   finals). The loggers of other libraries stay at `INFO`.
+- Debug setting `VM_TYGER_BARGE_CAPTURE_DIR` (empty, off). With a directory, each
+  barge that an opted-in session acts on writes the mic audio around it as
+  `barge-<session>-<mic_sample>.wav` and a `.json` note with the onset, the barge,
+  the playback stop, the finals and the turn end. The capture runs from the audio
+  held before the onset to the turn end, at most 12 s past the barge. The files
+  hold the user's voice and nothing limits their number.
 
 ## [0.8.3]
 

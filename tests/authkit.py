@@ -45,6 +45,9 @@ _STORE_DIR = Path(tempfile.mkdtemp(prefix="vm-test-auth-"))
 atexit.register(shutil.rmtree, _STORE_DIR, ignore_errors=True)
 STORE_PATH = _STORE_DIR / "state.db"
 os.environ["VM_DB_PATH"] = str(STORE_PATH)
+# The barge capture writes audio files: a developer's .env that turns it on must not
+# make the suite write into that directory. A test that wants it sets the variable.
+os.environ["VM_TYGER_BARGE_CAPTURE_DIR"] = ""
 
 from voicemanager.auth import accounts  # noqa: E402  (after the env is set)
 from voicemanager.auth.store import open_store  # noqa: E402
