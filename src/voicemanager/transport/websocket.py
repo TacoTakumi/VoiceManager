@@ -47,6 +47,11 @@ WARNING_LEAD = 30
 # goes back to its usual cap: words that come later are an utterance of their own,
 # and must not get the lead-in and 2 s of old quiet audio in front of them. So a
 # barge with no speech after it cannot grow the pre-roll without limit either.
+#
+# The limit counts gated audio only. Two more things end the wait of an armed
+# lead-in, and both drop the pre-roll with it: a listen_stop, and a later reply that
+# plays with no barge (the mic hold keeps its audio from the gate, so the limit does
+# not run down under it).
 BARGE_PREROLL_MS = 2000
 
 
@@ -651,15 +656,27 @@ async def websocket_endpoint(websocket: WebSocket):
         front of each chunk that does not continue the audio before it. A barge's
         break is where its utterance starts, so the flush and the lead-in go there,
         behind any older audio the hold let go with it: see "The barge lead-in" in
-        the turn engine module.
+        the turn engine module. A gap ends the wait of a lead-in armed by an earlier
+        barge.
+
+        Breaks come only for an opted-in session, and the turn engine runs on the
+        audiocpp engine only, so the audiocpp state read here always exists.
         """
+        nonlocal audiocpp_barge_lead
         for chunk in chunks:
             if chunk is StreamBreak.BARGE:
                 await _begin_barge_utterance(send)
             elif chunk is StreamBreak.GAP:
-                # A reply played here and no barge came. The decoder needs nothing
-                # at this place for now.
-                continue
+                # A reply played here and no barge came for it. A lead-in still armed
+                # is for an earlier barge, and its time limit counts gated audio only:
+                # the audio under this reply was never gated, so the limit did not run
+                # down. The words after the reply are not that barge's. Drop the
+                # lead-in, and the pre-roll with it: it holds the audio gated since
+                # that barge, from before this reply. With no lead-in armed nothing
+                # is touched, and the pre-roll stays as it is.
+                if audiocpp_barge_lead:
+                    audiocpp_barge_lead = b""
+                    audiocpp_preroll.clear()
             else:
                 await _audiocpp_stt_frame(chunk, send)
 
@@ -873,7 +890,9 @@ async def websocket_endpoint(websocket: WebSocket):
         each received frame through here; an opted-in session's held audio comes
         through here too when the hold lets it go. A barge lead-in armed under the idle
         gate is fed at the speech onset, ahead of the pre-roll. It is dropped when
-        more than BARGE_PREROLL_MS of audio is gated after the barge with no onset.
+        more than BARGE_PREROLL_MS of audio is gated after the barge with no onset
+        (here), at a listen_stop (_discard_open_utterance) and when a later reply
+        plays with no barge (_feed_audiocpp_stt).
         """
         nonlocal audiocpp_last_audio, audiocpp_barge_lead
         was_speaking = audiocpp_endpointer.speech_active

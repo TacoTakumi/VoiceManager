@@ -387,8 +387,9 @@ def test_under_the_idle_gate_speech_long_after_the_barge_gets_no_lead_in(
 # Only a barge the session acts on puts the lead-in in front of its audio. Every other
 # way the mic hold lets audio go feeds that audio alone, byte for byte. A lead-in that
 # waits for its speech onset under the idle gate is dropped by a listen_stop, and by
-# 2 s of quiet audio after the barge. Each test sets a 600 ms lead-in, so one would
-# show if the server fed it.
+# 2 s of quiet audio after the barge (and by a later reply that plays: see the section
+# on an armed lead-in below). Each test sets a 600 ms lead-in, so one would show if the
+# server fed it.
 
 LISTEN_STOP = {"type": "listen_stop"}
 LISTEN_START = {"type": "listen_start"}
@@ -612,6 +613,95 @@ def test_the_default_is_600_ms_and_a_negative_length_is_refused():
     assert cfg.Settings(_env_file=None).tyger_barge_lead_ms == 600
     with pytest.raises(ValidationError, match="tyger_barge_lead_ms"):
         cfg.Settings(_env_file=None, tyger_barge_lead_ms=-1)
+
+
+# --- a later reply ends the wait of an armed lead-in ---------------------------------
+#
+# Under the idle gate a lead-in waits, armed, for the speech onset of its barge, and
+# the pre-roll keeps the audio gated since that barge. The time limit of the wait
+# counts gated audio only, and the audio under a later reply is never gated. So a
+# reply that plays in between ends the wait: the words after it are not that barge's,
+# and get no lead-in and none of the audio gated before the reply.
+
+def _armed_then_a_second_reply(ws, tyger, dispatched, mic: _Mic, stt) -> None:
+    """A barge on r1 with only quiet audio after its onset (10000 to 18048), so its
+    lead-in is armed; then r2 is sent and plays from sample 18048."""
+    _play_and_barge(ws, tyger, dispatched, mic)
+    assert stt.feeds == []                   # armed: the decoder has nothing
+    speak(ws, "r2")                          # holding from sample 18048
+    ws.send_json(_start("r2", 18048))
+
+
+def test_a_reply_that_plays_with_no_barge_ends_the_wait_of_an_armed_lead_in(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(32000)
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        stt = made[0]
+        _armed_then_a_second_reply(ws, tyger, dispatched, mic, stt)
+        mic.send(8 * FRAME)                  # to 26240, under the reply
+        ws.send_json(_stop("r2", 24000))     # no barge: dropped to the stop plus the tail
+        assert errors(barrier(ws)) == []
+        assert stt.feeds == []
+
+        mic.send(8 * FRAME)                  # to 34432; the words start at 32000
+        assert errors(barrier(ws)) == []
+        # An utterance of its own. The gate kept the audio from the stop plus the tail
+        # (sample 26400) to the frame the VAD started on (the one from 31360), and the
+        # decoder gets the usual pre-roll of it: the last 200 ms. No lead-in, and no
+        # sample of the 500 ms that were gated between the barge and the second reply.
+        assert _no_lead_in(stt)
+        assert 31360 - PREROLL // 2 >= 24000 + TAIL
+        assert stt.feeds[0] == stream[2 * 31360 - PREROLL:2 * 31360]
+        assert stt.fed == stream[2 * 31360 - PREROLL:2 * 34432]
+
+
+def test_a_second_barge_while_a_lead_in_is_armed_feeds_one_lead_in_at_its_own_onset(
+        tyger, gated_client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(28000)
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        stt = made[0]
+        _armed_then_a_second_reply(ws, tyger, dispatched, mic, stt)
+        mic.send(13 * FRAME)                 # to 31360; the words start at 28000
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=26000, mic_sample=30720))
+        assert [f["request_id"] for f in frames
+                if isinstance(f, dict) and f["type"] == "barge"] == ["r2"]
+        # One lead-in, the second barge's, and right behind it the audio from that
+        # barge's onset: the frames before the VAD's start as one chunk, then the rest.
+        # Nothing of the audio gated after the first barge (10000 to 18048).
+        assert _is_lead_in(stt.feeds[0])
+        assert sum(_is_lead_in(f) for f in stt.feeds) == 1
+        assert stt.feeds[1] == stream[2 * 26000:2 * 27264]
+        assert stt.fed == stt.feeds[0] + stream[2 * 26000:2 * 31360]
+
+
+def test_with_no_lead_in_armed_a_reply_that_played_leaves_the_pre_roll_as_it_is(
+        tyger, gated_client, made, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600)
+    stream = _speech_from(14500)
+    with gated_client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws, stream)
+        stt = made[0]
+        mic.send(2048)
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 4000))
+        ws.send_json(_stop("r1", 12000))     # no barge at all
+        assert errors(barrier(ws)) == []
+        # The words start right after the reply's tail (sample 14400). The onset feeds
+        # the usual pre-roll, which the gate kept from before the reply: the last
+        # 200 ms up to the playback start.
+        assert _no_lead_in(stt)
+        assert stt.feeds[0] == stream[2 * 4000 - PREROLL:2 * 4000]
+        assert stt.fed == stream[2 * 4000 - PREROLL:2 * 4000] \
+            + stream[2 * (12000 + TAIL):2 * 18048]
 
 
 # --- the lead-in goes where the fed audio breaks --------------------------------------
