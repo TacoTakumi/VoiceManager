@@ -9,6 +9,7 @@ Usage::
     python setup_models.py openvoice    # only OpenVoice v2 checkpoints + NLTK
     python setup_models.py vibevoice    # only VibeVoice model + voice presets
     python setup_models.py tyger        # only the Tyger turn-engine bundle (VM_TYGER_MODEL)
+    python setup_models.py wake         # only the wake word model (into VM_WAKE_MODEL_DIR)
     python setup_models.py whisper vibevoice  # multiple targets
 
 requirements.txt covers only the default audiocpp engines. When an engine needs
@@ -16,7 +17,9 @@ packages from its requirements-<engine>.txt that are missing, this script asks
 before it installs them, and only prints the pip command when stdin is not a TTY.
 The Tyger sidecar runs from its own environment (requirements-tyger.txt), so the
 tyger target only downloads and checks the bundle (and, with VM_TYGER_PREFILTER=voxlock,
-the pre-filter's VoxLock models); it needs nothing beyond the core.
+the pre-filter's VoxLock models); it needs nothing beyond the core. The wake target
+downloads its model with or without the wake engine's packages
+(requirements-wake.txt) and then offers to install them.
 """
 import argparse
 import hashlib
@@ -26,7 +29,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.request
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -45,6 +50,21 @@ TYGER_FILES = ["config.json", "model.safetensors", "nemotron/*.json"]
 VOXLOCK_REPO = "arbazsiddiqui/voxlock"
 VOXLOCK_REVISION = "2413b292bc2c337bfc19a9802aaf3e011e68e9c4"
 VOXLOCK_FILES = ["onnx/v2/enroll.onnx", "onnx/v2/chunk.onnx"]
+# The wake word model (VM_WAKE_ENGINE=sherpa): the English keyword spotting zipformer
+# from the sherpa-onnx model releases, as one archive with a pinned checksum. Only
+# the files the spotter loads are taken out of it: the float encoder, decoder and
+# joiner, the token list and the tokenizer model.
+WAKE_MODEL = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+WAKE_MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/"
+                  f"{WAKE_MODEL}.tar.bz2")
+WAKE_MODEL_SHA256 = "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a"
+WAKE_MODEL_FILES = (
+    "encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+    "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+    "joiner-epoch-12-avg-2-chunk-16-left-64.onnx",
+    "tokens.txt",
+    "bpe.model",
+)
 
 # Setup target for each configured engine. None means the engine has no setup step.
 STT_TARGETS = {"audiocpp": "audiocpp-stt", "whisper": "whisper", "nemotron": None, "qwen": None}
@@ -59,6 +79,7 @@ ENGINE_REQUIREMENTS = {
     "vibevoice": (("vibevoice", "diffusers"), "requirements-vibevoice.txt"),
     "nemotron": (("nemo",), "requirements-nemotron.txt"),
     "qwen": (("qwen_asr", "vllm"), "requirements-qwen.txt"),
+    "wake": (("sherpa_onnx", "sentencepiece"), "requirements-wake.txt"),
 }
 
 
@@ -252,6 +273,55 @@ def setup_voxlock():
     print(f"Pre-filter models ready in {folder}\n")
 
 
+def _fetch(url: str, dest: Path) -> None:
+    """Download ``url`` to the file ``dest``."""
+    with urllib.request.urlopen(url) as response, open(dest, "wb") as out:
+        shutil.copyfileobj(response, out)
+
+
+def setup_wake():
+    """Download the wake word model into VM_WAKE_MODEL_DIR and check its checksum.
+
+    The archive is checked against its pinned SHA-256 before anything is taken out of
+    it, and only the files the spotter loads are written, each by name, so nothing
+    in the archive chooses where a file goes. A directory that has the files already
+    is left alone. The wake engine's packages are offered last: the model is
+    downloaded with or without them.
+    """
+    folder = get_settings().wake_model_dir
+    if not folder:
+        sys.exit("wake: set VM_WAKE_MODEL_DIR to the directory the wake word model goes in.")
+    folder = Path(folder).expanduser()
+    if all((folder / name).is_file() for name in WAKE_MODEL_FILES):
+        print(f"wake: the model is already in {folder}.\n")
+    else:
+        print(f"Downloading {WAKE_MODEL} into {folder}/")
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "model.tar.bz2"
+            try:
+                _fetch(WAKE_MODEL_URL, archive)
+            except OSError as e:
+                sys.exit(f"wake: cannot download {WAKE_MODEL_URL}: {e}")
+            if _sha256(archive) != WAKE_MODEL_SHA256:
+                sys.exit("wake: the downloaded archive does not have the pinned SHA-256; "
+                         "nothing was installed.")
+            contents = {}
+            with tarfile.open(archive, "r:bz2") as tar:
+                for name in WAKE_MODEL_FILES:
+                    try:
+                        member = tar.extractfile(f"{WAKE_MODEL}/{name}")
+                    except KeyError:
+                        member = None
+                    if member is None:
+                        sys.exit(f"wake: the archive has no file {name}; nothing was installed.")
+                    contents[name] = member.read()
+            folder.mkdir(parents=True, exist_ok=True)
+            for name, data in contents.items():
+                (folder / name).write_bytes(data)
+        print(f"wake: the model is ready in {folder}.\n")
+    ensure_requirements("wake")
+
+
 def _setup_voice_presets():
     """Download voice preset .pt files from the VibeVoice GitHub repo."""
     os.makedirs(VOICES_DIR, exist_ok=True)
@@ -307,6 +377,7 @@ TARGETS = {
     "openvoice": setup_openvoice,
     "vibevoice": setup_vibevoice,
     "tyger": setup_tyger,
+    "wake": setup_wake,
 }
 
 
@@ -348,6 +419,8 @@ if __name__ == "__main__":
                 targets.append(target)
         if settings.turn_engine == "tyger":
             targets.append("tyger")
+        if settings.wake_engine == "sherpa":
+            targets.append("wake")
 
     for name in targets:
         TARGETS[name]()

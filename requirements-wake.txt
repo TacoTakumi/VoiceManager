@@ -1,0 +1,4 @@
+# VM_WAKE_ENGINE=sherpa: the sherpa-onnx keyword spotter (server-side wake word) and
+# the tokenizer that turns a wake phrase into the model's tokens. CPU only.
+sherpa-onnx>=2.0.1
+sentencepiece
