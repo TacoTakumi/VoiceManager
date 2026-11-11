@@ -40,6 +40,14 @@ def configure_logging() -> None:
     )
 
 
+def apply_log_level(level: str) -> None:
+    """Set the level of the voicemanager loggers (VM_LOG_LEVEL).
+
+    Only this package's loggers change: the root logger stays at INFO, so DEBUG does
+    not turn on the debug lines of every library."""
+    logging.getLogger("voicemanager").setLevel(level)
+
+
 def hangup_means_shutdown(shutdown=None) -> bool:
     """Make a terminal hangup run the orderly shutdown; True when a handler went in.
 
@@ -75,6 +83,7 @@ def run_server() -> None:
     import uvicorn
 
     settings = get_settings()  # Fails fast with a clear error on bad config
+    apply_log_level(settings.log_level)
     hangup_means_shutdown()
     uvicorn.run(
         "voicemanager.app:create_app",

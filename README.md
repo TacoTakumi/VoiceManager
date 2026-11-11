@@ -249,6 +249,7 @@ All settings are `VM_*` variables in `.env`. `.env.example` lists each one with 
 Some important settings:
 
 - `VM_HOST`, `VM_PORT`: the listen address (default `0.0.0.0:8255`). 8255 spells TALK on a phone keypad.
+- `VM_LOG_LEVEL`: `DEBUG`, `INFO`, `WARNING` or `ERROR` (default `INFO`), for the `voicemanager` loggers and the Tyger sidecar's log.
 - `VM_DEVICE`: `auto` (the CUDA GPU with the most free memory), `cpu`, `cuda` or `cuda:N`. The audio.cpp engine uses `VM_AUDIOCPP_DEVICE` instead.
 - `VM_DB_PATH`: the user store (default `~/.local/state/voicemanager/state.db`)
 - `VM_SESSION_TIMEOUT`: close an inactive session after this many seconds (default 300)

@@ -125,6 +125,9 @@ class Settings(BaseSettings):
     )
     host: str = Field(default="0.0.0.0")         # VM_HOST
     port: int = Field(default=8255)              # VM_PORT
+    # The level of the voicemanager loggers and of the Tyger sidecar's log. DEBUG adds
+    # the per-frame and per-event lines (playback frames, turn engine events, finals).
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")  # VM_LOG_LEVEL
     # Auth store file; blank means the XDG state dir (see resolve_db_path).
     db_path: str = Field(default="")             # VM_DB_PATH
     whisper_model: str = Field(default="tiny")   # VM_WHISPER_MODEL

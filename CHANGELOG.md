@@ -4,6 +4,15 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4]
+
+### Added
+
+- Setting `VM_LOG_LEVEL` (`INFO`): `DEBUG`, `INFO`, `WARNING` or `ERROR`. It sets
+  the level of the `voicemanager` loggers and of the Tyger sidecar's log. `DEBUG`
+  adds the per-frame and per-event lines (playback frames, turn engine events,
+  finals). The loggers of other libraries stay at `INFO`.
+
 ## [0.8.3]
 
 ### Fixed

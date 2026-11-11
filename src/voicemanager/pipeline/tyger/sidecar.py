@@ -103,6 +103,9 @@ class TygerSidecar:
         if settings.tyger_prefilter != "off":
             rule_args += ["--prefilter", settings.tyger_prefilter,
                           "--prefilter-floor-db", str(settings.tyger_prefilter_floor_db)]
+        # Likewise the log level: passed only when it is not the sidecar's default.
+        if settings.log_level != "INFO":
+            rule_args += ["--log-level", settings.log_level.lower()]
         return cls(python=settings.tyger_py, port=settings.tyger_port, device=device,
                    model=settings.tyger_model, revision=settings.tyger_revision,
                    rule_args=rule_args, ready_timeout_s=settings.tyger_ready_timeout)
