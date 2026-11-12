@@ -29,10 +29,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dry about a second into a reply, heard as a short dropout, mostly while an LLM
   was decoding on the same machine. The engine made chunks that double up to
   1280 ms, and that client had under 100 ms left when the first 1280 ms chunk
-  was due. The sidecar now sets `stream_frames_per_event=4` for Breeze, so audio
-  comes in chunks of at most 320 ms and that client keeps about 350 ms. The time
-  to the first audio is the same; a reply takes 5 to 9 percent longer to make,
-  in about four times as many binary frames. No protocol change. **Rebuild the
+  was due. The sidecar now sets `stream_frames_per_event=4` for Breeze, so the
+  engine makes chunks of at most 320 ms and that client keeps about 350 ms. The
+  time to the first audio is the same. A reply takes up to about 9 percent longer
+  to make (6 to 9 percent in sentence mode, 1 to 4 percent in clause mode) and
+  comes in two to three times as many binary frames. The first binary frame of
+  an engine request can still be longer than 320 ms, because the start buffer
+  sends its held audio as one frame. No protocol change. **Rebuild the
   sidecar** to get the new default. `stream_frames_per_event=16` in
   `VM_AUDIOCPP_TTS_REQUEST_OPTIONS` brings back the earlier chunks. See
   [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause),

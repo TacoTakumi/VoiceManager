@@ -64,8 +64,8 @@ public:
     // text_chunk_size=200 / max_tokens=500 pinned as its request-option defaults), and
     // voxcpm2-tts-streaming (retry_badcase=false pinned as its sole request-option
     // default, ref_text optional), and breeze-tts-streaming (text_chunk_size=200 /
-    // guidance_scale=1.0 pinned as its request-option defaults, ref_text required,
-    // 24 kHz output), and qwen3-tts-streaming (no pinned options, ref_text required,
+    // guidance_scale=1.0 / stream_frames_per_event=4 pinned as its request-option
+    // defaults, ref_text required, 24 kHz output), and qwen3-tts-streaming (no pinned options, ref_text required,
     // 24 kHz output). Adding a model is one more entry here plus its payload - the
     // drive loop does not change.
     static TaskRegistry default_registry();

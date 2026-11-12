@@ -111,9 +111,10 @@ TaskRegistry TaskRegistry::default_registry() {
     // 1280 ms), and each chunk takes about 0.55 times its length to make, so a client
     // that plays audio on arrival had under 100 ms left when the first 1280 ms chunk
     // was due and ran dry there whenever the engine was a little slower. With 4 frames
-    // the audio comes in steps of 320 ms and that client keeps about 350 ms. The time
-    // to the first audio is the same; a whole reply takes 5 to 9 percent longer to
-    // make. An operator --request-option of the same key still wins. No other request
+    // the engine's chunks are at most 320 ms and that client keeps about 350 ms. The
+    // time to the first audio is the same; a whole reply takes up to about 9 percent
+    // longer to make (measured: 6 to 9 percent for one long request, 1 to 4 percent
+    // when a reply is several requests). An operator --request-option of the same key still wins. No other request
     // or session option is set. ref_text_required=true: breeze clones from
     // a reference clip plus its transcript and rejects an empty one. sample_rate=24000:
     // breeze's vocoder emits 24 kHz (speech_decoder.cpp kSampleRate) and READY
