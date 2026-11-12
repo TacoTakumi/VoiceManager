@@ -4,6 +4,21 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1]
+
+### Fixed
+
+- Clause mode on the audiocpp engine: a reply had a gap of up to about a second
+  between two sentences. Breeze makes a long pause at a period, inside one engine
+  request and at its end, and the server sent it as it was. A `tts_stream` request
+  with `chunking: "clause"` now sends a silent run up to
+  `VM_AUDIOCPP_TTS_CLAUSE_SILENCE_MS` (new setting, default 400 ms) and drops the
+  rest of the run. `0` sends the audio as the engine made it. Speech is not
+  changed, the protocol is not changed, and a sentence-mode request is not
+  changed. The server log has a new line for each engine request of a clause
+  request with its longest silent run and the time dropped. See
+  [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause).
+
 ## [0.9.0]
 
 ### Added
