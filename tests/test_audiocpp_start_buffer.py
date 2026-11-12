@@ -77,8 +77,11 @@ class _WS:
 
 
 def _pipe(engine: _Engine, events: list, **kwargs) -> AudioCppTTSStreamPipeline:
+    # The silence cap is off here: it sends a clause request's audio in whole
+    # windows of 10 ms, and these tests pin the sizes of the frames.
     pipe = AudioCppTTSStreamPipeline(TTSPipeline(engine=engine, executor=None),
                                      clause_continue=False, clause_end_mark="",
+                                     clause_silence_ms=0,
                                      **{**_NO_TIMER, **kwargs})
     original = pipe._report_audio
 
