@@ -16,6 +16,14 @@ What must hold for the start buffer:
   * with nothing unplayed, the full buffer is held, as before;
   * a sentence request holds the full buffer for every engine request, as before.
 
+What must hold for the coalescing window:
+
+  * with 500 ms or less unplayed, the next engine request starts at once;
+  * with much more unplayed, the full window is used and text that arrives in it
+    joins the engine request;
+  * the wait ends when the unplayed audio falls to 500 ms;
+  * a sentence request uses the full window, as before.
+
 Model-free and server-free: a fake engine gives the audio and a fake WebSocket
 takes the frames.
 """
@@ -164,3 +172,82 @@ def test_the_first_engine_request_holds_the_full_buffer():
 def test_a_sentence_request_holds_the_full_buffer_for_every_engine_request():
     frames = _two_requests(_Engine([20, 8]), chunking="sentence")
     assert [ms(n) for n in frames] == [250] + [50] * 3
+
+
+# --- the coalescing window --------------------------------------------------------------
+
+WINDOW_MS = 350
+
+
+def _later_text(engine: _Engine, third_after: float | None, chunking: str = "clause"):
+    """One request: a first piece, a second piece queued while the first engine
+    request runs, and (with `third_after`) a third piece that many seconds after
+    the first engine request ended. Done comes 1 s after that end."""
+    ws = _WS()
+    engine.ws = ws
+
+    async def run() -> None:
+        pipe = _pipe(engine, coalesce_ms=WINDOW_MS)
+        if chunking == "clause":
+            texts = ["One two three. ", "Four five six. ", "Seven eight nine."]
+            flush = True
+        else:
+            texts = [_SENTENCE + " Meanwhile the careful gray owl watches",
+                     " quietly from the tallest branch of the old oak tree. Down in the"
+                     " valley the patient badger",
+                     " digs a new tunnel beneath the crumbling stone wall. Far above them"]
+            flush = False
+        await pipe.feed_text(texts[0], False, ws, "r1", chunking=chunking, flush=flush)
+        await _until(lambda: len(engine.texts) == 1)
+        await pipe.feed_text(texts[1], False, ws, "r1", chunking=chunking, flush=flush)
+        await asyncio.sleep(0.02)
+        engine.gate.set()
+        await _until(lambda: len(engine.ended_at) >= 1)
+        if third_after is not None:
+            await asyncio.sleep(third_after)
+            await pipe.feed_text(texts[2], False, ws, "r1", chunking=chunking, flush=flush)
+            await asyncio.sleep(1.0 - third_after)
+        else:
+            await asyncio.sleep(1.0)
+        await pipe.feed_text("", True, ws, "r1", chunking=chunking)
+        await asyncio.wait_for(pipe.synthesis_task, 5.0)
+
+    asyncio.run(run())
+    return engine.started_at[1] - engine.ended_at[0]
+
+
+def test_with_a_low_reserve_the_next_engine_request_starts_at_once():
+    """0.3 s unplayed, below the floor of 0.5 s: no wait for more text."""
+    engine = _Engine([6, 4, 4])
+    wait = _later_text(engine, third_after=None)
+    assert wait < 0.1
+    assert engine.texts[1] == "Four five six."
+
+
+def test_with_a_high_reserve_the_full_window_is_used():
+    """3.0 s unplayed: text that comes 150 ms after the first engine request ended
+    joins the second one, which starts when the window of 0.35 s has passed."""
+    engine = _Engine([60, 4])
+    wait = _later_text(engine, third_after=0.15)
+    assert engine.texts[1:] == ["Four five six. Seven eight nine."]
+    assert 0.33 <= wait < 0.5
+
+
+def test_the_wait_ends_when_the_reserve_falls_to_the_floor():
+    """About 0.65 s unplayed when the first engine request ends: the wait is the
+    0.15 s above the floor, less the few ms that passed, not the window of 0.35 s."""
+    engine = _Engine([13, 4])
+    wait = _later_text(engine, third_after=None)
+    assert 0.08 <= wait <= 0.25
+    assert engine.texts[1] == "Four five six."
+
+
+def test_a_sentence_request_uses_the_full_window_with_nothing_unplayed():
+    """The first engine request left 0.15 s, played out before the third sentence
+    comes: a sentence request still waits the full window and takes it in. The
+    words left at done make a third engine request."""
+    engine = _Engine([3, 4, 4])
+    wait = _later_text(engine, third_after=0.2, chunking="sentence")
+    assert len(engine.texts) == 3
+    assert "owl" in engine.texts[1] and "badger" in engine.texts[1]
+    assert 0.33 <= wait < 0.5

@@ -109,6 +109,12 @@ MODEL_TASK_SAMPLE_RATES = {BREEZE_TTS_MODEL_TASK: 24000, QWEN3_TTS_MODEL_TASK: 2
 DEFAULT_VOICE = "designed_female_s101"
 
 
+# In a clause request the coalescing window is spent only from the unplayed audio
+# above this many seconds, so the next engine request has time to give its first
+# audio before the client runs dry.
+COALESCE_RESERVE_S = 0.5
+
+
 class PresetLoadError(RuntimeError):
     """A voice asset failed validation at load time (fail-fast)."""
 
@@ -1098,7 +1104,16 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 # stalls, and cancellation still lands promptly because the wait is
                 # an awaited wait_for, not a sleep.
                 if self._coalesce_ms and batches and not ended:
-                    deadline = loop.time() + self._coalesce_ms / 1000.0
+                    window = self._coalesce_ms / 1000.0
+                    if clause:
+                        # The window is spent against the playback of the previous
+                        # batch. A short first piece or a slow engine leaves little
+                        # of it, so wait only while the client keeps a reserve: the
+                        # estimate falls by one second each second, and the wait
+                        # ends when it reaches the floor.
+                        window = min(window, max(
+                            0.0, self._unplayed_audio_s(request_id) - COALESCE_RESERVE_S))
+                    deadline = loop.time() + window
                     while (remaining := deadline - loop.time()) > 0:
                         try:
                             queued = await asyncio.wait_for(
