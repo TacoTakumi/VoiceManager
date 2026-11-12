@@ -14,6 +14,8 @@ What must hold:
     engine's audio unchanged;
   * the unplayed-audio estimate counts the samples sent;
   * the composed reference gets the engine's own audio;
+  * audio that is not a whole number of 10 ms windows arrives in full: the
+    rest that the limiter keeps between chunks goes out before the request ends;
   * each engine request logs its longest silent run and the time dropped;
   * the cap defaults to the setting.
 
@@ -37,6 +39,7 @@ import authkit  # test auth env; must be imported before voicemanager
 from voicemanager.config import Settings
 from voicemanager.pipeline import audiocpp_tts
 from voicemanager.pipeline.audiocpp_tts import AudioCppTTSStreamPipeline
+from voicemanager.pipeline.silence_limiter import SilenceLimiter
 from voicemanager.pipeline.tts import TTSPipeline, float32_to_pcm16
 
 SR = 24000
@@ -67,9 +70,11 @@ class _Engine:
     is_batch = False
     sample_rate = SR
 
-    def __init__(self, signals: list[np.ndarray], gate: asyncio.Event | None = None):
+    def __init__(self, signals: list[np.ndarray], gate: asyncio.Event | None = None,
+                 chunk: int = CHUNK):
         self._signals = list(signals)
         self._gate = gate
+        self._chunk = chunk
         self.texts: list[str] = []
 
     async def ensure_ready(self) -> None:
@@ -81,8 +86,8 @@ class _Engine:
     async def stream_synthesize(self, text: str, **kwargs):
         self.texts.append(text)
         signal = self._signals[len(self.texts) - 1]
-        for pos in range(0, len(signal), CHUNK):
-            yield signal[pos:pos + CHUNK]
+        for pos in range(0, len(signal), self._chunk):
+            yield signal[pos:pos + self._chunk]
         if self._gate is not None and len(self.texts) == 1:
             await self._gate.wait()
 
@@ -103,9 +108,9 @@ def _pipe(engine, **kwargs) -> AudioCppTTSStreamPipeline:
     return AudioCppTTSStreamPipeline(TTSPipeline(engine=engine, executor=None), **options)
 
 
-def _speak(signal: np.ndarray, chunking: str = "clause", **kwargs):
+def _speak(signal: np.ndarray, chunking: str = "clause", chunk: int = CHUNK, **kwargs):
     """One request with one engine request; returns (bytes sent, samples reported)."""
-    engine = _Engine([signal])
+    engine = _Engine([signal], chunk=chunk)
     ws = _WS()
     reported: list[int] = []
 
@@ -185,6 +190,75 @@ def test_a_run_across_two_engine_requests_is_one_run():
     between = sent[len(head):-len(head)]
     assert not any(between)
     assert abs(len(between) // 2 - int(SR * 0.4)) <= WINDOW
+
+
+# --- audio that does not end on a window ------------------------------------------------
+
+def _limited(signal: np.ndarray, cap_ms: int) -> np.ndarray:
+    """What a limiter of its own makes of the whole signal."""
+    limiter = SilenceLimiter(SR, cap_ms)
+    return np.concatenate([limiter.feed(signal), limiter.flush()])
+
+
+def _ramp(samples: int) -> np.ndarray:
+    """A short piece that is not silence and has no two equal samples."""
+    return np.linspace(0.2, 0.6, samples, dtype=np.float32)
+
+
+@pytest.mark.parametrize("chunk", [1000, 1920, 7])
+@pytest.mark.parametrize("start_buffer_ms", [0, 250])
+def test_the_rest_of_an_unaligned_request_is_sent_before_it_ends(chunk, start_buffer_ms):
+    """The signal is 157 samples longer than a whole number of windows. Those
+    samples wait in the limiter after the last engine chunk; the request must
+    still send them."""
+    signal = np.concatenate([LONG_PAUSE, _ramp(157)])
+    assert len(signal) % WINDOW
+    expected = _limited(signal, 400)
+    sent, reported = _speak(signal, chunk=chunk, clause_silence_ms=400,
+                            start_buffer_ms=start_buffer_ms)
+    assert sent == pcm(expected)
+    assert sent.endswith(pcm(_ramp(157)))
+    assert reported == len(expected)
+    assert abs(len(expected) - (len(signal) - int(SR * 0.6))) <= WINDOW
+
+
+def test_the_rest_goes_on_into_the_next_engine_request_and_out_at_the_end():
+    """Two engine requests, neither a whole number of windows: the rest of the
+    first joins the second, and the rest of the second goes out at the end."""
+    first = np.concatenate([tone(0.5), silence(0.3), np.zeros(100, dtype=np.float32)])
+    second = np.concatenate([silence(0.3), tone(0.5), _ramp(57)])
+    assert len(first) % WINDOW and len(second) % WINDOW
+    expected = _limited(np.concatenate([first, second]), 400)
+    ws = _WS()
+    reported: list[int] = []
+
+    async def run() -> int:
+        gate = asyncio.Event()
+        engine = _Engine([first, second], gate, chunk=1000)
+        pipe = _pipe(engine, clause_silence_ms=400)
+        real = pipe._report_audio
+
+        def report(request_id, n_samples, sample_rate):
+            reported.append(n_samples)
+            real(request_id, n_samples, sample_rate)
+
+        pipe._report_audio = report
+        await pipe.feed_text("Permissions are set.", False, ws, "r1", chunking="clause",
+                             flush=True)
+        for _ in range(200):
+            if engine.texts:
+                break
+            await asyncio.sleep(0.005)
+        await pipe.feed_text(" The file is writable.", True, ws, "r1", chunking="clause")
+        gate.set()
+        await asyncio.wait_for(pipe.synthesis_task, 5.0)
+        return len(engine.texts)
+
+    assert asyncio.run(run()) == 2
+    sent = bytes(ws.audio)
+    assert sent == pcm(expected)
+    assert sent.endswith(pcm(_ramp(57)))
+    assert sum(reported) == len(expected)
 
 
 # --- where the limiter is not used ------------------------------------------------------
