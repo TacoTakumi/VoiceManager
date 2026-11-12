@@ -1001,6 +1001,20 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         """The cap for a silent run in a clause request's audio; 0 is off."""
         return self._clause_silence_ms
 
+    def _log_seam(self, request_id: str, waited_samples: int, sample_rate: int) -> None:
+        """Log the client's reserve at a seam between two engine requests.
+
+        Called just before the first audio of an engine request after the first
+        is sent: `reserve_ms` is the unplayed-audio estimate at that time (0 means
+        the client ran dry by the estimate) and `held_ms` the audio that waited in
+        the start buffer.
+        """
+        logger.info(
+            "Clause TTS seam: request_id=%s reserve_ms=%d held_ms=%d",
+            request_id, int(self._unplayed_audio_s(request_id) * 1000),
+            waited_samples * 1000 // sample_rate if sample_rate > 0 else 0,
+        )
+
     async def _write_clause_reference(self, state: "_ClauseReference", loop,
                                       sample_rate: int) -> str:
         """Compose the reference for the next piece into a new temp WAV, off-loop.
@@ -1216,6 +1230,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 held_samples = 0
                 dispatched_at = time.monotonic()
                 first_chunk = True
+                # The first send of an engine request after the first is a seam:
+                # log how much audio the client still had then, by the estimate,
+                # and how much audio waited in the start buffer.
+                seam_pending = clause and batches > 0
+                waited_samples = 0
                 async for chunk_np in engine.stream_synthesize(text, **kwargs):
                     if first_chunk and clause:
                         first_chunk = False
@@ -1240,9 +1259,13 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                                        * engine.sample_rate)
                         if held_samples + unplayed < hold_samples:
                             continue
+                        waited_samples = held_samples - len(chunk_np)
                         chunk_np = np.concatenate(held)
                         held = []
                         hold_samples = 0  # buffer sent: the rest pass through
+                    if seam_pending:
+                        seam_pending = False
+                        self._log_seam(request_id, waited_samples, engine.sample_rate)
                     await websocket.send_bytes(float32_to_pcm16(chunk_np))
                     # Clause mode's unplayed-audio estimate needs every chunk sent;
                     # a no-op on a sentence request. Clause pieces cut while this
@@ -1251,6 +1274,9 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 if held:
                     # The request ended before the buffer filled: send what it made.
                     block = np.concatenate(held)
+                    if seam_pending:
+                        seam_pending = False
+                        self._log_seam(request_id, len(block), engine.sample_rate)
                     await websocket.send_bytes(float32_to_pcm16(block))
                     self._report_audio(request_id, len(block), engine.sample_rate)
                 if refs is not None:

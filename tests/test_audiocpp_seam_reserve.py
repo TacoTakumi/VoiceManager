@@ -24,6 +24,8 @@ What must hold for the coalescing window:
   * the wait ends when the unplayed audio falls to 500 ms;
   * a sentence request uses the full window, as before.
 
+Each engine request after the first logs the reserve at its seam.
+
 Model-free and server-free: a fake engine gives the audio and a fake WebSocket
 takes the frames.
 """
@@ -31,6 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 
 import numpy as np
 
@@ -251,3 +255,64 @@ def test_a_sentence_request_uses_the_full_window_with_nothing_unplayed():
     assert len(engine.texts) == 3
     assert "owl" in engine.texts[1] and "badger" in engine.texts[1]
     assert 0.33 <= wait < 0.5
+
+
+# --- the log line -----------------------------------------------------------------------
+
+_SEAM = re.compile(r"Clause TTS seam: request_id=(\S+) reserve_ms=(\d+) held_ms=(\d+)")
+_LOGGER = "voicemanager.pipeline.audiocpp_tts"
+
+
+def _seam_lines(caplog) -> list[tuple[str, int, int]]:
+    found = []
+    for record in caplog.records:
+        match = _SEAM.fullmatch(record.getMessage())
+        if match:
+            assert record.levelno == logging.INFO
+            found.append((match.group(1), int(match.group(2)), int(match.group(3))))
+    return found
+
+
+def test_a_later_engine_request_logs_the_reserve_at_its_seam(caplog):
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _two_requests(_Engine([20, 8]))
+    lines = _seam_lines(caplog)
+    assert len(lines) == 1
+    request_id, reserve, held = lines[0]
+    assert request_id == "r1"
+    assert 800 <= reserve <= 1000
+    assert held == 0
+
+
+def test_the_seam_line_gives_the_audio_that_waited(caplog):
+    """150 ms unplayed, buffer 250 ms: 100 ms waited when the third chunk came."""
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _two_requests(_Engine([3, 8]))
+    lines = _seam_lines(caplog)
+    assert len(lines) == 1
+    assert 100 <= lines[0][1] <= 150
+    assert lines[0][2] == 100
+
+
+def test_a_dry_client_shows_as_a_reserve_of_zero(caplog):
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _two_requests(_Engine([3, 8], delays=[0.0, 0.3]))
+    assert _seam_lines(caplog) == [("r1", 0, 200)]
+
+
+def test_one_engine_request_and_a_sentence_request_log_no_seam_line(caplog):
+    engine = _Engine([8])
+    ws = _WS()
+    engine.ws = ws
+
+    async def run() -> None:
+        pipe = _pipe(engine)
+        engine.gate.set()
+        await pipe.feed_text("One two three.", True, ws, "r1", chunking="clause")
+        await asyncio.wait_for(pipe.synthesis_task, 5.0)
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        asyncio.run(run())
+        _two_requests(_Engine([20, 8]), chunking="sentence")
+    assert len(engine.texts) == 1
+    assert _seam_lines(caplog) == []
