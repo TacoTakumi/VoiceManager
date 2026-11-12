@@ -4,6 +4,25 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2]
+
+### Added
+
+- The audiocpp engine logs when it sent each audio frame of a `tts_stream`
+  request. One INFO line at the end of each request, in sentence mode and in
+  clause mode, lists the send time and the audio length of each binary frame,
+  with a mark between two engine requests, and gives the lowest reserve of a
+  client that plays on arrival (`TTS frames: ... min_reserve_ms=... at_ms=...
+  sent=[...]`). A negative reserve means that such a client ran dry. Use it to
+  find where a reply's audio came late: a wait inside one engine request, or a
+  seam. Nothing that a client receives changes. See
+  [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause),
+  "Frame times".
+- `scripts/audiocpp_tts_frame_probe.py`: a manual script that speaks test
+  replies through the real stream pipeline on a private TTS sidecar and prints
+  the frame line of each one. It does not use a running server. It needs GPU
+  memory for one more TTS sidecar.
+
 ## [0.9.1]
 
 ### Fixed
