@@ -7,7 +7,8 @@
 //     qwen3-tts-streaming
 //   - breeze descriptor: family breeze_tts, task tts, mode streaming, input_kind none,
 //     ref_text_required true, sample_rate 24000, request options EXACTLY
-//     text_chunk_size=200 and guidance_scale=1.0, no session options
+//     text_chunk_size=200, guidance_scale=1.0 and stream_frames_per_event=4, no
+//     session options
 //   - qwen3 descriptor: family qwen3_tts, task tts, mode streaming, input_kind none,
 //     ref_text_required true, sample_rate 24000, no request or session options
 //   - READY reports the descriptor's rate: 48000 for dots and voxcpm2, 24000 for breeze
@@ -71,9 +72,12 @@ void test_breeze_descriptor() {
           "breeze taxonomy: streaming TTS, no streaming input feed");
     CHECK(breeze->ref_text_required, "breeze requires a reference transcript");
     CHECK(breeze->sample_rate == 24000, "breeze output rate is 24 kHz");
-    const sidecar::OptionMap expected{{"text_chunk_size", "200"}, {"guidance_scale", "1.0"}};
+    const sidecar::OptionMap expected{{"text_chunk_size", "200"},
+                                      {"guidance_scale", "1.0"},
+                                      {"stream_frames_per_event", "4"}};
     CHECK(breeze->request_options == expected,
-          "breeze request options are EXACTLY text_chunk_size=200 and guidance_scale=1.0");
+          "breeze request options are EXACTLY text_chunk_size=200, guidance_scale=1.0 "
+          "and stream_frames_per_event=4");
     CHECK(breeze->session_options.empty(), "breeze pins no session options");
 }
 

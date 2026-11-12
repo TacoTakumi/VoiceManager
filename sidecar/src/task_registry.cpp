@@ -105,8 +105,16 @@ TaskRegistry TaskRegistry::default_registry() {
     // and voxcpm2. Request-option defaults pin
     // upstream's documented streaming recipe: text_chunk_size=200 keeps long text below
     // the model's drift range and guidance_scale=1.0 is the documented CFG default,
-    // written down HERE so the recipe holds even if the dev engine's defaults move. No
-    // other request or session option is set. ref_text_required=true: breeze clones from
+    // written down HERE so the recipe holds even if the dev engine's defaults move.
+    // stream_frames_per_event=4 caps a streamed audio chunk at 4 frames (320 ms). The
+    // engine's own default is 16 with chunks that double (80, 160, 320, 640, then
+    // 1280 ms), and each chunk takes about 0.55 times its length to make, so a client
+    // that plays audio on arrival had under 100 ms left when the first 1280 ms chunk
+    // was due and ran dry there whenever the engine was a little slower. With 4 frames
+    // the audio comes in steps of 320 ms and that client keeps about 350 ms. The time
+    // to the first audio is the same; a whole reply takes 5 to 9 percent longer to
+    // make. An operator --request-option of the same key still wins. No other request
+    // or session option is set. ref_text_required=true: breeze clones from
     // a reference clip plus its transcript and rejects an empty one. sample_rate=24000:
     // breeze's vocoder emits 24 kHz (speech_decoder.cpp kSampleRate) and READY
     // advertises it.
@@ -121,6 +129,7 @@ TaskRegistry TaskRegistry::default_registry() {
         /*request_options=*/{
             {"text_chunk_size", "200"},
             {"guidance_scale", "1.0"},
+            {"stream_frames_per_event", "4"},
         },
         /*ref_text_required=*/true,
         /*sample_rate=*/24000,

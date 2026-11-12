@@ -417,8 +417,10 @@ engine defaults); the voxtral entry pins its arena/context recipe as session-opt
 defaults; the dots entry pins the upstream long-form guards (`text_chunk_size=200`,
 `max_tokens=500`) as request-option defaults and requires `ref_text`; the voxcpm2
 entry pins `retry_badcase=false` (streaming throws without it) and
-`voxcpm2.chunk_strategy=stateless`, and makes `ref_text` optional; the breeze entry pins `text_chunk_size=200` and
-`guidance_scale=1.0` as its only request-option defaults, requires `ref_text`, and
+`voxcpm2.chunk_strategy=stateless`, and makes `ref_text` optional; the breeze entry pins `text_chunk_size=200`,
+`guidance_scale=1.0` and `stream_frames_per_event=4` (a streamed audio chunk of at most
+320 ms, so a client that plays on arrival keeps a reserve; the engine's default of 16
+sends chunks of up to 1280 ms) as its only request-option defaults, requires `ref_text`, and
 declares 24000 as its output rate; the qwen3 entry pins no options, requires `ref_text`
 and declares 24000 - all carried on the descriptor
 (`ref_text_required`, `sample_rate`), never a family string comparison in the drive
