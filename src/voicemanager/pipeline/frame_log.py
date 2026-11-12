@@ -18,6 +18,10 @@ from __future__ import annotations
 import time
 from typing import Callable
 
+# The line lists this many frames. A longer request says how many it left out;
+# its counts and its lowest reserve still cover every frame.
+MAX_LISTED = 200
+
 
 class FrameLog:
     """Times and lengths of the frames of one request, and the line for the log."""
@@ -51,10 +55,11 @@ class FrameLog:
                 self._lowest = reserve
                 self._lowest_at = since_first
         length_s = n_samples / sample_rate
-        if self._mark_next:
-            self._entries.append("|")
-            self._mark_next = False
-        self._entries.append(f"{round(since_first * 1000)}:{round(length_s * 1000)}")
+        if self._count < MAX_LISTED:
+            if self._mark_next:
+                self._entries.append("|")
+            self._entries.append(f"{round(since_first * 1000)}:{round(length_s * 1000)}")
+        self._mark_next = False
         self._count += 1
         self._audio_s += length_s
         self._last_at = since_first
@@ -65,10 +70,13 @@ class FrameLog:
             reserve, at = "none", "none"
         else:
             reserve, at = str(round(self._lowest * 1000)), str(round(self._lowest_at * 1000))
+        listed = " ".join(self._entries)
+        if self._count > MAX_LISTED:
+            listed += f" +{self._count - MAX_LISTED} more"
         return (
             f"TTS frames: request_id={request_id} chunking={chunking} "
             f"frames={self._count} audio_ms={round(self._audio_s * 1000)} "
             f"span_ms={round(self._last_at * 1000)} "
             f"min_reserve_ms={reserve} at_ms={at} "
-            f"sent=[{' '.join(self._entries)}]"
+            f"sent=[{listed}]"
         )

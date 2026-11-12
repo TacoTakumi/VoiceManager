@@ -23,6 +23,10 @@ What must hold:
   * the times and lengths are those of the frames as sent: after the silence cap,
     with the audio that the start buffer held as the one frame it is sent as, and
     with the rest that the silence limiter sends at the end of a clause request.
+  * a request that is cancelled, or whose engine raises, logs the line for the
+    frames that it sent; a request that sent no audio logs it with 0 frames;
+  * a request with more than 200 frames lists its first 200 and says how many it
+    left out, and the counts and the lowest reserve cover all of them.
 
 Model-free and server-free: a fake engine gives the audio and sets a fake clock,
 and a fake WebSocket takes the frames.
@@ -89,6 +93,7 @@ class _Engine:
         self.script = script
         self.gate = asyncio.Event()
         self.texts: list[str] = []
+        self.fail_after_chunks = False
 
     async def ensure_ready(self) -> None:
         return None
@@ -99,6 +104,8 @@ class _Engine:
         for at_ms, audio in self.script[index]:
             self.clock.set_ms(at_ms)
             yield audio
+        if self.fail_after_chunks:
+            raise RuntimeError("the engine failed")
         if index == 0:
             await self.gate.wait()
 
@@ -262,3 +269,101 @@ def test_the_line_gives_the_frames_as_the_client_got_them(caplog):
     assert sum(sent_ms) == 100 * 3 + 100 + 105 + 100   # 200 ms of silence dropped
     assert sent_ms[-1] == 5                       # the limiter's rest at the end
     assert "|" not in line["sent"]
+
+
+# --- requests that do not end in the normal way -----------------------------------------
+
+def test_a_cancelled_request_logs_the_frames_that_it_sent(caplog):
+    clock = _Clock()
+    engine = _Engine(clock, [[(0, _speech(200)), (100, _speech(200))]])
+    ws = _WS()
+
+    async def run() -> None:
+        pipe = _pipe(engine)
+        await pipe.feed_text("One two three.", True, ws, "r1", chunking="sentence")
+        # The engine request stays open after its two chunks: the gate is not set.
+        await _until(lambda: len(ws.frames) == 2)
+        task = pipe.synthesis_task
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        asyncio.run(run())
+    lines = _frame_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["frames"] == "2"
+    assert lines[0]["sent"] == "0:200 100:200"
+    assert (lines[0]["reserve"], lines[0]["at"]) == ("100", "100")
+
+
+def test_a_request_whose_engine_raises_logs_the_frames_that_it_sent(caplog):
+    clock = _Clock()
+    engine = _Engine(clock, [[(0, _speech(200))]])
+    engine.fail_after_chunks = True
+    ws = _WS()
+
+    async def run() -> None:
+        pipe = _pipe(engine)
+        await pipe.feed_text("One two three.", True, ws, "r1", chunking="sentence")
+        try:
+            await asyncio.wait_for(pipe.synthesis_task, 5.0)
+        except RuntimeError:
+            pass
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        asyncio.run(run())
+    lines = _frame_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["frames"] == "1"
+    assert lines[0]["sent"] == "0:200"
+    # One frame has no later send to measure a reserve at.
+    assert (lines[0]["reserve"], lines[0]["at"]) == ("none", "none")
+
+
+def test_a_request_with_no_text_logs_the_line_with_no_frames(caplog):
+    clock = _Clock()
+    engine = _Engine(clock, [])
+    ws = _WS()
+
+    async def run() -> None:
+        pipe = _pipe(engine)
+        await pipe.feed_text("", True, ws, "r1", chunking="sentence")
+        await asyncio.wait_for(pipe.synthesis_task, 5.0)
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        asyncio.run(run())
+    assert engine.texts == [] and ws.frames == []
+    lines = _frame_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert (line["frames"], line["audio"], line["span"]) == ("0", "0", "0")
+    assert (line["reserve"], line["at"]) == ("none", "none")
+    assert line["sent"] == ""
+
+
+# --- a very long request ----------------------------------------------------------------
+
+def test_a_long_request_lists_its_first_200_frames_and_counts_them_all(caplog):
+    """250 frames of 10 ms, one each 5 ms, but frame 240 comes 5 s late: the
+    lowest reserve is at a frame that the list leaves out, and still counts."""
+    def at(i: int) -> int:
+        return i * 5 + (5000 if i >= 240 else 0)
+
+    line, ws = _one_request(caplog, [(at(i), _speech(10)) for i in range(250)])
+    assert len(ws.frames) == 250
+    assert line["frames"] == "250"
+    assert line["audio"] == "2500"
+    assert line["span"] == str(at(249))
+    listed, _, left_out = line["sent"].partition(" +")
+    assert listed.split() == [f"{i * 5}:10" for i in range(200)]
+    assert left_out == "50 more"
+    # 2400 ms sent before frame 240, which goes at 6200 ms.
+    assert (line["reserve"], line["at"]) == ("-3800", "6200")
+
+
+def test_a_request_of_200_frames_lists_them_all(caplog):
+    line, _ = _one_request(caplog, [(i * 5, _speech(10)) for i in range(200)])
+    assert line["sent"].split() == [f"{i * 5}:10" for i in range(200)]
