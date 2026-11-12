@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -316,3 +317,22 @@ def test_one_engine_request_and_a_sentence_request_log_no_seam_line(caplog):
         _two_requests(_Engine([20, 8]), chunking="sentence")
     assert len(engine.texts) == 1
     assert _seam_lines(caplog) == []
+
+
+# -- the client guide ---------------------------------------------------------
+
+def test_the_guide_says_that_a_low_reserve_skips_the_coalescing_wait():
+    """With nothing unplayed only the start buffer works as in a sentence
+    request. The coalescing wait does not: a clause request does not wait at
+    all, and a sentence request waits the full window. The guide must say so."""
+    guide = (Path(__file__).resolve().parents[1] / "docs"
+             / "client-integration.md").read_text(encoding="utf-8")
+    heading = "**Reserve at a seam (audiocpp).**"
+    paragraphs = [p for p in guide.split("\n\n") if p.startswith(heading)]
+    assert len(paragraphs) == 1
+    text = paragraphs[0]
+    assert "both work as in a sentence-mode request" not in text
+    assert ("With nothing unplayed the start buffer works as in a "
+            "sentence-mode request.") in text
+    assert ("with 500 ms or less unplayed a clause-mode request does not wait, "
+            "where a sentence-mode request waits the full window") in text
