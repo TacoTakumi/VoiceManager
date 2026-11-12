@@ -55,6 +55,7 @@ import soundfile as sf
 
 from voicemanager.config import get_settings
 from voicemanager.pipeline.audiocpp_stt import SidecarError, SidecarFault
+from voicemanager.pipeline.silence_limiter import SilenceLimiter
 from voicemanager.pipeline.tts import TTSEngine, TTSStreamPipeline, float32_to_pcm16
 
 logger = logging.getLogger(__name__)
@@ -933,7 +934,8 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
 
     def __init__(self, *args, coalesce_ms: int = 0, clause_continue: bool | None = None,
                  clause_tail_ms: int | None = None, start_buffer_ms: int | None = None,
-                 clause_end_mark: str | None = None, **kwargs) -> None:
+                 clause_end_mark: str | None = None,
+                 clause_silence_ms: int | None = None, **kwargs) -> None:
         """Same surface as the base pipeline plus the coalescing window.
 
         `coalesce_ms` defaults to 0 - the drain-what-is-already-queued behavior
@@ -944,12 +946,13 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         (VM_AUDIOCPP_TTS_CLAUSE_CONTINUE, VM_AUDIOCPP_TTS_CLAUSE_TAIL_MS) when
         not given, so the websocket layer need not know about them.
         `start_buffer_ms` likewise defaults to VM_AUDIOCPP_TTS_START_BUFFER_MS,
-        and `clause_end_mark` to VM_AUDIOCPP_TTS_CLAUSE_END_MARK.
+        and `clause_end_mark` to VM_AUDIOCPP_TTS_CLAUSE_END_MARK, and
+        `clause_silence_ms` to VM_AUDIOCPP_TTS_CLAUSE_SILENCE_MS.
         """
         super().__init__(*args, **kwargs)
         self._coalesce_ms = max(0, int(coalesce_ms))
         if (clause_continue is None or clause_tail_ms is None or start_buffer_ms is None
-                or clause_end_mark is None):
+                or clause_end_mark is None or clause_silence_ms is None):
             settings = get_settings()
             if clause_continue is None:
                 clause_continue = settings.audiocpp_tts_clause_continue
@@ -959,6 +962,9 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 start_buffer_ms = settings.audiocpp_tts_start_buffer_ms
             if clause_end_mark is None:
                 clause_end_mark = settings.audiocpp_tts_clause_end_mark
+            if clause_silence_ms is None:
+                clause_silence_ms = settings.audiocpp_tts_clause_silence_ms
+        self._clause_silence_ms = max(0, int(clause_silence_ms))
         self._clause_continue = bool(clause_continue)
         self._clause_tail_ms = max(1, int(clause_tail_ms))
         self._start_buffer_ms = max(0, int(start_buffer_ms))
@@ -983,6 +989,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     def clause_end_mark(self) -> str:
         """The mark added to a clause engine request that ends without one."""
         return self._clause_end_mark
+
+    @property
+    def clause_silence_ms(self) -> int:
+        """The cap for a silent run in a clause request's audio; 0 is off."""
+        return self._clause_silence_ms
 
     async def _write_clause_reference(self, state: "_ClauseReference", loop,
                                       sample_rate: int) -> str:
@@ -1041,6 +1052,10 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 preset = None
             if preset is not None:
                 refs = _ClauseReference(preset=preset)
+        # One limiter for the whole clause request, so a silent run that goes
+        # from the end of one engine request into the start of the next is one
+        # run. Made at the first engine request, when the sample rate is known.
+        limiter: SilenceLimiter | None = None
         try:
             while not ended:
                 sentence = await self._sentence_queue.get()
@@ -1164,6 +1179,8 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                                 "the piece clones from the preset", request_id,
                                 exc_info=True)
                     refs.start_piece()
+                if clause and limiter is None:
+                    limiter = SilenceLimiter(engine.sample_rate, self._clause_silence_ms)
                 if clause:
                     logger.info(
                         "Clause TTS engine request: request_id=%s parts=%d text=%r ref=%s",
@@ -1188,6 +1205,14 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                         )
                     if refs is not None:
                         refs.add_audio(chunk_np)
+                    if limiter is not None:
+                        # The reference above keeps the engine's own audio. What
+                        # goes to the client, and into the unplayed-audio
+                        # estimate, is the audio after the limiter.
+                        given = len(chunk_np)
+                        chunk_np = limiter.feed(chunk_np)
+                        if given and not len(chunk_np):
+                            continue  # all of it dropped, or kept for the next feed
                     if hold_samples > 0:
                         held.append(chunk_np)
                         held_samples += len(chunk_np)
@@ -1213,6 +1238,13 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                     "Streamed coalesced TTS batch: request_id=%s parts=%d text=%s",
                     request_id, len(parts), text[:50],
                 )
+            if limiter is not None:
+                # The request is complete: send the rest that the limiter kept
+                # (less than one window). A cancelled request drops it.
+                rest = limiter.flush()
+                if len(rest):
+                    await websocket.send_bytes(float32_to_pcm16(rest))
+                    self._report_audio(request_id, len(rest), engine.sample_rate)
         finally:
             # The composed references belong to this request: gone on done,
             # cancel, the flush timeout and disconnect alike. Unlinks only, so

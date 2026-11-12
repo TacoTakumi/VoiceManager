@@ -301,6 +301,13 @@ class Settings(BaseSettings):
     # can cut or weaken the last word of a text that ends with no mark. Empty
     # sends every text as it is.
     audiocpp_tts_clause_end_mark: str = Field(default=",")   # VM_AUDIOCPP_TTS_CLAUSE_END_MARK
+    # Cap for a silent run in the audio of a chunking="clause" request. Breeze
+    # makes a pause of up to about a second at a period, inside one engine
+    # request and at its end, and the next engine request follows at once, so
+    # the listener hears a gap between two sentences. A silent run is sent up to
+    # this many ms and the rest of the run is dropped. 0 sends the audio as the
+    # engine made it.
+    audiocpp_tts_clause_silence_ms: int = Field(default=400, ge=0)  # VM_AUDIOCPP_TTS_CLAUSE_SILENCE_MS
 
     # VoXtream TTS sidecar (only used when VM_TTS_ENGINE=voxtream). VoXtream reads
     # streamed text at the speaking rate, so one generation speaks a whole tts_stream

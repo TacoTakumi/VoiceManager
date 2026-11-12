@@ -47,7 +47,8 @@ class _Engine:
 
     ``audio_s`` sets the duration of the chunk at ``sample_rate``; None yields an
     empty chunk, so the unplayed estimate stays 0 and only the first-piece rule
-    applies.
+    applies. The chunk is not silence: the audiocpp pipeline caps a silent run
+    in a clause request, and this audio stands for speech.
     """
 
     is_batch = False
@@ -71,7 +72,7 @@ class _Engine:
     async def stream_synthesize(self, text: str, **kwargs):
         self.calls.append((text, asyncio.get_running_loop().time()))
         n = 0 if self._audio_s is None else int(round(self._audio_s * self._sample_rate))
-        yield np.zeros(n, dtype=np.float32)
+        yield np.full(n, 0.1, dtype=np.float32)
 
 
 class _WS:
@@ -320,7 +321,7 @@ class _BusyEngine(_Engine):
         if first:
             await self.release.wait()
         n = 0 if self._audio_s is None else int(round(self._audio_s * self._sample_rate))
-        yield np.zeros(n, dtype=np.float32)
+        yield np.full(n, 0.1, dtype=np.float32)
 
 
 def test_audiocpp_merges_pieces_cut_while_busy_into_one_request():
