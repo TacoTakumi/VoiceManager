@@ -1233,6 +1233,14 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                     self._report_audio(request_id, len(block), engine.sample_rate)
                 if refs is not None:
                     refs.finish_piece(text)
+                if limiter is not None:
+                    # Written with the cap at 0 too (dropped_ms=0), so the log
+                    # shows the pauses the engine makes before a cap is chosen.
+                    longest_ms, dropped_ms = limiter.take_stats()
+                    logger.info(
+                        "Clause TTS silence: request_id=%s longest_run_ms=%d dropped_ms=%d",
+                        request_id, longest_ms, dropped_ms,
+                    )
                 batches += 1
                 logger.debug(
                     "Streamed coalesced TTS batch: request_id=%s parts=%d text=%s",

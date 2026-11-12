@@ -14,6 +14,7 @@ What must hold:
     engine's audio unchanged;
   * the unplayed-audio estimate counts the samples sent;
   * the composed reference gets the engine's own audio;
+  * each engine request logs its longest silent run and the time dropped;
   * the cap defaults to the setting.
 
 Model-free and server-free: a fake engine gives the audio and a fake WebSocket
@@ -23,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -217,6 +220,48 @@ def test_the_composed_reference_gets_the_engine_audio(monkeypatch):
     sent, _ = _speak(LONG_PAUSE, clause_silence_ms=400, clause_continue=True)
     assert np.array_equal(np.concatenate(given), LONG_PAUSE)
     assert abs(len(sent) // 2 - int(SR * 1.4)) <= WINDOW
+
+
+# --- the log line -----------------------------------------------------------------------
+
+_LINE = re.compile(
+    r"Clause TTS silence: request_id=(\S+) longest_run_ms=(\d+) dropped_ms=(\d+)")
+
+
+def _silence_lines(caplog) -> list[tuple[str, int, int]]:
+    found = []
+    for record in caplog.records:
+        match = _LINE.fullmatch(record.getMessage())
+        if match:
+            assert record.levelno == logging.INFO
+            found.append((match.group(1), int(match.group(2)), int(match.group(3))))
+    return found
+
+
+def test_each_engine_request_logs_its_longest_run_and_the_time_dropped(caplog):
+    with caplog.at_level(logging.INFO, logger="voicemanager.pipeline.audiocpp_tts"):
+        _speak(LONG_PAUSE, clause_silence_ms=400)
+    lines = _silence_lines(caplog)
+    assert len(lines) == 1
+    request_id, longest, dropped = lines[0]
+    assert request_id == "r1"
+    assert abs(longest - 1000) <= 10
+    assert abs(dropped - 600) <= 10
+
+
+def test_cap_zero_logs_the_run_with_nothing_dropped(caplog):
+    with caplog.at_level(logging.INFO, logger="voicemanager.pipeline.audiocpp_tts"):
+        _speak(LONG_PAUSE, clause_silence_ms=0)
+    lines = _silence_lines(caplog)
+    assert len(lines) == 1
+    assert abs(lines[0][1] - 1000) <= 10
+    assert lines[0][2] == 0
+
+
+def test_a_sentence_request_logs_no_silence_line(caplog):
+    with caplog.at_level(logging.INFO, logger="voicemanager.pipeline.audiocpp_tts"):
+        _speak(LONG_PAUSE, chunking="sentence", clause_silence_ms=400)
+    assert _silence_lines(caplog) == []
 
 
 # --- the setting ------------------------------------------------------------------------
