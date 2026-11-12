@@ -55,6 +55,7 @@ import soundfile as sf
 
 from voicemanager.config import get_settings
 from voicemanager.pipeline.audiocpp_stt import SidecarError, SidecarFault
+from voicemanager.pipeline.frame_log import FrameLog
 from voicemanager.pipeline.silence_limiter import SilenceLimiter
 from voicemanager.pipeline.tts import TTSEngine, TTSStreamPipeline, float32_to_pcm16
 
@@ -941,7 +942,8 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     def __init__(self, *args, coalesce_ms: int = 0, clause_continue: bool | None = None,
                  clause_tail_ms: int | None = None, start_buffer_ms: int | None = None,
                  clause_end_mark: str | None = None,
-                 clause_silence_ms: int | None = None, **kwargs) -> None:
+                 clause_silence_ms: int | None = None,
+                 frame_clock: Callable[[], float] = time.monotonic, **kwargs) -> None:
         """Same surface as the base pipeline plus the coalescing window.
 
         `coalesce_ms` defaults to 0 - the drain-what-is-already-queued behavior
@@ -954,8 +956,12 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         `start_buffer_ms` likewise defaults to VM_AUDIOCPP_TTS_START_BUFFER_MS,
         and `clause_end_mark` to VM_AUDIOCPP_TTS_CLAUSE_END_MARK, and
         `clause_silence_ms` to VM_AUDIOCPP_TTS_CLAUSE_SILENCE_MS.
+
+        `frame_clock` gives the send time of each frame for the frame line in
+        the log. A test replaces it to set those times.
         """
         super().__init__(*args, **kwargs)
+        self._frame_clock = frame_clock
         self._coalesce_ms = max(0, int(coalesce_ms))
         if (clause_continue is None or clause_tail_ms is None or start_buffer_ms is None
                 or clause_end_mark is None or clause_silence_ms is None):
@@ -1059,7 +1065,10 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         loop = asyncio.get_running_loop()
         batches = 0
         ended = False
-        clause = self._chunking == "clause"
+        # Read once: a later request on this pipeline can change the attribute
+        # while this one still unwinds.
+        chunking = self._chunking
+        clause = chunking == "clause"
         # Composed-reference state for this request; None when the feature is
         # off, on a sentence request, or when the engine has no presets to read.
         refs: _ClauseReference | None = None
@@ -1076,6 +1085,8 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         # from the end of one engine request into the start of the next is one
         # run. Made at the first engine request, when the sample rate is known.
         limiter: SilenceLimiter | None = None
+        # When each frame of this request was sent, for one log line at its end.
+        frames = FrameLog(self._frame_clock)
         try:
             while not ended:
                 sentence = await self._sentence_queue.get()
@@ -1235,6 +1246,7 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 # and how much audio waited in the start buffer.
                 seam_pending = clause and batches > 0
                 waited_samples = 0
+                frames.engine_request()
                 async for chunk_np in engine.stream_synthesize(text, **kwargs):
                     if first_chunk and clause:
                         first_chunk = False
@@ -1267,6 +1279,7 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                         seam_pending = False
                         self._log_seam(request_id, waited_samples, engine.sample_rate)
                     await websocket.send_bytes(float32_to_pcm16(chunk_np))
+                    frames.sent(len(chunk_np), engine.sample_rate)
                     # Clause mode's unplayed-audio estimate needs every chunk sent;
                     # a no-op on a sentence request. Clause pieces cut while this
                     # request synthesizes queue up and the drain above merges them.
@@ -1278,6 +1291,7 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                         seam_pending = False
                         self._log_seam(request_id, len(block), engine.sample_rate)
                     await websocket.send_bytes(float32_to_pcm16(block))
+                    frames.sent(len(block), engine.sample_rate)
                     self._report_audio(request_id, len(block), engine.sample_rate)
                 if refs is not None:
                     refs.finish_piece(text)
@@ -1300,8 +1314,12 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 rest = limiter.flush()
                 if len(rest):
                     await websocket.send_bytes(float32_to_pcm16(rest))
+                    frames.sent(len(rest), engine.sample_rate)
                     self._report_audio(request_id, len(rest), engine.sample_rate)
         finally:
+            # First, and with no await before it: a request that was cancelled
+            # or whose engine raised still shows the frames that it sent.
+            logger.info("%s", frames.line(request_id, chunking))
             # The composed references belong to this request: gone on done,
             # cancel, the flush timeout and disconnect alike. Unlinks only, so
             # this stays safe inline on a cancellation unwind.
