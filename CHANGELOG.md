@@ -18,6 +18,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   changed. The server log has a new line for each engine request of a clause
   request with its longest silent run and the time dropped. See
   [Clause mode](docs/client-integration.md#2-clause-mode-chunking-clause).
+- Clause mode on the audiocpp engine: the audio queue of a client could run dry at
+  the first seam between two engine requests of a reply, heard as a dropout about
+  a second into the reply, mostly while an LLM was decoding on the same machine.
+  The start buffer held the first audio of every engine request, also while the
+  client still played the one before it, and the coalescing wait could add up to
+  `VM_AUDIOCPP_TTS_COALESCE_MS`. In a clause request the start buffer now counts
+  the audio the client has not played yet, and the coalescing wait ends when
+  500 ms of it are left. The audio of a later engine request reaches the client
+  about 340 ms earlier. The server log has a new line for each such seam with the
+  client's reserve. No setting and no protocol change, and a sentence-mode request
+  is not changed.
 
 ## [0.9.0]
 
