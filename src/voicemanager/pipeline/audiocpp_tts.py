@@ -1191,6 +1191,11 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                 # between them. Hold this request's audio until the buffer is full
                 # and send it as one chunk; later chunks go out as they arrive.
                 # Audio still held when a cancel lands is dropped with the task.
+                # In a clause request the buffer counts the audio the client has
+                # not played yet: at a seam between two engine requests the client
+                # still plays the previous one, and a hold there only takes from
+                # its reserve. With nothing unplayed (the first engine request, a
+                # client that ran dry, a sentence request) the full buffer is held.
                 hold_samples = engine.sample_rate * self._start_buffer_ms // 1000
                 held: list[np.ndarray] = []
                 held_samples = 0
@@ -1216,7 +1221,9 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                     if hold_samples > 0:
                         held.append(chunk_np)
                         held_samples += len(chunk_np)
-                        if held_samples < hold_samples:
+                        unplayed = int(self._unplayed_audio_s(request_id)
+                                       * engine.sample_rate)
+                        if held_samples + unplayed < hold_samples:
                             continue
                         chunk_np = np.concatenate(held)
                         held = []

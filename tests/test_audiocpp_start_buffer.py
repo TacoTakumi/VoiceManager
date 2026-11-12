@@ -153,9 +153,11 @@ def test_a_zero_buffer_sends_every_chunk_on_arrival():
     _assert_reported_on_send(engine, ws, events)
 
 
-# --- each clause piece holds again ------------------------------------------------------
+# --- a later clause piece counts the audio still unplayed --------------------------------
 
-def test_the_second_clause_piece_holds_again():
+def test_the_second_clause_piece_does_not_hold_while_the_first_still_plays():
+    """The first piece left 250 ms unplayed, more than the buffer of 150 ms, so
+    the second piece is sent as it comes. The first piece holds the buffer."""
     engine, events = _Engine(6), []
     ws = _WS(events)
 
@@ -168,8 +170,7 @@ def test_the_second_clause_piece_holds_again():
 
     asyncio.run(run())
     assert engine.texts == ["One two", "three four"]
-    piece = [4 * CHUNK, CHUNK, CHUNK]
-    assert _sends(events) == piece + piece
+    assert _sends(events) == [4 * CHUNK, CHUNK, CHUNK] + [CHUNK] * 6
     _assert_reported_on_send(engine, ws, events)
 
 

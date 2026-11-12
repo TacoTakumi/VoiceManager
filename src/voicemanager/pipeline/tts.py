@@ -677,6 +677,18 @@ class TTSStreamPipeline:
             self._sentence_queue.put_nowait(piece)
         self._wake_clause_timer()
 
+    def _unplayed_audio_s(self, request_id: str) -> float:
+        """The clause chunker's estimate of the audio the client has not played yet.
+
+        Seconds, from the audio reported through ``_report_audio``. 0 on a sentence
+        request, which keeps no estimate, and for a request that is no longer the
+        current one.
+        """
+        chunker = self._clause_chunker
+        if chunker is None or request_id != self._request_id:
+            return 0.0
+        return chunker.unplayed_estimate()
+
     async def _clause_timer_loop(
         self, chunker: ClauseChunker, wake: asyncio.Event, queue: asyncio.Queue
     ) -> None:
