@@ -65,13 +65,23 @@ def _area(path: str) -> str:
     return top if top in AREAS else "other"
 
 
-def _shipped_files() -> list[str]:
+def _tracked_files() -> list[str]:
+    """Every tracked path, as it is on disk.
+
+    With -z git ends each path with NUL and writes it as it is. Without -z it
+    writes a path with a non-ASCII character, a double quote or a backslash in C
+    quotes, and such a path would match no prefix here.
+    """
     try:
-        out = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True,
-                             text=True, check=True).stdout
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT,
+                             capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         pytest.skip("needs a git checkout to list the tracked files")
-    return [p for p in out.splitlines()
+    return [p for p in out.split("\0") if p]
+
+
+def _shipped_files() -> list[str]:
+    return [p for p in _tracked_files()
             if p != SELF and not p.startswith(PRIVATE_PREFIXES)]
 
 
@@ -142,16 +152,27 @@ def test_every_private_tracked_file_is_stripped_from_the_release():
     EXCLUDE_PATHS entries as literal paths, with no pattern, so a new private file
     under a prefix such as the agenda files is published unless it is listed.
     """
-    try:
-        out = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True,
-                             text=True, check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        pytest.skip("needs a git checkout to list the tracked files")
     excludes = _release_excludes()
-    published = [path for path in out.splitlines()
+    published = [path for path in _tracked_files()
                  if path.startswith(PRIVATE_PREFIXES)
                  and not any(path == entry or path.startswith(entry + "/")
                              for entry in excludes)]
     assert not published, (
         "private files that the release would publish (add them to EXCLUDE_PATHS "
         "in .releaserc):\n" + "\n".join(published))
+
+
+def test_the_release_guard_sees_a_path_that_git_would_quote(monkeypatch):
+    """Without -z git writes a path with a non-ASCII character, a double quote or
+    a backslash in C quotes, so it would not start with a private prefix and the
+    guard would pass over it."""
+    name = "docs/agenda-2026-12-01-café.md"
+    quoted = '"docs/agenda-2026-12-01-caf\\303\\251.md"'
+
+    def fake_git(cmd, **kwargs):
+        out = f"{name}\0README.md\0" if "-z" in cmd else f"{quoted}\nREADME.md\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_git)
+    with pytest.raises(AssertionError, match="agenda-2026-12-01"):
+        test_every_private_tracked_file_is_stripped_from_the_release()
