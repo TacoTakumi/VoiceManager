@@ -1134,6 +1134,38 @@ def test_a_second_barge_from_a_later_place_gets_a_gap_break_after_the_reply_betw
     assert rig.marked() == [_s(30000, 32048)]            # and no break after that one
 
 
+# A barge that still waits for its audio is forgotten at a listening boundary and at
+# the loss of the sidecar. A mark left behind would stay at its old place, and the
+# echo of the next reply would take it from a later barge.
+
+def _a_second_barge_gets_its_own_break(rig: _HoldRig) -> None:
+    """r2 is sent now and plays from sample 18048, and a barge comes on it at 26000."""
+    rig.reply("r2")
+    rig.playback(_start("r2", 18048))
+    rig.mic(30000)
+    assert rig.marked() == []                # r2 plays: its echo waits in the hold
+    rig.barge(26000, 28000)
+    assert rig.marked() == [BARGE, _s(26000, 30000)]
+
+
+def test_a_listening_boundary_forgets_a_barge_that_still_waits_for_its_audio():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # at the mic count: none of its audio is in
+    assert rig.marked() == []
+    assert rig.hold.clear() == 0             # the listening boundary
+    rig.feed.listen_boundary()
+    rig.feed.listen_start()
+    _a_second_barge_gets_its_own_break(rig)
+
+
+def test_take_all_forgets_a_barge_that_still_waits_for_its_audio():
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)
+    assert rig.marked() == []
+    assert rig.hold.take_all() == []         # the hold ends with nothing in it
+    _a_second_barge_gets_its_own_break(rig)
+
+
 def _barge_at_the_mic_count_then_a_second_reply(ws, tyger, dispatched, mic: _Mic) -> None:
     """r1 plays from sample 3000 and a barge comes at the newest mic sample (18048), so
     the hold has none of the barge's audio. Then r2 is sent with no mic frame in
@@ -1205,6 +1237,44 @@ def test_with_no_vad_a_second_barge_from_a_later_place_gets_no_flush_and_no_lead
         assert ("finalize",) not in stt.events
         assert _no_lead_in(stt)
         assert stt.fed == _s(0, 3000) + _s(26000, 30336)
+
+
+def test_with_no_vad_a_barge_after_a_listening_boundary_gets_its_lead_in(
+        tyger, client, made, dispatched, env):
+    """A barge at the newest mic sample has none of its audio in when the client
+    stops listening. The boundary forgets it. The next reply plays from the same
+    sample, and a barge on that reply gets its own lead-in."""
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws)
+        stt = made[0]
+        mic.send(2048)
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 3000))
+        assert errors(barrier(ws)) == []
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=18048, mic_sample=18048))
+        assert "barge" in [f["type"] for f in frames if isinstance(f, dict)]
+        ws.send_json(LISTEN_STOP)
+        assert {"type": "listen_stopped", "mic_sample": 18048} in barrier(ws)
+        ws.send_json(LISTEN_START)
+        assert errors(barrier(ws)) == []
+        fed = len(stt.feeds)
+
+        speak(ws, "r2")                      # holding from sample 18048
+        ws.send_json(_start("r2", 18048))
+        mic.send(8 * FRAME)                  # to 26240, under the reply
+        assert errors(barrier(ws)) == []
+        assert stt.feeds[fed:] == []         # all of it is r2's echo so far
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=26000, mic_sample=26240))
+        assert [f["request_id"] for f in frames
+                if isinstance(f, dict) and f["type"] == "barge"] == ["r2"]
+        after = stt.feeds[fed:]
+        assert _is_lead_in(after[0])
+        assert b"".join(after[1:]) == _s(26000, 26240)
 
 
 def test_under_the_idle_gate_a_barge_with_no_audio_of_its_own_arms_no_lead_in(
