@@ -26,6 +26,9 @@ the end one row per reply:
                 first frame arrives; negative means that it ran dry
     at_ms       when that was, from the first frame
     wait_ms     the longest time between two frames, and when it ended
+    cut         '+N' when the server listed only the first frames of a long
+                reply and left N out; wait_ms and wait_at then cover the listed
+                frames only
 
 Sessions:
   warm   one sidecar session for all replies, with one reply spoken first and
@@ -69,6 +72,8 @@ _FRAME_LINE = re.compile(
     r"min_reserve_ms=(?P<reserve>-?\d+|none) at_ms=(?P<at>\d+|none) "
     r"sent=\[(?P<sent>[^\]]*)\]"
 )
+# The tail that the server adds when it lists only the first frames of a reply.
+_CUT_TAIL = re.compile(r"\+(?P<more>\d+) more\s*$")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -104,7 +109,6 @@ class _Frames:
 
     def __init__(self) -> None:
         self.first_frame_at: float | None = None
-        self.frames = 0
 
     async def send_text(self, data: str) -> None:
         del data
@@ -112,7 +116,6 @@ class _Frames:
     async def send_bytes(self, data: bytes) -> None:
         if self.first_frame_at is None and data:
             self.first_frame_at = time.monotonic()
-        self.frames += 1
 
 
 class _Lines(logging.Handler):
@@ -142,6 +145,20 @@ def longest_wait(sent: str) -> tuple[int, int]:
     return best, at
 
 
+def cut_count(sent: str) -> int:
+    """How many frames the server left out of the list; 0 for a whole list."""
+    match = _CUT_TAIL.search(sent)
+    return int(match["more"]) if match else 0
+
+
+def format_row(label: str, row: dict) -> str:
+    """One line of the summary table."""
+    cut = f"+{row['cut']}" if row["cut"] else ""
+    return (f"{label:<12} {row['chars']:>5} {row['frames']:>6} {row['audio']:>8} "
+            f"{row['span']:>7} {str(row['first_ms']):>8} {row['reserve']:>10} "
+            f"{row['at']:>6} {row['wait_ms']:>7} {row['wait_at']:>7} {cut:>6}")
+
+
 async def speak(pipe, text: str, request_id: str, args, lines: _Lines) -> dict:
     """Feed one reply and wait for its end; returns the row for the summary."""
     lines.frame_line = None
@@ -158,7 +175,7 @@ async def speak(pipe, text: str, request_id: str, args, lines: _Lines) -> dict:
         await pipe.feed_text("", True, ws, request_id, voice=args.voice,
                              chunking=args.chunking)
     await pipe.synthesis_task
-    row = {"chars": len(text), "first_ms": None, "frames": ws.frames}
+    row = {"chars": len(text), "first_ms": None}
     if ws.first_frame_at is not None:
         row["first_ms"] = round((ws.first_frame_at - started) * 1000)
     match = _FRAME_LINE.fullmatch(lines.frame_line or "")
@@ -166,6 +183,7 @@ async def speak(pipe, text: str, request_id: str, args, lines: _Lines) -> dict:
         raise RuntimeError(f"no frame line for {request_id}: {lines.frame_line!r}")
     row.update(match.groupdict())
     row["wait_ms"], row["wait_at"] = longest_wait(match["sent"])
+    row["cut"] = cut_count(match["sent"])
     return row
 
 
@@ -178,7 +196,18 @@ async def open_session(base_engine, settings, args):
     engine = base_engine.session_engine()
     # Spawn and load now, as the server's warm-up does at the connect. A load
     # that fails (no memory on the card) raises here and ends the probe.
-    await asyncio.to_thread(engine.connect)
+    connecting = asyncio.ensure_future(asyncio.to_thread(engine.connect))
+    try:
+        await asyncio.shield(connecting)
+    except BaseException:
+        # The caller never gets this engine, so its finally cannot close it.
+        # After a cancel the connect thread runs on and may still start a
+        # sidecar: wait for that thread to end, then close the engine.
+        try:
+            await asyncio.wait([connecting])
+        finally:
+            await close_session(engine)
+        raise
     tts_pipeline = TTSPipeline(
         engine=engine, executor=None, language=settings.tts_language,
         speaker_key=settings.tts_speaker_key, speed=settings.tts_speed,
@@ -264,15 +293,18 @@ async def run(args: argparse.Namespace) -> int:
 
     print()
     print(f"{'reply':<12} {'chars':>5} {'frames':>6} {'audio_ms':>8} {'span_ms':>7} "
-          f"{'first_ms':>8} {'reserve_ms':>10} {'at_ms':>6} {'wait_ms':>7} {'wait_at':>7}")
+          f"{'first_ms':>8} {'reserve_ms':>10} {'at_ms':>6} {'wait_ms':>7} {'wait_at':>7} "
+          f"{'cut':>6}")
     dry = 0
+    cut = 0
     for label, row in rows:
         if row["reserve"] != "none" and int(row["reserve"]) < 0:
             dry += 1
-        print(f"{label:<12} {row['chars']:>5} {row['frames']:>6} {row['audio']:>8} "
-              f"{row['span']:>7} {str(row['first_ms']):>8} {row['reserve']:>10} "
-              f"{row['at']:>6} {row['wait_ms']:>7} {row['wait_at']:>7}")
-    print(f"=== {len(rows)} replies, {dry} with a negative reserve ===")
+        if row["cut"]:
+            cut += 1
+        print(format_row(label, row))
+    print(f"=== {len(rows)} replies, {dry} with a negative reserve, {cut} with a cut "
+          f"frame list ===")
     return 0
 
 
