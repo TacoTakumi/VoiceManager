@@ -275,6 +275,10 @@ async for pcm_chunk in client.stream_tts_live(token_stream(), voice="Carter"):
     play(pcm_chunk)   # sample rate available via client.last_tts_sample_rate
 ```
 
+Both raise `TTSError` when the server fails the request (an `audio_end` with
+`reason: "error"`). Its `error_type` tells why. See
+[Client method reference](#client-method-reference).
+
 **Per-segment seam.** One-shot synthesis renders the whole string as a single
 utterance with continuous prosody. Streaming synthesizes each speakable unit the
 server accumulates as its own segment, and VibeVoice **restarts its prosody per
@@ -1624,11 +1628,28 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 
 | Method | Signature | Returns | Purpose |
 |---|---|---|---|
-| `synthesize_tts` | `(text, voice=None)` | `tuple[bytes, int]` | One-shot synthesis; returns `(pcm_bytes, sample_rate)`. |
-| `stream_tts` | `(text_chunks, voice=None)` | `tuple[bytes, int]` | Stream text chunks, collect all audio, and return `(pcm_bytes, sample_rate)`. |
-| `stream_tts_live` | `(text_chunks, voice=None, request_id=None)` | `AsyncIterator[bytes]` | Stream text and yield PCM chunks as they arrive; supply or read `request_id` for barge-in. |
+| `synthesize_tts` | `(text, voice=None)` | `tuple[bytes, int]` | One-shot synthesis; returns `(pcm_bytes, sample_rate)`. Raises `TTSError` when the request fails (see below). |
+| `stream_tts` | `(text_chunks, voice=None)` | `tuple[bytes, int]` | Stream text chunks, collect all audio, and return `(pcm_bytes, sample_rate)`. Raises `TTSError` when the request fails (see below). |
+| `stream_tts_live` | `(text_chunks, voice=None, request_id=None)` | `AsyncIterator[bytes]` | Stream text and yield PCM chunks as they arrive; supply or read `request_id` for barge-in. Raises `TTSError` when the request fails (see below). |
 | `cancel_tts` | `(request_id)` | `None` | Fire-and-forget cancel; returns as soon as the `tts_cancel` frame is sent. |
 | `flush_tts` | `(request_id)` | `None` | Synthesize the buffered text for an in-flight streaming request now, leaving it open (one `flush:true, done:false` frame). |
+
+**A failed request raises `TTSError`.** `synthesize_tts`, `stream_tts` and
+`stream_tts_live` raise `TTSError` when their request's `audio_end` has
+`reason: "error"`. The error's `error_type` attribute then holds the
+`error_type` of the TTS `error` frame the server sent for that request:
+`tts_unavailable` (the engine failed, a later request may succeed) or
+`unknown_voice` (pick a voice from `available_voices`). The message is the
+frame's `message`. When no such frame came, as on the one-shot `tts` path,
+`error_type` is `None` and the message is fixed. The client matches the frame
+to the request by wire order: the server sends it before that `audio_end`, and
+an `error` frame read before the request started does not count.
+`synthesize_tts` and `stream_tts` drop the partial audio. `stream_tts_live`
+has already yielded the audio that came before the `audio_end`, then it raises.
+The `error` frame also still goes to the error queue that
+`DuplexSession.errors()` reads. A lost connection or a timeout also raises
+`TTSError`, with `error_type` `None`. The reasons `complete`, `cancelled` and
+`interrupted` do not raise: the method returns, or the iteration ends.
 
 ### Full duplex: `duplex()`
 

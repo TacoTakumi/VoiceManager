@@ -45,6 +45,13 @@ _TURN_ENGINE_LOST = "turn_engine_lost"
 # a wake_word opt-in. The refusal has no error_type of its own, so the message tells
 # it from the other invalid_request frames.
 _WAKE_REFUSAL = "wake_word refused"
+# The error_types the server sends for a TTS request that fails: the TTS engine is
+# down, or the request named a voice the engine does not have. The frame has no
+# request_id; it comes before the request's audio_end, which has reason "error".
+_TTS_REQUEST_ERRORS = ("tts_unavailable", "unknown_voice")
+# The message of the TTSError for an audio_end with reason "error" that no TTS
+# error frame came before (the one-shot tts path sends none).
+_TTS_FAILED_NO_FRAME = "The server ended the TTS request with an error"
 # The default of VoiceManagerClient._reconnect: reconnect whatever socket is current.
 _CURRENT_SOCKET = object()
 
@@ -101,7 +108,17 @@ class STTError(VoiceManagerError):
 
 
 class TTSError(VoiceManagerError):
-    """Raised when an error occurs during TTS synthesis."""
+    """Raised when an error occurs during TTS synthesis.
+
+    ``error_type`` is the error_type of the server's TTS error frame when the
+    request failed on the server (``tts_unavailable`` or ``unknown_voice``), and
+    None otherwise: a request that ended with reason ``error`` and no error frame,
+    a lost connection, or a timeout.
+    """
+
+    def __init__(self, message: str, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class TurnEngineError(VoiceManagerError):
@@ -718,6 +735,11 @@ class VoiceManagerClient:
         self._stt_queue: asyncio.Queue = asyncio.Queue()
         self._tts_queue: asyncio.Queue = asyncio.Queue()
         self._error_queue: asyncio.Queue = asyncio.Queue()
+        # The last TTS request error frame the reader read (see _TTS_REQUEST_ERRORS).
+        # A one-sided TTS method clears it when its request starts and reads it at
+        # its audio_end with reason "error": the reader handles frames in wire
+        # order, and the server sends the error frame before that audio_end.
+        self._tts_error_frame: dict | None = None
         # turn_started acks. turn_start() sends the control frame then
         # awaits its server-owned turn_id here, off the single reader.
         self._turn_queue: asyncio.Queue = asyncio.Queue()
@@ -1066,6 +1088,8 @@ class VoiceManagerClient:
                                 "Turn engine lost: %s", frame.get("message", ""))
                             self.turn_engine = None
                             self.barge_state = None
+                        if error_type in _TTS_REQUEST_ERRORS:
+                            self._tts_error_frame = frame
                         await self._error_queue.put(frame)
                     else:
                         self._logger.debug("Unhandled message type: %s", ftype)
@@ -1420,6 +1444,19 @@ class VoiceManagerClient:
     # TTS methods
     # ------------------------------------------------------------------
 
+    def _tts_request_failed(self) -> TTSError:
+        """Build the TTSError for an audio_end with reason "error".
+
+        It carries the message and error_type of the TTS error frame read since
+        the request started, or a fixed message and error_type None when none came.
+        """
+        frame = self._tts_error_frame
+        self._tts_error_frame = None
+        if frame is None:
+            return TTSError(_TTS_FAILED_NO_FRAME)
+        error_type = frame.get("error_type")
+        return TTSError(frame.get("message", "") or error_type, error_type)
+
     async def synthesize_tts(self, text: str, voice: str | None = None) -> tuple[bytes, int]:
         """Request TTS synthesis and collect all audio as PCM bytes.
 
@@ -1434,7 +1471,12 @@ class VoiceManagerClient:
             OpenVoice, 24000 Hz for VibeVoice).
 
         Raises:
-            TTSError: If the connection is lost or times out.
+            TTSError: If the connection is lost or times out (``error_type`` is
+                None), or if the request's audio_end has reason "error". Then any
+                partial audio is dropped, and ``error_type`` holds the error_type
+                of the server's TTS error frame for the request
+                (``tts_unavailable`` or ``unknown_voice``), or None when no such
+                frame came.
         """
         self._require_no_duplex("synthesize_tts")
         request_id = str(uuid.uuid4())
@@ -1443,6 +1485,8 @@ class VoiceManagerClient:
         if voice is not None:
             payload["voice"] = voice
         msg = json.dumps(payload)
+        # An error frame read before this request started is not this request's.
+        self._tts_error_frame = None
         await self._send_or_raise(msg, TTSError, "Connection lost during TTS synthesis")
 
         audio_buf = bytearray()
@@ -1469,6 +1513,8 @@ class VoiceManagerClient:
 
                         elif ftype == "audio_end":
                             if item_rid == request_id:
+                                if item.get("reason") == "error":
+                                    raise self._tts_request_failed()
                                 break
                             # else: stale audio_end - discard
 
@@ -1505,7 +1551,12 @@ class VoiceManagerClient:
             WAV files - TTS output rate depends on engine.
 
         Raises:
-            TTSError: If the connection is lost or times out.
+            TTSError: If the connection is lost or times out (``error_type`` is
+                None), or if the request's audio_end has reason "error". Then any
+                partial audio is dropped, and ``error_type`` holds the error_type
+                of the server's TTS error frame for the request
+                (``tts_unavailable`` or ``unknown_voice``), or None when no such
+                frame came.
             ValueError: If chunking is not None, "sentence" or "clause".
         """
         self._require_no_duplex("stream_tts")
@@ -1514,6 +1565,8 @@ class VoiceManagerClient:
         self.last_tts_request_id = request_id  # reachable so a caller can cancel_tts()
         audio_buf = bytearray()
         sample_rate = 22050  # fallback; overwritten by audio_start
+        # An error frame read before this request started is not this request's.
+        self._tts_error_frame = None
 
         # Send all text chunks as tts_stream messages (done=True on final)
         first_chunk = True
@@ -1563,6 +1616,8 @@ class VoiceManagerClient:
 
                         elif ftype == "audio_end":
                             if item_rid == request_id:
+                                if item.get("reason") == "error":
+                                    raise self._tts_request_failed()
                                 break
                             # else: stale audio_end - discard
 
@@ -1616,7 +1671,12 @@ class VoiceManagerClient:
             Raw PCM bytes per audio chunk from the server.
 
         Raises:
-            TTSError: If the connection is lost or times out.
+            TTSError: If the connection is lost or times out (``error_type`` is
+                None), or if the request's audio_end has reason "error". Then the
+                audio that came before it has already been yielded, and
+                ``error_type`` holds the error_type of the server's TTS error
+                frame for the request (``tts_unavailable`` or ``unknown_voice``),
+                or None when no such frame came.
             ValueError: If chunking is not None, "sentence" or "clause".
         """
         self._require_no_duplex("stream_tts_live")
@@ -1625,6 +1685,8 @@ class VoiceManagerClient:
             request_id = str(uuid.uuid4())
         # Expose the id so the caller can reach the request it just started.
         self.last_tts_request_id = request_id
+        # An error frame read before this request started is not this request's.
+        self._tts_error_frame = None
         send_done = False
         audio_started = False
         first_chunk = True
@@ -1678,6 +1740,8 @@ class VoiceManagerClient:
                             audio_started = True
                         elif ftype == "audio_end" and item_rid == request_id:
                             self._cancelled_tts.discard(request_id)
+                            if item.get("reason") == "error":
+                                raise self._tts_request_failed()
                             return
 
             # Text exhausted - collect remaining audio until audio_end
@@ -1699,6 +1763,8 @@ class VoiceManagerClient:
                                 audio_started = True
                             elif ftype == "audio_end" and item_rid == request_id:
                                 self._cancelled_tts.discard(request_id)
+                                if item.get("reason") == "error":
+                                    raise self._tts_request_failed()
                                 return
             except TimeoutError:
                 raise TTSError("Timed out waiting for streaming TTS audio")
