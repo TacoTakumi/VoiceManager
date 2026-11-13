@@ -18,8 +18,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   It gets an `unknown_voice` error frame that names the presets, as on the
   VoXtream engine, then `audio_end` with `reason: "error"`. See the audio.cpp
   TTS section of the client guide.
+- Python client: `VoiceManagerClient.reconnect()` opens a new connection.
+  Call it after a reconnect that failed with `ConnectionError`: from then on
+  every call raises "Not connected" until a connection is up again. It waits
+  for a reconnect that already runs, sets `reconnected`, and raises
+  `ConnectionError` when its attempts fail. The session state starts over,
+  as after an automatic reconnect.
 
 ### Changed
+
+- Python client: `synthesize_tts`, `stream_tts` and `stream_tts_live` now
+  raise `TTSError` when their request ends with `audio_end` reason `error`.
+  Before, they returned the empty or partial audio as if the request had
+  succeeded. `TTSError` has a new `error_type` attribute: the error_type of
+  the server's error frame for the request (`tts_unavailable` or
+  `unknown_voice`), or None when the server sent none or the connection was
+  lost. `synthesize_tts` and `stream_tts` drop the partial audio.
+  `stream_tts_live` raises after the audio that it already yielded. A caller
+  that checked for empty audio must now catch `TTSError`.
 
 - Documentation only, no change of behaviour. The client guide
   (`docs/client-integration.md`), `.env.example`, `sidecar/PROTOCOL.md`, some
@@ -66,6 +82,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python client: a `barge` frame for a request whose `audio_end` was already
   read no longer adds the request to the set of cancelled requests, which
   grew for the life of the client.
+- Python client: a connect or reconnect attempt whose handshake does not
+  finish (the read of the `ready` frame is cancelled or fails, or the first
+  frame is of another type) now closes its socket. Before, a cancelled
+  handshake left an open socket that nothing read, and later calls waited
+  until their timeout or forever. A failed reconnect attempt no longer leaves
+  its socket open.
+- Python client: a `ConnectionClosed` from the caller's own iterator passed to
+  `stream_stt_live` or `stream_tts_live` now propagates unchanged. Before, it
+  closed the healthy connection, reconnected and raised `STTError` or
+  `TTSError`.
+- Python client: `cancel_tts` and `TTSRequest.cancel` with no connection raise
+  `TTSError` and mark nothing. Before, the request stayed in the cancelled set
+  of the new connection for good.
 
 ## [0.9.2]
 
