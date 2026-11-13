@@ -10,8 +10,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Documentation only, no change of behaviour. The client guide
   (`docs/client-integration.md`), `.env.example`, `sidecar/PROTOCOL.md`, some
-  comments and docstrings, and five statements in earlier sections of this file
-  were corrected where they did not agree with the code. The guide now says
+  comments and docstrings, and four statements in earlier sections of this file
+  were corrected where they did not agree with the code. The 0.8.1 section now
+  lists Added before Fixed. The guide now says
   that: only the audiocpp engine writes the `ref=` suffix and the first-audio
   log line of a clause-mode request; held text with no letter or digit is kept
   at a `flush` and dropped at `done` and at the flush timeout; in clause mode
