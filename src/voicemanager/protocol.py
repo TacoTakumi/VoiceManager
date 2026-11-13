@@ -201,6 +201,12 @@ TURN_ENGINE_ERROR_TYPES: tuple[str, ...] = (
     TURN_ENGINE_UNAVAILABLE, TURN_ENGINE_UNSUPPORTED, TURN_ENGINE_LOST,
 )
 
+#: error_type for a tts_stream request whose TTS engine raised (for example a sidecar
+#: that could not load its model). The message names the sidecar error code when there
+#: is one. audio_end with reason "error" follows for the same request_id, and the
+#: connection stays open: a later request can succeed.
+TTS_UNAVAILABLE = "tts_unavailable"
+
 
 class TurnEngineMessage(BaseModel):
     """Client opt-in to a turn engine, sent before the connection's first audio frame.

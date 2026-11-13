@@ -28,6 +28,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connection is the count at that frame; and the default of
   `VM_AUDIOCPP_TTS_REQUEST_OPTIONS` is `seed=2`.
 
+### Fixed
+
+- The audiocpp engine: a `tts_stream` request whose engine fails (for example
+  a TTS sidecar that cannot load its model because the card is full) no longer
+  ends like a normal reply with no audio. The client now gets an `error` frame
+  with the new `error_type` `tts_unavailable`, then `audio_end` with
+  `reason: "error"` for that `request_id`. The message names the sidecar error
+  code (for example `load_failed`) and not the sidecar's detail text. The
+  connection stays open, and a later request can succeed. The constant is
+  `protocol.TTS_UNAVAILABLE`. A sidecar that dies still gets
+  `tts_backend_fault` and a `1011` close.
+
 ## [0.9.2]
 
 ### Added

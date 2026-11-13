@@ -19,7 +19,11 @@ Scriptable:
                     .proceed (threading.Event) before sending the rest: holds a
                     request "in flight" so a test can prove the engine yields the
                     first chunk before the fake finishes generating
-  * hello_error  -- reply to HELLO with ERROR <code> and close (handshake-error path)
+  * hello_error  -- reply to HELLO with ERROR <code> and close (handshake-error path).
+                    Read at each handshake, so a test can clear it to let a
+                    later connect succeed (a load that works on a retry)
+  * hello_error_message -- the ERROR message text sent with hello_error
+                    (default "scripted <code>"), for a free-form detail
   * text_error   -- reply to the FIRST TEXT with ERROR <code> instead of audio; the
                     connection then serves normally (mirrors the drive path, which
                     reports a failed request and keeps its loop)
@@ -88,6 +92,7 @@ class FakeTtsSidecar:
                  flush_chunk: bytes | None = DEFAULT_FLUSH,
                  gate_after_first: bool = False,
                  hello_error: str | None = None,
+                 hello_error_message: str | None = None,
                  text_error: str | None = None,
                  die_on_text: bool = False,
                  die_on_text_containing: str | None = None,
@@ -97,6 +102,7 @@ class FakeTtsSidecar:
         self.flush_chunk = flush_chunk
         self.gate_after_first = gate_after_first
         self.hello_error = hello_error
+        self.hello_error_message = hello_error_message
         self.text_error = text_error
         self.die_on_text = die_on_text
         self.die_on_text_containing = die_on_text_containing
@@ -277,10 +283,14 @@ class FakeTtsSidecar:
         if mtype != HELLO:
             return False
         self.hello = json.loads(payload.decode("utf-8"))
-        if self.hello_error is not None:
+        hello_error = self.hello_error
+        if hello_error is not None:
+            message = self.hello_error_message
+            if message is None:
+                message = f"scripted {hello_error}"
             self._send(conn, ERROR, json.dumps({
-                "ok": False, "code": self.hello_error,
-                "message": f"scripted {self.hello_error}",
+                "ok": False, "code": hello_error,
+                "message": message,
             }).encode("utf-8"))
             return False
         self._send(conn, READY, json.dumps({

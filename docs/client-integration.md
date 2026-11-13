@@ -616,6 +616,19 @@ If the session's TTS sidecar process dies mid-request, the session receives an
 TTS analog of `stt_backend_fault` in [Close codes](#close-codes); reconnecting
 gets a fresh sidecar.
 
+If the engine fails a `tts_stream` request in any other way, the request ends
+with an `error` frame with `error_type: "tts_unavailable"`, then `audio_end`
+with `reason: "error"` for the same `request_id`. An example is a sidecar that
+cannot load its model because the card has no free memory. The connection
+stays open, and the next request tries the load again, so it can succeed.
+The `message` names the sidecar error code, for example `load_failed`. It does
+not contain the sidecar's detail text. A failure with no code gets a fixed
+message.
+
+```json
+{ "type": "error", "error_type": "tts_unavailable", "message": "The TTS engine is unavailable (load_failed). A later request may succeed." }
+```
+
 ### The VoXtream TTS engine: one generation per request
 
 With `VM_TTS_ENGINE=voxtream` a `tts_stream` request is one continuous

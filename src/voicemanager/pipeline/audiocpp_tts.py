@@ -115,6 +115,22 @@ DEFAULT_VOICE = "designed_female_s101"
 # audio before the client runs dry.
 COALESCE_RESERVE_S = 0.5
 
+#: A sidecar error code fit to name to a client: a short token. The sidecar's
+#: message (an allocator line, a path) stays in the server log.
+_CLIENT_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def tts_unavailable_message(exc: BaseException) -> str:
+    """The client-facing message for a tts_stream request whose engine raised.
+
+    It names the sidecar error code when the raise carries a short one, and is a
+    fixed text otherwise. It never carries the sidecar's free-form detail.
+    """
+    code = exc.code if isinstance(exc, SidecarError) else None
+    if isinstance(code, str) and _CLIENT_CODE.fullmatch(code):
+        return f"The TTS engine is unavailable ({code}). A later request may succeed."
+    return "The TTS engine is unavailable. A later request may succeed."
+
 
 class PresetLoadError(RuntimeError):
     """A voice asset failed validation at load time (fail-fast)."""
@@ -1063,7 +1079,9 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         return path
 
     async def _synthesis_loop(self, websocket, request_id: str) -> None:
-        from voicemanager.protocol import AudioStartMessage, AudioEndMessage
+        from voicemanager.protocol import (
+            AudioEndMessage, AudioStartMessage, ErrorMessage, TTS_UNAVAILABLE,
+        )
 
         engine = self._tts_pipeline._engine
         loop = asyncio.get_running_loop()
@@ -1091,6 +1109,9 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
         limiter: SilenceLimiter | None = None
         # When each frame of this request was sent, for one log line at its end.
         frames = FrameLog(self._frame_clock)
+        # The engine error that ended this request, if any. A cancel is not one: it
+        # is a BaseException and its terminal frame is the session's to send.
+        failure: Exception | None = None
         try:
             while not ended:
                 sentence = await self._sentence_queue.get()
@@ -1320,6 +1341,12 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                     await websocket.send_bytes(float32_to_pcm16(rest))
                     frames.sent(len(rest), engine.sample_rate)
                     self._report_audio(request_id, len(rest), engine.sample_rate)
+        except Exception as exc:
+            # The engine raised (a sidecar that cannot load, an ERROR reply): the
+            # request ends with an error, not a normal end with no audio. The task
+            # still fails with the error, and the session logs it.
+            failure = exc
+            raise
         finally:
             # First, and with no await before it: a request that was cancelled
             # or whose engine raised still shows the frames that it sent.
@@ -1340,9 +1367,27 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
                         sample_rate=engine.sample_rate,
                     ).model_dump_json()
                 )
+            # A failed request gets an error frame that names the cause, then
+            # audio_end reason "error", and the connection stays open: a later
+            # load can succeed. A sidecar death is the exception: its fault
+            # handler has already sent tts_backend_fault and closed the session.
+            if failure is not None and not isinstance(failure, SidecarFault):
+                try:
+                    await websocket.send_text(
+                        ErrorMessage(
+                            error_type=TTS_UNAVAILABLE,
+                            message=tts_unavailable_message(failure),
+                        ).model_dump_json()
+                    )
+                except Exception:
+                    logger.debug("Could not send the TTS error for request_id=%s",
+                                 request_id)
             try:
                 await websocket.send_text(
-                    AudioEndMessage(request_id=request_id).model_dump_json()
+                    AudioEndMessage(
+                        request_id=request_id,
+                        reason="complete" if failure is None else "error",
+                    ).model_dump_json()
                 )
             except Exception:
                 logger.debug("Could not send audio_end for request_id=%s", request_id)
