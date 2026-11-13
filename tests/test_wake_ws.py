@@ -18,6 +18,10 @@ optional phrase list. These tests prove, through the real /ws/stream handler:
   and changes nothing;
 * a connection that does not opt in sends nothing to the spotter, on a server that
   has one;
+* the message of every refusal starts with "wake_word refused", which a client
+  routes the refusal by;
+* a spotter that raises (when it opens a stream, or on a dormant frame) ends the
+  connection with one server_error frame and close code 1011;
 * a dormant connection is exempt from the session inactivity timeout, and the
   timeout runs again from the wake.
 
@@ -54,6 +58,10 @@ DEFAULT_PHRASES = ["hey computer"]
 # stream's first phrase, or its last.
 HEAR_FIRST = 0x7001
 HEAR_LAST = 0x7002
+# The first sample of a frame on which the stand-in spotter raises.
+FAULT = 0x7003
+# The start of the message of every refused wake_word: a client routes by it.
+REFUSED = "wake_word refused: "
 
 
 def _pcm(samples: int, value: int = 0x0101) -> bytes:
@@ -83,6 +91,8 @@ class _FakeWakeStream:
     def feed(self, pcm: bytes) -> str | None:
         self.fed.append(bytes(pcm))
         first = int.from_bytes(pcm[:2], "little") if len(pcm) >= 2 else 0
+        if first == FAULT:
+            raise RuntimeError("the wake model failed on a frame")
         if first == HEAR_FIRST:
             return self.phrases[0]
         if first == HEAR_LAST:
@@ -91,7 +101,8 @@ class _FakeWakeStream:
 
 
 class _FakeWakeSpotter:
-    """A stand-in wake engine. It has no tokens for a phrase with the word 'zzz'."""
+    """A stand-in wake engine. It has no tokens for a phrase with the word 'zzz',
+    and it fails (not a phrase error) on a phrase with the word 'boom'."""
 
     executor = None
 
@@ -103,6 +114,8 @@ class _FakeWakeSpotter:
         for phrase in phrases:
             if "zzz" in phrase.split():
                 raise WakePhraseError(f"the wake model has no tokens for the phrase {phrase!r}")
+            if "boom" in phrase.split():
+                raise RuntimeError("the wake model failed to open a stream")
         self.streams.append(_FakeWakeStream(list(phrases)))
         return self.streams[-1]
 
@@ -216,6 +229,7 @@ def test_wake_word_on_a_server_with_no_wake_engine_is_refused(whispers, set_stat
         ws.send_json(WAKE_WORD)
         answer = ws.receive_json()
         assert answer["type"] == "error" and answer["error_type"] == "invalid_request", answer
+        assert answer["message"].startswith(REFUSED)
         assert "no wake word engine" in answer["message"]
         # No wake_word_ready follows, and the connection is open and listening.
         assert barrier(ws) == []
@@ -444,6 +458,7 @@ def test_a_phrase_list_the_server_cannot_use_is_refused(
     with authkit.ws_connect(client, "/ws/stream") as ws:
         answer = _opt_in(ws, phrases)
         assert answer["type"] == "error" and answer["error_type"] == "invalid_request", answer
+        assert answer["message"].startswith(REFUSED)
         assert reason in answer["message"]
         # One error frame, no wake_word_ready, and the connection still listens.
         assert barrier(ws) == []
@@ -463,9 +478,62 @@ def test_a_refused_second_wake_word_keeps_the_first_phrases_and_the_dormant_stat
         ws.send_json({"type": "wake_word", "phrases": ["hey computer 9"]})
         answer = ws.receive_json()
         assert answer["error_type"] == "invalid_request", answer
+        assert answer["message"].startswith(REFUSED)
         ws.send_bytes(_pcm(160, HEAR_FIRST))
         assert ws.receive_json() == _wake("hey hermes", 0, 160)
     assert len(spotter.streams) == 1
+
+
+# --- a spotter that raises -----------------------------------------------------------
+
+def _server_error_then_close_1011(ws) -> None:
+    """The connection ends: one server_error frame, then a close with code 1011."""
+    answer = ws.receive_json()
+    assert answer["type"] == "error" and answer["error_type"] == "server_error", answer
+    assert not answer["message"].startswith("wake_word refused")
+    closed = ws.receive()
+    assert closed["type"] == "websocket.close" and closed["code"] == 1011, closed
+
+
+def test_a_spotter_that_raises_on_a_dormant_frame_ends_the_connection_with_1011(
+        client, spotter, whispers):
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        assert _opt_in(ws) == _ready_frame()
+        ws.send_bytes(_pcm(160))
+        assert barrier(ws) == []             # an ordinary dormant frame: nothing
+        ws.send_bytes(_pcm(160, FAULT))
+        _server_error_then_close_1011(ws)
+    assert spotter.streams[0].fed == [_pcm(160), _pcm(160, FAULT)]
+    assert whispers[0].fed == []
+
+
+def test_a_spotter_that_raises_when_it_opens_a_stream_ends_the_connection_with_1011(
+        client, spotter, whispers):
+    """A fault of the wake engine is not a refusal: only a phrase error is."""
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        assert _opt_in(ws, ["hey boom"])["error_type"] == "server_error"
+        closed = ws.receive()
+        assert closed["type"] == "websocket.close" and closed["code"] == 1011, closed
+    assert spotter.streams == []
+
+
+def test_a_spotter_that_raises_on_the_new_stream_at_a_listen_stop_ends_with_1011(
+        client, spotter):
+    """After a wake, a listen_stop opens a new stream. A fault there ends the
+    connection too."""
+    with authkit.ws_connect(client, "/ws/stream") as ws:
+        assert _opt_in(ws) == _ready_frame()
+        ws.send_bytes(_pcm(160, HEAR_FIRST))
+        assert ws.receive_json() == _wake("hey computer", 0, 160)
+
+        def broken(phrases):
+            raise RuntimeError("the wake model failed to open a stream")
+        spotter.open_stream = broken
+        ws.send_json(STOP)
+        frames = recv_until(ws, is_type("error"))
+        assert frames[-1]["error_type"] == "server_error", frames
+        closed = ws.receive()
+        assert closed["type"] == "websocket.close" and closed["code"] == 1011, closed
 
 
 # --- a connection that does not opt in ----------------------------------------------

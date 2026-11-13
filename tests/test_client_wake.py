@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock
 import pytest
 import websockets
 
-from voicemanager.client import VoiceManagerClient, VoiceManagerError, WakeWordError
+from voicemanager.client import (
+    ConnectionError as ClientConnectionError, STTError, VoiceManagerClient,
+    VoiceManagerError, WakeWordError)
 from voicemanager.protocol import (
     ErrorMessage,
     ListenStoppedMessage,
@@ -572,6 +574,43 @@ def test_a_frame_not_sent_on_a_closed_connection_leaves_the_new_connections_coun
                 await session.send_audio(CHUNK)
             return session.mic_sample, client._mic_frames
     assert asyncio.run(run()) == (0, 0)
+
+
+@pytest.mark.parametrize("dormant", [False, True])
+def test_a_frame_not_sent_when_the_reconnect_fails_leaves_the_counts_at_zero(
+        monkeypatch, dormant):
+    """The send finds the connection closed and its own reconnect fails after the
+    retries, so the error is the client's ConnectionError, not the STTError of a
+    connection that came back. The reconnect set the counts to 0 before it tried
+    to connect. The frame that was not sent must not be taken out of them a
+    second time."""
+    ws = _FakeServerWS(_accepting())
+    client = _client(ws)
+    waits: list[float] = []
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    async def run():
+        _start_reader(client)
+        monkeypatch.setattr(client, "_connect", AsyncMock(side_effect=OSError("refused")))
+        async with client.duplex() as session:
+            if dormant:
+                await session.enable_wake_word()
+            await session.send_audio(CHUNK)
+            before = (session.mic_sample, client._mic_frames, client._dormant_bytes)
+            ws.send = AsyncMock(side_effect=websockets.exceptions.ConnectionClosed(None, None))
+            monkeypatch.setattr(asyncio, "sleep", no_wait)
+            with pytest.raises(ClientConnectionError) as exc:
+                await session.send_audio(CHUNK)
+            assert not isinstance(exc.value, STTError)
+            assert client._ws is None            # no connection came back
+            return before, (session.mic_sample, client._mic_frames, client._dormant_bytes)
+
+    before, after = asyncio.run(run())
+    assert before == ((0, 0, 320) if dormant else (160, 1, 0))
+    assert after == (0, 0, 0)
+    assert client._connect.await_count == 3 and waits == [1, 2]
 
 
 def test_a_cancelled_send_keeps_its_frame_in_the_count():
