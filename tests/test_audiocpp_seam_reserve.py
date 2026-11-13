@@ -27,7 +27,10 @@ What must hold for the coalescing window:
 Each engine request after the first logs the reserve at its seam.
 
 Model-free and server-free: a fake engine gives the audio and a fake WebSocket
-takes the frames.
+takes the frames. The tests run on a virtual clock: an event loop whose time
+moves to the next timer when nothing is ready, and the pipeline's estimate of
+the unplayed audio reads the same clock. So a wait of 300 ms takes no real
+time, a busy machine cannot change a result, and the times are exact.
 """
 from __future__ import annotations
 
@@ -38,6 +41,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from voicemanager.pipeline.audiocpp_tts import AudioCppTTSStreamPipeline
 from voicemanager.pipeline.tts import TTSPipeline
@@ -53,19 +57,75 @@ def ms(samples: int) -> int:
     return samples * 1000 // SR
 
 
+class _VirtualLoop(asyncio.SelectorEventLoop):
+    """An event loop on a virtual clock.
+
+    When no callback is ready, the loop does not sleep until the next timer: its
+    time moves there at once. Nothing in these tests waits on a socket or a
+    thread, so a loop with nothing ready and no timer is a test that hangs, and
+    that is raised as an error.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._now = 0.0
+        poll = self._selector.select
+
+        def select(timeout=None):
+            if timeout is None:
+                raise RuntimeError("virtual clock: nothing is ready and no timer is set")
+            if timeout > 0:
+                self._now += timeout
+            return poll(0)
+
+        self._selector.select = select
+
+    def time(self) -> float:
+        return self._now
+
+
+def _run(coro):
+    """Run the coroutine to its end on a virtual clock."""
+    with asyncio.Runner(loop_factory=_VirtualLoop) as runner:
+        return runner.run(coro)
+
+
+def test_the_virtual_clock_gives_exact_times_and_takes_no_real_time():
+    import time
+
+    async def run() -> list[float]:
+        loop = asyncio.get_running_loop()
+        seen = [loop.time()]
+        await asyncio.sleep(30.0)
+        seen.append(loop.time())
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=12.5)
+        except asyncio.TimeoutError:
+            seen.append(loop.time())
+        return seen
+
+    started = time.monotonic()
+    assert _run(run()) == [0.0, 30.0, 42.5]
+    assert time.monotonic() - started < 5.0
+
+
 class _Engine:
     """Gives a set number of 50 ms chunks for each engine request.
 
     The first request ends when `gate` is set, after its chunks. `delays` holds
-    the seconds to wait before the first chunk of each request.
+    the seconds to wait before the first chunk of each request, and `gaps` the
+    seconds to wait before every chunk of each request (0.05 is an engine at
+    real-time speed).
     """
 
     is_batch = False
     sample_rate = SR
 
-    def __init__(self, chunks: list[int], delays: list[float] | None = None):
+    def __init__(self, chunks: list[int], delays: list[float] | None = None,
+                 gaps: list[float] | None = None):
         self.chunks = chunks
         self.delays = delays or [0.0] * len(chunks)
+        self.gaps = gaps or [0.0] * len(chunks)
         self.gate = asyncio.Event()
         self.texts: list[str] = []
         self.started_at: list[float] = []
@@ -85,6 +145,8 @@ class _Engine:
         if self.delays[index]:
             await asyncio.sleep(self.delays[index])
         for _ in range(self.chunks[index]):
+            if self.gaps[index]:
+                await asyncio.sleep(self.gaps[index])
             # Not silence: the pipeline caps a silent run in a clause request.
             yield np.full(CHUNK, 0.1, dtype=np.float32)
         if index == 0:
@@ -104,8 +166,10 @@ class _WS:
 
 
 def _pipe(engine: _Engine, **kwargs) -> AudioCppTTSStreamPipeline:
+    """A pipeline whose unplayed-audio estimate reads the running loop's clock."""
     options = {"clause_continue": False, "clause_end_mark": "", "clause_silence_ms": 0,
-               "start_buffer_ms": BUFFER_MS, **_NO_TIMER, **kwargs}
+               "start_buffer_ms": BUFFER_MS,
+               "clause_clock": asyncio.get_running_loop().time, **_NO_TIMER, **kwargs}
     return AudioCppTTSStreamPipeline(TTSPipeline(engine=engine, executor=None), **options)
 
 
@@ -140,7 +204,7 @@ def _two_requests(engine: _Engine, chunking: str = "clause", **kwargs) -> list[i
         engine.gate.set()
         await asyncio.wait_for(pipe.synthesis_task, 5.0)
 
-    asyncio.run(run())
+    _run(run())
     assert len(engine.texts) == 2
     return ws.frames[engine.frames_before[1]:]
 
@@ -154,10 +218,26 @@ def test_with_a_full_reserve_the_first_audio_of_the_next_request_goes_at_once():
 
 
 def test_with_a_small_reserve_only_the_missing_part_is_held():
-    """150 ms unplayed and a buffer of 250 ms: the audio goes when 150 ms are held
-    (100 ms are not enough, because the estimate is a little below 150 ms)."""
+    """150 ms unplayed and a buffer of 250 ms: the audio goes when 100 ms are held."""
     frames = _two_requests(_Engine([3, 8]))
+    assert [ms(n) for n in frames] == [100] + [50] * 6
+
+
+def test_a_reserve_a_little_below_the_missing_part_holds_one_chunk_more():
+    """The second engine request gives its first audio 1 ms later: 149 ms unplayed,
+    so 100 ms held are not enough and the audio goes when 150 ms are held."""
+    frames = _two_requests(_Engine([3, 8], delays=[0.0, 0.001]))
     assert [ms(n) for n in frames] == [150] + [50] * 5
+
+
+def test_a_reserve_that_falls_while_audio_is_held_is_read_at_every_chunk():
+    """150 ms unplayed, and the second engine request gives 50 ms of audio each
+    50 ms, as an engine at real-time speed does. The reserve falls as fast as the
+    held audio grows: 100 + 50, then 50 + 100, then 0 + 150, 0 + 200. The audio
+    goes only when the full buffer is held. An estimate read once, at the first
+    chunk (100 ms), would send the audio before the buffer is full."""
+    frames = _two_requests(_Engine([3, 8], gaps=[0.0, 0.05]))
+    assert [ms(n) for n in frames] == [250] + [50] * 3
 
 
 def test_with_no_reserve_the_full_buffer_is_held():
@@ -217,7 +297,7 @@ def _later_text(engine: _Engine, third_after: float | None, chunking: str = "cla
         await pipe.feed_text("", True, ws, "r1", chunking=chunking)
         await asyncio.wait_for(pipe.synthesis_task, 5.0)
 
-    asyncio.run(run())
+    _run(run())
     return engine.started_at[1] - engine.ended_at[0]
 
 
@@ -225,7 +305,7 @@ def test_with_a_low_reserve_the_next_engine_request_starts_at_once():
     """0.3 s unplayed, below the floor of 0.5 s: no wait for more text."""
     engine = _Engine([6, 4, 4])
     wait = _later_text(engine, third_after=None)
-    assert wait < 0.1
+    assert wait == 0.0
     assert engine.texts[1] == "Four five six."
 
 
@@ -235,15 +315,16 @@ def test_with_a_high_reserve_the_full_window_is_used():
     engine = _Engine([60, 4])
     wait = _later_text(engine, third_after=0.15)
     assert engine.texts[1:] == ["Four five six. Seven eight nine."]
-    assert 0.33 <= wait < 0.5
+    assert wait == pytest.approx(0.35)
 
 
 def test_the_wait_ends_when_the_reserve_falls_to_the_floor():
-    """About 0.65 s unplayed when the first engine request ends: the wait is the
-    0.15 s above the floor, less the few ms that passed, not the window of 0.35 s."""
+    """0.65 s of audio went out 22 ms before the first engine request ends (the
+    helper waits 20 ms and polls each 2 ms): the wait is the 0.15 s above the
+    floor less those 22 ms, not the window of 0.35 s."""
     engine = _Engine([13, 4])
     wait = _later_text(engine, third_after=None)
-    assert 0.08 <= wait <= 0.25
+    assert wait == pytest.approx(0.128)
     assert engine.texts[1] == "Four five six."
 
 
@@ -255,7 +336,7 @@ def test_a_sentence_request_uses_the_full_window_with_nothing_unplayed():
     wait = _later_text(engine, third_after=0.2, chunking="sentence")
     assert len(engine.texts) == 3
     assert "owl" in engine.texts[1] and "badger" in engine.texts[1]
-    assert 0.33 <= wait < 0.5
+    assert wait == pytest.approx(0.35)
 
 
 # --- the log line -----------------------------------------------------------------------
@@ -281,18 +362,38 @@ def test_a_later_engine_request_logs_the_reserve_at_its_seam(caplog):
     assert len(lines) == 1
     request_id, reserve, held = lines[0]
     assert request_id == "r1"
-    assert 800 <= reserve <= 1000
+    # 1.0 s went out 22 ms before the first engine request ended (the helper
+    # waits 20 ms and polls each 2 ms).
+    assert reserve == 978
     assert held == 0
 
 
 def test_the_seam_line_gives_the_audio_that_waited(caplog):
-    """150 ms unplayed, buffer 250 ms: 100 ms waited when the third chunk came."""
+    """149 ms unplayed, buffer 250 ms: 100 ms waited when the third chunk came."""
     with caplog.at_level(logging.INFO, logger=_LOGGER):
-        _two_requests(_Engine([3, 8]))
-    lines = _seam_lines(caplog)
-    assert len(lines) == 1
-    assert 100 <= lines[0][1] <= 150
-    assert lines[0][2] == 100
+        _two_requests(_Engine([3, 8], delays=[0.0, 0.001]))
+    assert _seam_lines(caplog) == [("r1", 149, 100)]
+
+
+def test_the_seam_line_of_a_falling_reserve_gives_the_reserve_at_the_send(caplog):
+    """The reserve of 150 ms is gone when the full buffer goes out, 250 ms later:
+    200 ms waited when the fifth chunk came."""
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _two_requests(_Engine([3, 8], gaps=[0.0, 0.05]))
+    assert _seam_lines(caplog) == [("r1", 0, 200)]
+
+
+@pytest.mark.parametrize("delay, reserve", [(0.001, 149), (0.3, 0)])
+def test_a_later_engine_request_that_ends_before_the_buffer_fills_logs_its_seam(
+        caplog, delay, reserve):
+    """The second engine request makes 100 ms of audio and ends. With 149 ms or
+    with nothing unplayed that does not fill the buffer of 250 ms, so its audio
+    goes out in one frame when it ends. That send is the seam: the line gives the
+    reserve then and the 100 ms that waited."""
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        frames = _two_requests(_Engine([3, 2], delays=[0.0, delay]))
+    assert [ms(n) for n in frames] == [100]
+    assert _seam_lines(caplog) == [("r1", reserve, 100)]
 
 
 def test_a_dry_client_shows_as_a_reserve_of_zero(caplog):
@@ -313,7 +414,7 @@ def test_one_engine_request_and_a_sentence_request_log_no_seam_line(caplog):
         await asyncio.wait_for(pipe.synthesis_task, 5.0)
 
     with caplog.at_level(logging.INFO, logger=_LOGGER):
-        asyncio.run(run())
+        _run(run())
         _two_requests(_Engine([20, 8]), chunking="sentence")
     assert len(engine.texts) == 1
     assert _seam_lines(caplog) == []
