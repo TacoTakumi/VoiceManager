@@ -337,6 +337,116 @@ def test_main_passes_torch_threads_to_the_scorer_load(monkeypatch):
     assert seen["load"] == (server.DEFAULT_MODEL, "abc", "cpu", 3)
 
 
+# --- the pre-filter wiring of main(), in process -----------------------------------------
+
+def _run_main(monkeypatch, tmp_path, argv, voxlock_module=None):
+    """Run the sidecar's main() with a fake scorer script, a fake create_app and a
+    fake uvicorn server. Returns what create_app got, whether the server ran and
+    every module name main() imported by name."""
+    import types
+
+    import uvicorn
+
+    from voicemanager.pipeline.tyger import server
+    seen = {"imports": [], "ran": False}
+
+    def fake_create_app(settings, **kwargs):
+        seen["create_app"] = kwargs
+        return types.SimpleNamespace(state=types.SimpleNamespace(load_error=None))
+
+    class FakeServer:
+        def __init__(self, config):
+            pass
+
+        def run(self):
+            seen["ran"] = True
+
+    real_import = server.importlib.import_module
+
+    def import_module(name, package=None):
+        seen["imports"].append((name, package))
+        if voxlock_module is not None and name == ".voxlock":
+            return voxlock_module
+        return real_import(name, package)
+
+    script = tmp_path / "script.json"
+    script.write_text('{"sessions": {}}')
+    monkeypatch.setattr(server, "create_app", fake_create_app)
+    monkeypatch.setattr(server.importlib, "import_module", import_module)
+    monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: None)
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    server.main(["--fake-scorer", str(script), *argv])
+    return seen
+
+
+def test_main_with_the_prefilter_off_never_imports_the_voxlock_package(monkeypatch, tmp_path):
+    """The default: no pre-filter module is imported, create_app gets no factory."""
+    from voicemanager.pipeline.tyger import server
+    prefix = server.rules.__package__ + ".voxlock"
+
+    def loaded() -> list[str]:
+        return [name for name in sys.modules
+                if name == prefix or name.startswith(prefix + ".")]
+
+    # Another test file may have imported the subpackage in this process.
+    for name in loaded():
+        monkeypatch.delitem(sys.modules, name)
+    for argv in ([], ["--prefilter", "off"], ["--prefilter-floor-db", "-40"]):
+        seen = _run_main(monkeypatch, tmp_path, argv)
+        assert seen["ran"] is True
+        assert seen["imports"] == []  # not by name through importlib
+        assert loaded() == []  # and not by an import statement
+        assert seen["create_app"]["prefilter_factory"] is None
+
+
+def test_main_with_the_prefilter_gives_the_loaded_factory_and_the_floor_to_create_app(
+        monkeypatch, tmp_path):
+    import types
+
+    from voicemanager.pipeline.tyger import server
+    loads = []
+
+    class FakeFactory:
+        @staticmethod
+        def load(device):
+            loads.append(device)
+            return "the factory"
+
+    fake_voxlock = types.SimpleNamespace(VoxLockFactory=FakeFactory)
+    seen = _run_main(monkeypatch, tmp_path,
+                     ["--prefilter", "voxlock", "--prefilter-floor-db", "-47.5",
+                      "--device", "cuda:1"], voxlock_module=fake_voxlock)
+    assert seen["ran"] is True
+    # The subpackage is loaded next to the rules module, by a relative name.
+    assert seen["imports"] == [(".voxlock", server.rules.__package__)]
+    assert loads == ["cuda:1"]
+    assert seen["create_app"]["prefilter_factory"] == "the factory"
+    assert seen["create_app"]["prefilter_floor_db"] == -47.5
+
+
+def test_main_gives_the_default_floor_to_create_app(monkeypatch, tmp_path):
+    seen = _run_main(monkeypatch, tmp_path, [])
+    assert seen["create_app"]["prefilter_floor_db"] == -52.0
+
+
+def test_main_exits_1_and_serves_nothing_when_the_prefilter_cannot_load(
+        monkeypatch, tmp_path):
+    import types
+
+    class FailingFactory:
+        @staticmethod
+        def load(device):
+            raise RuntimeError("no model files")
+
+    fake_voxlock = types.SimpleNamespace(VoxLockFactory=FailingFactory)
+    seen = {}
+    with pytest.raises(SystemExit) as exc:
+        seen = _run_main(monkeypatch, tmp_path, ["--prefilter", "voxlock"],
+                         voxlock_module=fake_voxlock)
+    assert exc.value.code == 1
+    assert seen == {}  # main() left before create_app and the server
+
+
 # --- the experimental pre-filter, through the sidecar app -------------------------------
 
 class _RecordingSession:
