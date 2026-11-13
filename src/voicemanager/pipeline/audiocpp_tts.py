@@ -1371,14 +1371,17 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
             # audio_end reason "error", and the connection stays open: a later
             # load can succeed. A sidecar death is the exception: its fault
             # handler has already sent tts_backend_fault and closed the session.
+            # An unknown voice is the client's error, not the engine's: it gets
+            # unknown_voice with the message naming the presets, as the VoXtream
+            # engine sends it, so the client does not retry the same voice.
             if failure is not None and not isinstance(failure, SidecarFault):
+                if isinstance(failure, UnknownVoiceError):
+                    error = ErrorMessage(error_type="unknown_voice", message=str(failure))
+                else:
+                    error = ErrorMessage(error_type=TTS_UNAVAILABLE,
+                                         message=tts_unavailable_message(failure))
                 try:
-                    await websocket.send_text(
-                        ErrorMessage(
-                            error_type=TTS_UNAVAILABLE,
-                            message=tts_unavailable_message(failure),
-                        ).model_dump_json()
-                    )
+                    await websocket.send_text(error.model_dump_json())
                 except Exception:
                     logger.debug("Could not send the TTS error for request_id=%s",
                                  request_id)

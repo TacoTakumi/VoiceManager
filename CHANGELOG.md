@@ -13,8 +13,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   example when the TTS sidecar cannot load its model. `audio_end` with
   `reason: "error"` follows for the same `request_id`. The message names the
   sidecar error code (for example `load_failed`) and not the sidecar's detail
-  text. The connection stays open, and a later request can succeed. See the
-  audio.cpp TTS section of the client guide.
+  text. The connection stays open, and a later request can succeed. A
+  `tts_stream` request with an unknown `voice` does not get `tts_unavailable`.
+  It gets an `unknown_voice` error frame that names the presets, as on the
+  VoXtream engine, then `audio_end` with `reason: "error"`. See the audio.cpp
+  TTS section of the client guide.
 
 ### Changed
 

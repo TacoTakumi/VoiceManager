@@ -629,6 +629,17 @@ message.
 { "type": "error", "error_type": "tts_unavailable", "message": "The TTS engine is unavailable (load_failed). A later request may succeed." }
 ```
 
+A `voice` that is not a loaded preset is the client's error, not the engine's.
+It does not get `tts_unavailable`. It gets an `error` frame with
+`error_type: "unknown_voice"`, as on the VoXtream engine. The `message` names
+the valid presets. Then `audio_end` with `reason: "error"` follows for the same
+`request_id`. Nothing goes to the sidecar, and the connection stays open. Do not
+send the same voice again: pick a name from `available_voices`.
+
+```json
+{ "type": "error", "error_type": "unknown_voice", "message": "unknown voice 'no-such-voice'; valid presets: designed_female_s101, designed_gm_02, designed_male_s202, lcars_demo" }
+```
+
 ### The VoXtream TTS engine: one generation per request
 
 With `VM_TTS_ENGINE=voxtream` a `tts_stream` request is one continuous

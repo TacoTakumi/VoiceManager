@@ -32,6 +32,7 @@ from voicemanager.pipeline.audiocpp_tts import (
     AudioCppTTSEngine,
     AudioCppTTSStreamPipeline,
     SidecarError,
+    UnknownVoiceError,
 )
 from voicemanager.pipeline.tts import TTSPipeline
 from voicemanager.transport import websocket as ws_module
@@ -45,6 +46,7 @@ REAL_REFS = REPO_ROOT / "voices" / "designed" / "refs.json"
 ALLOCATOR_DETAIL = ("alloc_tensor_range: failed to allocate CUDA4 buffer of size "
                     "317411456")
 SENTENCE = "The quick brown fox jumps over the lazy dog near the river bank."
+UNKNOWN_VOICE = "no-such-voice"
 
 
 class _FakeWS:
@@ -132,6 +134,24 @@ def _assert_failed_request(frames: list, request_id: str) -> dict:
     return error
 
 
+def _assert_unknown_voice_request(frames: list, request_id: str) -> dict:
+    """audio_start, then the unknown_voice error, then audio_end reason error."""
+    assert "pcm" not in frames, "an unknown voice must deliver no audio"
+    types = [f["type"] for f in frames]
+    assert types == ["audio_start", "error", "audio_end"], frames
+    assert frames[0]["request_id"] == request_id
+    error = frames[1]
+    assert error["error_type"] == "unknown_voice", error
+    assert not any(isinstance(f, dict) and f.get("error_type") == "tts_unavailable"
+                   for f in frames)
+    # The message is the one the VoXtream engine gives: it names the presets.
+    assert error["message"].startswith(f"unknown voice {UNKNOWN_VOICE!r}"), error
+    assert "designed_female_s101" in error["message"]
+    assert frames[2]["request_id"] == request_id
+    assert frames[2]["reason"] == "error", frames[2]
+    return error
+
+
 # --- pipeline level ----------------------------------------------------------------
 
 def test_load_failure_sends_tts_unavailable_then_error_end_and_next_request_completes(
@@ -199,6 +219,69 @@ def test_a_code_that_is_not_a_short_token_is_not_named(code: str) -> None:
     assert error["message"] == "The TTS engine is unavailable. A later request may succeed."
 
 
+# --- an unknown voice is a client error, not an unavailable engine -----------------
+#
+# The engine raises UnknownVoiceError from stream_synthesize when it resolves the
+# voice, before anything goes to the sidecar. A tts_stream request reaches that
+# raise three ways: a sentence request, a clause request with the composed
+# reference off, and a clause request with it on (where the pipeline resolves the
+# voice first itself, lets that raise go, and the dispatch raises it again).
+
+@pytest.mark.parametrize("chunking,clause_continue", [
+    ("sentence", False),
+    ("clause", False),
+    ("clause", True),
+])
+def test_unknown_voice_sends_unknown_voice_then_error_end(
+        chunking: str, clause_continue: bool) -> None:
+    with FakeTtsSidecar() as fake:
+        engine = _external_engine(fake)
+        resolved: list = []
+        real_resolve_voice = engine.resolve_voice
+
+        def spy_resolve_voice(voice):
+            resolved.append(voice)
+            return real_resolve_voice(voice)
+
+        engine.resolve_voice = spy_resolve_voice
+        ws = _FakeWS()
+        ws_next = _FakeWS()
+
+        async def scenario() -> tuple:
+            stream = AudioCppTTSStreamPipeline(
+                tts_pipeline=TTSPipeline(engine=engine, executor=None),
+                clause_continue=clause_continue, start_buffer_ms=0,
+                clause_end_mark="")
+            await stream.feed_text(chunk=SENTENCE, done=True, websocket=ws,
+                                   request_id="r1", voice=UNKNOWN_VOICE,
+                                   chunking=chunking)
+            try:
+                await asyncio.wait_for(stream.synthesis_task, timeout=10.0)
+            except Exception as exc:
+                failed = exc
+            else:
+                failed = None
+            # The connection's next request with a known voice still speaks.
+            ok = await _run_request(stream, ws_next, "r2")
+            return failed, ok
+
+        try:
+            failed, ok = asyncio.run(scenario())
+        finally:
+            engine.dispose()
+
+    assert isinstance(failed, UnknownVoiceError)
+    error = _assert_unknown_voice_request(ws.frames, "r1")
+    assert error["message"] == str(failed)
+    if chunking == "clause" and clause_continue:
+        # The pipeline's own resolve for the composed reference ran and raised.
+        assert UNKNOWN_VOICE in resolved
+    assert ok is None
+    assert ws_next.frames[-1]["reason"] == "complete"
+    assert [r["text"] for r in fake.requests] == [SENTENCE], (
+        "an unknown voice must never reach the sidecar")
+
+
 # --- WS level: the connection stays open and serves the next request ---------------
 
 def _tts_app(engine, executor):
@@ -249,6 +332,31 @@ def test_ws_failed_load_keeps_the_connection_open_for_the_next_request(
                 assert frames[0]["request_id"] == "r2"
                 assert "pcm" in frames
                 assert frames[-1]["request_id"] == "r2"
+                assert frames[-1]["reason"] == "complete"
+
+    assert [r["text"] for r in fake.requests] == [SENTENCE]
+
+
+def test_ws_unknown_voice_gets_unknown_voice_and_the_connection_stays_open(
+        monkeypatch) -> None:
+    monkeypatch.setattr(ws_module, "QwenSTTPipeline", _InstantSTT)
+    with FakeTtsSidecar() as fake:
+        engine = _external_engine(fake)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            client = TestClient(_tts_app(engine, executor))
+            with authkit.ws_connect(client, "/ws/stream") as ws:
+                assert ws.receive_json()["type"] == "ready"
+
+                ws.send_json({"type": "tts_stream", "text": SENTENCE,
+                              "request_id": "r1", "done": True,
+                              "voice": UNKNOWN_VOICE})
+                _assert_unknown_voice_request(_read_request(ws), "r1")
+
+                ws.send_json({"type": "tts_stream", "text": SENTENCE,
+                              "request_id": "r2", "done": True})
+                frames = _read_request(ws)
+                assert frames[0]["request_id"] == "r2"
+                assert "pcm" in frames
                 assert frames[-1]["reason"] == "complete"
 
     assert [r["text"] for r in fake.requests] == [SENTENCE]
