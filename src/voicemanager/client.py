@@ -52,6 +52,10 @@ _TTS_REQUEST_ERRORS = ("tts_unavailable", "unknown_voice")
 # The message of the TTSError for an audio_end with reason "error" that no TTS
 # error frame came before (the one-shot tts path sends none).
 _TTS_FAILED_NO_FRAME = "The server ended the TTS request with an error"
+# The client-private key under which the reader puts a TTS error frame on the
+# audio_end with reason "error" that follows it on the wire. DuplexSession.audio()
+# removes it before it yields the audio_end.
+_TTS_ERROR_KEY = "_tts_error"
 # The default of VoiceManagerClient._reconnect: reconnect whatever socket is current.
 _CURRENT_SOCKET = object()
 
@@ -655,6 +659,7 @@ class DuplexSession:
                 client.last_tts_sample_rate = item.get("sample_rate", client.last_tts_sample_rate)
                 yield ("audio_start", item)
             elif kind == "audio_end":
+                item.pop(_TTS_ERROR_KEY, None)  # client-private, not a wire field
                 client._cancelled_tts.discard(rid)
                 if rid == current:
                     current = None
@@ -735,10 +740,12 @@ class VoiceManagerClient:
         self._stt_queue: asyncio.Queue = asyncio.Queue()
         self._tts_queue: asyncio.Queue = asyncio.Queue()
         self._error_queue: asyncio.Queue = asyncio.Queue()
-        # The last TTS request error frame the reader read (see _TTS_REQUEST_ERRORS).
-        # A one-sided TTS method clears it when its request starts and reads it at
-        # its audio_end with reason "error": the reader handles frames in wire
-        # order, and the server sends the error frame before that audio_end.
+        # The TTS request error frame (see _TTS_REQUEST_ERRORS) the reader read and
+        # has not yet tied to an audio_end. The server sends a request's error frame
+        # before that request's audio_end, so at each audio_end the reader takes it:
+        # it puts it on an audio_end with reason "error" (under _TTS_ERROR_KEY) and
+        # drops it otherwise. A one-sided TTS method also clears it when its request
+        # starts, so a frame left from an earlier connection cannot reach it.
         self._tts_error_frame: dict | None = None
         # turn_started acks. turn_start() sends the control frame then
         # awaits its server-owned turn_id here, off the single reader.
@@ -1061,7 +1068,17 @@ class VoiceManagerClient:
                     ftype = frame.get("type")
                     if ftype == "transcription":
                         await self._stt_queue.put(frame)
-                    elif ftype in ("audio_start", "audio_end"):
+                    elif ftype == "audio_start":
+                        await self._tts_queue.put(frame)
+                    elif ftype == "audio_end":
+                        # Tie the pending TTS error frame to this audio_end, the
+                        # next one on the wire. The frames are read in wire order
+                        # here, before any method reads the queue, so the frame
+                        # rides with its own request's audio_end.
+                        error_frame = self._tts_error_frame
+                        self._tts_error_frame = None
+                        if error_frame is not None and frame.get("reason") == "error":
+                            frame[_TTS_ERROR_KEY] = error_frame
                         await self._tts_queue.put(frame)
                     elif ftype == "turn_started":
                         # Server-owned ack for a turn_start - routed to
@@ -1472,14 +1489,15 @@ class VoiceManagerClient:
     # TTS methods
     # ------------------------------------------------------------------
 
-    def _tts_request_failed(self) -> TTSError:
+    @staticmethod
+    def _tts_request_failed(audio_end: dict) -> TTSError:
         """Build the TTSError for an audio_end with reason "error".
 
-        It carries the message and error_type of the TTS error frame read since
-        the request started, or a fixed message and error_type None when none came.
+        It carries the message and error_type of the TTS error frame the reader
+        put on that audio_end, or a fixed message and error_type None when none
+        came before it.
         """
-        frame = self._tts_error_frame
-        self._tts_error_frame = None
+        frame = audio_end.get(_TTS_ERROR_KEY)
         if frame is None:
             return TTSError(_TTS_FAILED_NO_FRAME)
         error_type = frame.get("error_type")
@@ -1542,7 +1560,7 @@ class VoiceManagerClient:
                         elif ftype == "audio_end":
                             if item_rid == request_id:
                                 if item.get("reason") == "error":
-                                    raise self._tts_request_failed()
+                                    raise self._tts_request_failed(item)
                                 break
                             # else: stale audio_end - discard
 
@@ -1645,7 +1663,7 @@ class VoiceManagerClient:
                         elif ftype == "audio_end":
                             if item_rid == request_id:
                                 if item.get("reason") == "error":
-                                    raise self._tts_request_failed()
+                                    raise self._tts_request_failed(item)
                                 break
                             # else: stale audio_end - discard
 
@@ -1771,7 +1789,7 @@ class VoiceManagerClient:
                     elif ftype == "audio_end" and item_rid == request_id:
                         self._cancelled_tts.discard(request_id)
                         if item.get("reason") == "error":
-                            raise self._tts_request_failed()
+                            raise self._tts_request_failed(item)
                         return
 
         # Text exhausted - collect remaining audio until audio_end
@@ -1794,7 +1812,7 @@ class VoiceManagerClient:
                         elif ftype == "audio_end" and item_rid == request_id:
                             self._cancelled_tts.discard(request_id)
                             if item.get("reason") == "error":
-                                raise self._tts_request_failed()
+                                raise self._tts_request_failed(item)
                             return
         except TimeoutError:
             raise TTSError("Timed out waiting for streaming TTS audio")

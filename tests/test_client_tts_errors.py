@@ -7,9 +7,12 @@ their request's audio_end with reason error, with the error_type and message of
 the TTS error frame read for that request in the audiocpp order (audio_start,
 error, audio_end) and the VoXtream order (error, audio_start, audio_end), and with
 error_type None when no error frame came; a stored error frame of an earlier
-request does not mark a later request; the reasons complete, cancelled and
-interrupted return as before; stream_tts_live yields the audio that came before
-the audio_end and then raises.
+request does not mark a later request, also when that earlier request's error
+frame and audio_end come after the later request started, and also when the
+reader reads them and the later request's own frames in one batch; the reasons
+complete, cancelled and interrupted return as before; stream_tts_live yields the
+audio that came before the audio_end and then raises, in its send loop and after
+it; DuplexSession.audio() yields the audio_end with no client-private key.
 """
 import asyncio
 import json
@@ -262,3 +265,124 @@ def test_tts_error_keeps_the_one_argument_form():
     assert str(err) == "Connection lost during TTS synthesis"
     assert err.error_type is None
     assert TTSError("x", "unknown_voice").error_type == "unknown_voice"
+
+
+# The request_id of an earlier request the caller gave up on (task cancelled,
+# timeout, break) that the server still finishes.
+EARLIER_RID = "earlier-request"
+
+
+def _earlier_failed() -> list:
+    """The late error frame and audio_end of the earlier request."""
+    return [_err("unknown_voice", UNKNOWN_VOICE_MSG), _start(EARLIER_RID),
+            _end(EARLIER_RID, "error")]
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+async def test_late_error_of_an_earlier_request_does_not_name_a_later_one(make_client,
+                                                                          method):
+    """The earlier request's frame and audio_end come after the later request started.
+
+    For stream_tts_live this is the audio_end read after the send loop.
+    """
+    def _script(rid: str) -> list:
+        return _earlier_failed() + _no_error_frame(rid)
+
+    client, _ = make_client([_script])
+    with pytest.raises(TTSError) as excinfo:
+        await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert excinfo.value.error_type is None
+    assert str(excinfo.value) == "The server ended the TTS request with an error"
+
+
+async def _text_with_frames(ws, frames: list):
+    """Deliver frames while text is still sent, so the send loop reads them."""
+    yield "Hello there."
+    for item in frames:
+        ws.push(item)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    yield "How are you?"
+    yield "Fine."
+
+
+async def test_live_late_error_of_an_earlier_request_while_text_is_sent(make_client):
+    """The same, with the audio_end read while text chunks are still sent."""
+    client, ws = make_client([])
+    rid = "later-request"
+    frames = _earlier_failed() + _no_error_frame(rid)
+    with pytest.raises(TTSError) as excinfo:
+        async for _ in client.stream_tts_live(_text_with_frames(ws, frames),
+                                              request_id=rid):
+            pass
+    assert excinfo.value.error_type is None
+    assert str(excinfo.value) == "The server ended the TTS request with an error"
+    # The error came in the send loop: the done frame was never sent.
+    assert not any(json.loads(d).get("done") for d in ws.sent)
+
+
+async def test_live_own_error_while_text_is_sent(make_client):
+    """The request's own error frame and audio_end, read while text is still sent."""
+    client, ws = make_client([])
+    rid = "live-request"
+    frames = _audiocpp_order(rid)
+    got: list = []
+    with pytest.raises(TTSError) as excinfo:
+        async for pcm in client.stream_tts_live(_text_with_frames(ws, frames),
+                                                request_id=rid):
+            got.append(pcm)
+    assert got == [PCM_A]
+    assert excinfo.value.error_type == "tts_unavailable"
+    assert str(excinfo.value) == UNAVAILABLE_MSG
+    assert not any(json.loads(d).get("done") for d in ws.sent)
+
+
+def _earlier_failed_then_own(rid: str) -> list:
+    """The earlier request's late failure, then the later request's own failure."""
+    return _earlier_failed() + [_err("tts_unavailable", UNAVAILABLE_MSG), _start(rid),
+                                _end(rid, "error")]
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+async def test_own_error_after_an_earlier_late_error_read_in_one_batch(make_client,
+                                                                        method):
+    """The reader reads all the frames before the method reads its queue.
+
+    The later request still gets its own error frame, not the earlier one and not
+    none. For stream_tts_live this is the audio_end read after the send loop.
+    """
+    client, _ = make_client([_earlier_failed_then_own])
+    with pytest.raises(TTSError) as excinfo:
+        await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert excinfo.value.error_type == "tts_unavailable"
+    assert str(excinfo.value) == UNAVAILABLE_MSG
+
+
+async def test_live_own_error_after_an_earlier_late_error_while_text_is_sent(make_client):
+    """The same, with the audio_end read while text chunks are still sent."""
+    client, ws = make_client([])
+    rid = "later-request"
+    with pytest.raises(TTSError) as excinfo:
+        async for _ in client.stream_tts_live(
+                _text_with_frames(ws, _earlier_failed_then_own(rid)), request_id=rid):
+            pass
+    assert excinfo.value.error_type == "tts_unavailable"
+    assert str(excinfo.value) == UNAVAILABLE_MSG
+    assert not any(json.loads(d).get("done") for d in ws.sent)
+
+
+async def test_duplex_audio_end_has_only_wire_fields(make_client):
+    """The audio_end of a failed request in DuplexSession.audio() is the wire frame."""
+    client, ws = make_client([])
+    rid = "duplex-request"
+    for item in _audiocpp_order(rid):
+        ws.push(item)
+    events: list = []
+    async with client.duplex() as session:
+        async for event in session.audio():
+            events.append(event)
+            if event[0] == "audio_end":
+                break
+    assert events[-1] == ("audio_end",
+                          {"type": "audio_end", "request_id": rid, "reason": "error"})
+    assert client._error_queue.get_nowait()["error_type"] == "tts_unavailable"
