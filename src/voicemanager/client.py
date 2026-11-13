@@ -925,13 +925,42 @@ class VoiceManagerClient:
                     break
             await q.put(None)
 
+    async def reconnect(self) -> None:
+        """Open a new connection to the server, replacing the current one.
+
+        Call this when a call raised ConnectionError because a reconnect failed
+        (every attempt to reach the server failed). The client then has no
+        connection, and every later call raises "Not connected" until this
+        succeeds. It also works with a live connection, which it closes and
+        replaces, and on a client that has no connection yet.
+
+        When a reconnect runs already (one that a lost connection started, or
+        another call of this method), this waits for that reconnect and opens
+        no connection of its own; its result is the result of this call.
+
+        The new connection is a new server session. On success
+        ``reconnected`` is True, as after a reconnect the client does itself:
+        upload the voice profile again with upload_voice(), which clears it.
+        The state of the old connection starts over: the mic sample counts are
+        zero, the wake word and turn engine opt-ins are gone (opt in again
+        before the first audio), the session listens, and the set of cancelled
+        TTS requests is empty.
+
+        Raises ConnectionError when every attempt fails (three attempts, with
+        waits of 1 and 2 s between them), also when it waited for the reconnect
+        of another task.
+        The client then has no connection, and this can be called again.
+        """
+        await self._reconnect()
+
     async def _reconnect(self, failed=_CURRENT_SOCKET) -> None:
         """Reconnect with exponential backoff; one reconnect serves every task.
 
         ``failed`` is the socket the caller saw closed. When it was already
         replaced by a new connection this does nothing. When another task is
         reconnecting already, this waits for that reconnect and opens no
-        connection of its own. Without ``failed`` the current socket is replaced.
+        connection of its own. Without ``failed`` the current socket is
+        replaced, or a connection is opened when there is none.
 
         Raises ConnectionError after max_retries attempts (also in a task that
         waited for the reconnect of another task).

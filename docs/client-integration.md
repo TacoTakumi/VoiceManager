@@ -329,8 +329,11 @@ async with client:
 
 If the client transparently reconnects mid-session it sets `reconnected = True`
 and starts a fresh server-side session, so a previously uploaded voice profile
-must be re-uploaded (it clears the flag once you do). For a clean end of work,
-simply exit the context manager.
+must be re-uploaded (it clears the flag once you do). When every attempt of that
+reconnect fails, the call raises `ConnectionError` and the client has no
+connection: every later call raises "Not connected". Call `await
+client.reconnect()` to open a new connection; it sets `reconnected = True` in the
+same way. For a clean end of work, simply exit the context manager.
 
 ## Speech-to-text (STT)
 
@@ -1609,6 +1612,7 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 |---|---|---|
 | `VoiceManagerClient` | `(host="localhost", port=8255, token="", max_retries=3, use_ssl=False)` | Construct a client. No socket opens until you enter the context manager. |
 | `async with client:` | `__aenter__` / `__aexit__` | Opens the WebSocket, reads the `ready` handshake, starts the single reader task; closes the socket and drains queues on exit. |
+| `reconnect` | `() -> None` | Opens a new connection and closes the current one, if there is one. Use it after a call raised `ConnectionError` because a reconnect failed: the client then has no connection, and every call raises "Not connected" until this succeeds. While a reconnect runs, it waits for that one and opens none of its own. Raises `ConnectionError` when all three attempts fail; you can call it again. On success it sets `reconnected = True`. The new connection is a new session: upload the voice profile again, and opt in to the wake word and the turn engine again. The mic sample counts start at zero, the session listens, and no TTS request is cancelled. |
 
 ### Speech to text
 
@@ -1763,7 +1767,7 @@ turn-taking and barge-in flows above rely on them.
 | `available_voices` | `list[str]` | Preset voices offered by the server (VibeVoice and audiocpp). |
 | `default_voice` | `str \| None` | The voice a TTS request without `voice` gets on this connection; `None` under OpenVoice. |
 | `connected` | `bool` | Whether the reader task holds a live connection. |
-| `reconnected` | `bool` | Set `true` after a transparent reconnect; the voice profile must be re-uploaded, after which it clears. |
+| `reconnected` | `bool` | Set `true` after a transparent reconnect or a successful `reconnect()`; the voice profile must be re-uploaded, after which it clears. |
 | `last_tts_sample_rate` | `int` | Output rate of the most recent TTS reply, updated from `audio_start` during live streaming. |
 | `last_tts_request_id` | `str \| None` | The `request_id` of the most recently started TTS request; pass it to `cancel_tts` for barge-in. |
 
@@ -1895,7 +1899,8 @@ Two properties a client must plan for:
   in-memory pipeline. It is lost on disconnect and never shared across sessions.
 - **Re-upload after reconnect.** A transparent reconnect starts a fresh session
   with no profile; `VoiceManagerClient` sets `reconnected = True` to flag this,
-  and clears it once `upload_voice` re-establishes the profile.
+  and clears it once `upload_voice` re-establishes the profile. A successful
+  `reconnect()` call sets it too.
 
 ```text
 client:  ws connect        -> ready { "session_id": "3f2b1a90-5c7e-4d21-9b0a-1e2f3a4b5c6d", ... }
