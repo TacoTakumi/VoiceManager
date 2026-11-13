@@ -4,6 +4,29 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3]
+
+### Changed
+
+- Documentation only, no change of behaviour. The client guide
+  (`docs/client-integration.md`), `.env.example`, `sidecar/PROTOCOL.md`, some
+  comments and docstrings, and five statements in earlier sections of this file
+  were corrected where they did not agree with the code. The guide now says
+  that: only the audiocpp engine writes the `ref=` suffix and the first-audio
+  log line of a clause-mode request; held text with no letter or digit is kept
+  at a `flush` and dropped at `done` and at the flush timeout; in clause mode
+  the start buffer holds its full length only for the first piece and for a
+  piece that starts with nothing unplayed; `held_ms` of the seam log line is
+  the audio that waited before the chunk that released the buffer; a client
+  gains reserve by the time it waits before it starts playback;
+  `VM_AUDIOCPP_TTS_CLAUSE_SILENCE_MS` rounds up to the next 10 ms; a client
+  drops any open `segment_index` at `listen_stopped`; closing a stopped
+  `DuplexSession` ends its exemption from `VM_SESSION_TIMEOUT`; the limit of
+  about 20 dormant wake word connections is for the whole server; the `wake`
+  frame's `mic_sample` after a `wake_word` frame that stopped a listening
+  connection is the count at that frame; and the default of
+  `VM_AUDIOCPP_TTS_REQUEST_OPTIONS` is `seed=2`.
+
 ## [0.9.2]
 
 ### Added
@@ -191,18 +214,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.8.1]
 
-### Fixed
-
-- Clause-mode `tts_stream` with a client that streams LLM tokens. A word split
-  across tokens ("subsystem" + "s.") is no longer cut in two: a word-count or time
-  trigger cuts at the last word end, which is whitespace, or the end of the held
-  text once no new frame arrived for the word grace. A piece with no letter or
-  digit (a lone ".") is never sent to the engine: it starts the next piece, or is
-  dropped at `done` or `flush`. Pieces keep the client's whitespace, so the
-  audiocpp engine no longer puts a space inside a split word or before
-  punctuation ("tri age", "categories ,"), and a paragraph break no longer joins
-  two sentences ("use.One").
-
 ### Added
 
 - Setting `VM_TTS_CLAUSE_WORD_GRACE_MS` (250). The end of the held text counts as
@@ -211,6 +222,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with no trailing space gets each count cut, and the first-piece deadline cut,
   at most this much later. The margin cut does not wait: it cuts at the last
   whitespace, so the last word can start the next piece.
+
+### Fixed
+
+- Clause-mode `tts_stream` with a client that streams LLM tokens. A word split
+  across tokens ("subsystem" + "s.") is no longer cut in two: a word-count or time
+  trigger cuts at the last word end, which is whitespace, or the end of the held
+  text once no new frame arrived for the word grace. A piece with no letter or
+  digit (a lone ".") is never sent to the engine: it starts the next piece (a
+  `flush` keeps it held for that), or is dropped at `done` and at the flush
+  timeout. Pieces keep the client's whitespace, so the
+  audiocpp engine no longer puts a space inside a split word or before
+  punctuation ("tri age", "categories ,"), and a paragraph break no longer joins
+  two sentences ("use.One").
 
 ## [0.8.0]
 
@@ -245,6 +269,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comes in time), `DuplexSession.listen_start()` listens again, and the
   `DuplexSession.listening` property tells the state. While stopped, `send_audio`
   sends and counts nothing, so `mic_sample` keeps matching the server's count.
+  `DuplexSession.close()` on a stopped session sends `listen_start`, so the
+  connection listens again.
 
 ## [0.7.0]
 
@@ -263,7 +289,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the lowest gate. On the mics tested the room sat at -50 to -52 dBFS, so the
   fixed -50 dBFS gate rarely saw silence and a turn could wait 20 s or more for
   the silence fallback. To pin a fixed gate as before, set the margin to 0 and the
-  max to the gate.
+  max to the gate. A `VM_TYGER_VOICE_GATE_DB` above `VM_TYGER_GATE_MAX_DB` now
+  stops startup, whatever `VM_TURN_ENGINE` is: an `.env` with a fixed gate above
+  -38 dBFS needs `VM_TYGER_GATE_MAX_DB` raised to match.
 - Experimental pre-filter (`VM_TYGER_PREFILTER=voxlock`): the session takes its
   3 s voice sample only after the gate is calibrated, and only from audio above
   that gate, so it no longer learns room noise. The order on a connection is:
@@ -291,8 +319,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Experimental: barge-in on speakers with the Tyger turn engine.
   `VM_TYGER_PREFILTER=voxlock` puts a target-speaker filter (VoxLock) in the
   Tyger sidecar. Each connection learns the user's voice from its first 3 s of
-  speech while no reply plays; from then on, while a reply plays, Tyger hears that
-  voice filtered out of the mic, plus noise at `VM_TYGER_PREFILTER_FLOOR_DB`
+  speech while no reply plays; from then on, while a reply plays, Tyger hears only
+  that voice, which the filter takes from the mic, plus noise at
+  `VM_TYGER_PREFILTER_FLOOR_DB`
   (default -52 dBFS), and no reply channel, so a barge in the middle of a reply
   on speakers is heard as on headphones. Off by default; no protocol change. It
   needs `onnxruntime-gpu` (now in `requirements-tyger.txt`) and runs on the
