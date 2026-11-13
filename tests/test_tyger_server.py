@@ -339,16 +339,18 @@ def test_main_passes_torch_threads_to_the_scorer_load(monkeypatch):
 
 # --- the pre-filter wiring of main(), in process -----------------------------------------
 
-def _run_main(monkeypatch, tmp_path, argv, voxlock_module=None):
+def _run_main(monkeypatch, tmp_path, argv, voxlock_module=None, seen=None):
     """Run the sidecar's main() with a fake scorer script, a fake create_app and a
     fake uvicorn server. Returns what create_app got, whether the server ran and
-    every module name main() imported by name."""
+    every module name main() imported by name. A caller that expects main() to
+    exit gives its own ``seen`` dict, which is filled as main() runs."""
     import types
 
     import uvicorn
 
     from voicemanager.pipeline.tyger import server
-    seen = {"imports": [], "ran": False}
+    seen = {} if seen is None else seen
+    seen.update({"imports": [], "ran": False})
 
     def fake_create_app(settings, **kwargs):
         seen["create_app"] = kwargs
@@ -439,12 +441,14 @@ def test_main_exits_1_and_serves_nothing_when_the_prefilter_cannot_load(
             raise RuntimeError("no model files")
 
     fake_voxlock = types.SimpleNamespace(VoxLockFactory=FailingFactory)
-    seen = {}
+    seen: dict = {}
     with pytest.raises(SystemExit) as exc:
-        seen = _run_main(monkeypatch, tmp_path, ["--prefilter", "voxlock"],
-                         voxlock_module=fake_voxlock)
+        _run_main(monkeypatch, tmp_path, ["--prefilter", "voxlock"],
+                  voxlock_module=fake_voxlock, seen=seen)
     assert exc.value.code == 1
-    assert seen == {}  # main() left before create_app and the server
+    # main() left before create_app and the server.
+    assert "create_app" not in seen
+    assert seen["ran"] is False
 
 
 # --- the experimental pre-filter, through the sidecar app -------------------------------
