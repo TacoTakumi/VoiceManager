@@ -18,6 +18,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   It gets an `unknown_voice` error frame that names the presets, as on the
   VoXtream engine, then `audio_end` with `reason: "error"`. See the audio.cpp
   TTS section of the client guide.
+- The `tts_unavailable` and `unknown_voice` error frames (audiocpp and
+  VoXtream) now carry the `request_id` of the request they end
+  (`protocol.RequestErrorMessage`). Every other error frame is unchanged. A
+  client can tie the frame to its request by id and not by the order of the
+  frames. A client that ignores unknown fields needs no change.
 - Python client: `VoiceManagerClient.reconnect()` opens a new connection.
   Call it after a reconnect that failed with `ConnectionError`: from then on
   every call raises "Not connected" until a connection is up again. It waits

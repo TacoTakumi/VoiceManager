@@ -1663,9 +1663,12 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 `tts_unavailable` (the engine failed, a later request may succeed) or
 `unknown_voice` (pick a voice from `available_voices`). The message is the
 frame's `message`. When no such frame came, as on the one-shot `tts` path,
-`error_type` is `None` and the message is fixed. The client matches the frame
-to the request by wire order: the server sends it before that `audio_end`, and
-an `error` frame read before the request started does not count.
+`error_type` is `None` and the message is fixed. The client ties the frame to
+the request by the frame's `request_id`, so an `audio_end` of another request
+(a cancel ack, for example) does not take it. A frame with no `request_id`
+(from a server older than 0.10.0) is tied by wire order: the server sends it
+before that `audio_end`. An `error` frame read before the request started does
+not count.
 `synthesize_tts` and `stream_tts` drop the partial audio. `stream_tts_live`
 has already yielded the audio that came before the `audio_end`, then it raises.
 The `error` frame also still goes to the error queue that
