@@ -24,6 +24,13 @@ dB and the mode (``listening``: no reply plays, ``speaking``: a reply plays).
   ``gate_margin_db``, no lower than the configured gate and no higher than
   ``gate_max_db``. Speaking-mode frames carry the reply's echo and do not count.
   Turn ends, mode changes and listening boundaries keep the calibrated gate.
+  Calibration does not count the open turn's voice again: frames that were voiced
+  under the configured gate stay counted. In a room that is louder than the
+  configured gate, the room frames of those 2 s count as speech, so one endpoint
+  by ``silence`` follows with no user speech, once the frames have been below the
+  new gate for the silence fallback's length (about 3 s into the session). The
+  server has no final text for that turn end, so the client gets a ``turn_empty``
+  frame for it, and the heads' context starts over.
 * The head's decisions count only after ``warmup_frames`` frames of fresh context:
   after the first hop, every switch of mode, every endpoint and every listening
   boundary (``boundary``: the client stopped listening). The silence

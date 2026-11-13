@@ -278,6 +278,11 @@ class DuplexSession:
         the frame is not sent and nothing is raised; the client still counts as
         listening, as the new connection of a reconnect does. Closing a session
         again does nothing.
+
+        That listen_start also ends the stopped connection's exemption from the
+        server's session timeout: an idle connection gets timeout_warning and
+        the 1001 close again. A client that wants to idle stopped keeps the
+        session open.
         """
         if self.closed:
             return
@@ -414,6 +419,11 @@ class DuplexSession:
         from now on. Calling it while already listening still sends the frame,
         which the server ignores.
 
+        Not handled, on a session that opted in to the wake word: a
+        ``listen_start`` and then a ``listen_stop`` that are both sent before the
+        session has read a wake frame that the server sent in that time. The
+        session can then count as listening while the server is dormant.
+
         Raises:
             VoiceManagerError: The session is closed (nothing is sent), or the
                 connection was lost while sending the frame.
@@ -451,6 +461,11 @@ class DuplexSession:
         ``listen_stop`` makes the session dormant again, and ``listen_start`` wakes
         it by hand. Calling this again replaces the phrases. Wait for the answer
         before the next ``listen_stop`` or ``listen_start``.
+
+        Not handled: a second call on a dormant session whose frame crosses a
+        wake frame from the server. The audio sent after that second call is
+        then counted in ``mic_sample``, and the server took it as dormant audio,
+        so the two counts differ.
 
         Raises:
             VoiceManagerError: The session is closed; nothing is sent.

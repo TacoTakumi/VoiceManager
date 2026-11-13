@@ -8,8 +8,10 @@ one log line for the request.
 The line also gives the lowest reserve of the simplest client: playback starts
 when the first frame arrives and does not stop. The reserve at a send is the
 audio sent before it minus the time since the first send. A negative value means
-that such a client ran dry by that amount. A client that buffers before it plays
-has more reserve than this by the length of its buffer.
+that such a client ran dry by that amount. A client that waits before it starts
+playback has more reserve than this by the time it waits. A client that starts
+when a set amount of audio is queued gains nothing when the first frame already
+holds that much.
 
 The record only reads. It does not change what is sent.
 """

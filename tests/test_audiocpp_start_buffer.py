@@ -3,8 +3,9 @@
 The first frames of a synthesis arrive from the sidecar at about real-time speed,
 so a client that plays on arrival runs dry between them. The audiocpp stream
 pipeline therefore holds the first VM_AUDIOCPP_TTS_START_BUFFER_MS of audio of
-each engine request and sends it as one chunk; later chunks of that request go
-out as they arrive.
+an engine request and sends it as one chunk; later chunks of that request go
+out as they arrive. In a clause request the audio that the client has not played
+yet counts toward the buffer.
 
 What must hold:
 
@@ -12,7 +13,7 @@ What must hold:
     least the buffer length, and later chunks pass through one by one;
   * a request that ends before the buffer fills sends what it made, once;
   * with the buffer at 0 every chunk is sent on arrival;
-  * each engine request (each clause piece) holds again;
+  * the second clause piece does not hold while the first still plays;
   * the unplayed-audio report counts every sample once, at the moment it is sent.
 
 Model-free and server-free: a fake engine yields float32 chunks and a fake

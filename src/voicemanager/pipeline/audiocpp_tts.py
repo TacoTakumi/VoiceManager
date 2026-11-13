@@ -923,10 +923,14 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
     byte-identical. This class is selected only when the audiocpp
     engine is (the websocket layer's engine selection branch).
 
-    A chunking="clause" request needs nothing extra beyond the inherited
-    chunker and timer: the loop reports each PCM chunk it sends, as the base
-    loop does, and clause pieces that are cut while a request synthesizes are
-    queued like sentences, so the same drain merges them into one next request.
+    A chunking="clause" request uses the inherited chunker and timer: the loop
+    reports each PCM chunk it sends, as the base loop does, and clause pieces
+    that are cut while a request synthesizes are queued like sentences, so the
+    same drain merges them into one next request. The loop also reads the
+    chunker's unplayed-audio estimate in two places: the start buffer counts
+    the unplayed audio toward its length, so a later piece is not held while
+    the piece before it still plays, and the coalescing window ends when the
+    unplayed audio falls to its floor.
 
     With `clause_continue` on, a clause request's later engine requests clone
     from a composed reference (see the module's composed-reference section)

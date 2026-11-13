@@ -206,17 +206,17 @@ def _release_section(version):
     return CHANGELOG[start:CHANGELOG.index("## [", start + 4)]
 
 
-def test_the_changelog_has_the_prefilter_under_the_next_version():
-    newest = _release_section("0.8.0")
-    assert "VM_TYGER_PREFILTER" in newest and "xperimental" in newest
+def test_the_changelog_has_the_prefilter_under_0_8_0():
+    release = _release_section("0.8.0")
+    assert "VM_TYGER_PREFILTER" in release and "xperimental" in release
 
 
 @pytest.mark.parametrize("name", ["VM_TYGER_GATE_MARGIN_DB", "VM_TYGER_GATE_MAX_DB"])
 def test_the_calibrated_gate_settings_are_documented(name):
     assert name in README and name in GUIDE
     assert f"# {name}=" in ENV_EXAMPLE
-    newest = _release_section("0.8.0")
-    assert name in newest
+    release = _release_section("0.8.0")
+    assert name in release
 
 
 

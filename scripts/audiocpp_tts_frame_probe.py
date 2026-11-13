@@ -12,9 +12,10 @@ Breeze q8_0). It never falls back to the CPU: a sidecar that cannot load is an
 error.
 
 The settings are the server's own: the VM_* variables in the shell, then the
-.env file of the directory it is started from. Run it from the repository root
-to measure what the service there would do. Set VM_AUDIOCPP_DEVICE in the shell
-to use another card.
+.env file of the VoiceManager home. The home is $VOICEMANAGER_HOME when set,
+else the clone that the package runs from; the current directory has no effect.
+So the script measures what the service of that home would do. Set
+VM_AUDIOCPP_DEVICE in the shell to use another card.
 
 For each reply it prints the pipeline's own log lines (the first audio and the
 seam of each engine request, the silence statistics, and the frame line), and at
