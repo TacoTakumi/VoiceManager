@@ -121,3 +121,37 @@ def test_matcher_ignores_real_names(sample):
 def test_no_trace_refs_in(area):
     hits = _offenders(area)
     assert not hits, f"{len(hits)} trace refs in {area}:\n" + "\n".join(hits[:200])
+
+
+def _release_excludes() -> list[str]:
+    """The EXCLUDE_PATHS entries of the release config: paths the mirror strips."""
+    config = REPO_ROOT / ".releaserc"
+    if not config.is_file():
+        pytest.skip("no release config in this tree")
+    match = re.search(r"^EXCLUDE_PATHS=\((.*?)^\)", config.read_text(encoding="utf-8"),
+                      flags=re.M | re.S)
+    assert match, "no EXCLUDE_PATHS array in .releaserc"
+    return [line.split("#", 1)[0].strip() for line in match.group(1).splitlines()
+            if line.split("#", 1)[0].strip()]
+
+
+def test_every_private_tracked_file_is_stripped_from_the_release():
+    """The scan above skips the private paths because they are not published.
+
+    That holds only when the release strips each of them. The mirror strips the
+    EXCLUDE_PATHS entries as literal paths, with no pattern, so a new private file
+    under a prefix such as the agenda files is published unless it is listed.
+    """
+    try:
+        out = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True,
+                             text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("needs a git checkout to list the tracked files")
+    excludes = _release_excludes()
+    published = [path for path in out.splitlines()
+                 if path.startswith(PRIVATE_PREFIXES)
+                 and not any(path == entry or path.startswith(entry + "/")
+                             for entry in excludes)]
+    assert not published, (
+        "private files that the release would publish (add them to EXCLUDE_PATHS "
+        "in .releaserc):\n" + "\n".join(published))
