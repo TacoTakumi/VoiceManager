@@ -16,13 +16,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   text. The connection stays open, and a later request can succeed. A
   `tts_stream` request with an unknown `voice` does not get `tts_unavailable`.
   It gets an `unknown_voice` error frame that names the presets, as on the
-  VoXtream engine, then `audio_end` with `reason: "error"`. See the audio.cpp
-  TTS section of the client guide.
-- The `tts_unavailable` and `unknown_voice` error frames (audiocpp and
-  VoXtream) now carry the `request_id` of the request they end
-  (`protocol.RequestErrorMessage`). Every other error frame is unchanged. A
-  client can tie the frame to its request by id and not by the order of the
-  frames. A client that ignores unknown fields needs no change.
+  VoXtream engine, then `audio_end` with `reason: "error"`. Both frames carry
+  the `request_id` of the request they end (`protocol.RequestErrorMessage`), so
+  a client can tie the frame to its request by id and not by the order of the
+  frames. See the audio.cpp TTS section of the client guide.
 - Python client: `VoiceManagerClient.reconnect()` opens a new connection.
   Call it after a reconnect that failed with `ConnectionError`: from then on
   every call raises "Not connected" until a connection is up again. It waits
@@ -32,6 +29,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The VoXtream engine's `unknown_voice` error frame now carries the
+  `request_id` of the request it ends, as the audiocpp frames do. Every other
+  error frame is unchanged. A client that ignores unknown fields needs no
+  change.
 - Python client: `synthesize_tts`, `stream_tts` and `stream_tts_live` now
   raise `TTSError` when their request ends with `audio_end` reason `error`.
   Before, they returned the empty or partial audio as if the request had

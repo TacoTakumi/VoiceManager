@@ -632,8 +632,8 @@ The `message` names the sidecar error code, for example `load_failed`. It does
 not contain the sidecar's detail text. A failure with no code gets a fixed
 message. The frame carries the `request_id` of the request it ends, so a client
 can tie it to that request's `audio_end` by id and not by wire order. The
-`request_id` field is new in 0.10.0. An older server sends the frame without
-it. A client should ignore fields it does not know.
+frame is new in 0.10.0 and always carries `request_id`. A client should ignore
+fields it does not know.
 
 ```json
 { "type": "error", "error_type": "tts_unavailable", "message": "The TTS engine is unavailable (load_failed). A later request may succeed.", "request_id": "r1" }
@@ -645,8 +645,8 @@ It does not get `tts_unavailable`. It gets an `error` frame with
 the valid presets. Then `audio_end` with `reason: "error"` follows for the same
 `request_id`. Nothing goes to the sidecar, and the connection stays open. Do not
 send the same voice again: pick a name from `available_voices`. Like
-`tts_unavailable`, the frame carries the `request_id` of the request it ends
-(new in 0.10.0).
+`tts_unavailable`, this frame is new in 0.10.0 on the audiocpp engine and
+always carries the `request_id` of the request it ends.
 
 ```json
 { "type": "error", "error_type": "unknown_voice", "message": "unknown voice 'no-such-voice'; valid presets: designed_female_s101, designed_gm_02, designed_male_s202, lcars_demo", "request_id": "r1" }
@@ -678,7 +678,9 @@ What changes for a client:
   `"unknown_voice"`, `message` naming the presets, `request_id` naming the
   request), then `audio_start` and one `audio_end` with `reason: "error"`; the
   connection stays open. Here the `error` frame comes before `audio_start`, so
-  tie it to the request by its `request_id` (new in 0.10.0), not by wire order.
+  tie it to the request by its `request_id`, not by wire order. The
+  `request_id` field is new in 0.10.0: a 0.9.x server sends this frame without
+  it.
 - A generation that fails before the engine finishes (the sidecar is
   unreachable, refuses the request, or drops the connection mid-reply) ends the
   request with `audio_start` (if not yet sent) and one `audio_end` with
@@ -709,8 +711,9 @@ For engines with preset voices (VibeVoice, audiocpp and voxtream), the voice of 
    `"unknown_voice"` whose `message` lists the valid presets and whose
    `request_id` names the request, then `audio_start` and one `audio_end` with
    `reason: "error"`, and the connection stays open for the next request.
-   The audiocpp `unknown_voice` frame carries the `request_id` too. Both are
-   new in 0.10.0. Pick names from `available_voices` to avoid all three.
+   The audiocpp `unknown_voice` frame carries the `request_id` too. The field
+   is new in 0.10.0 on both engines, and a 0.9.x VoXtream server sends the
+   frame without it. Pick names from `available_voices` to avoid all three.
 2. **The token's voice**, when the token that opened the connection has one and
    the running engine offers it. Set it with
    `voicemanager user token voice USER NAME VOICE` (clear it with `--clear`),
@@ -1665,9 +1668,9 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 frame's `message`. When no such frame came, as on the one-shot `tts` path,
 `error_type` is `None` and the message is fixed. The client ties the frame to
 the request by the frame's `request_id`, so an `audio_end` of another request
-(a cancel ack, for example) does not take it. A frame with no `request_id`
-(from a server older than 0.10.0) is tied by wire order: the server sends it
-before that `audio_end`. An `error` frame read before the request started does
+(a cancel ack, for example) does not take it. A frame with no `request_id` (the
+VoXtream `unknown_voice` frame of a 0.9.x server) is tied by wire order: the
+server sends it before that `audio_end`. An `error` frame read before the request started does
 not count.
 `synthesize_tts` and `stream_tts` drop the partial audio. `stream_tts_live`
 has already yielded the audio that came before the `audio_end`, then it raises.
