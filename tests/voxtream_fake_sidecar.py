@@ -95,7 +95,8 @@ class FakeVoxtreamSidecar:
                  keep_emitting_after_eot: bool = False, init_error: str | None = None,
                  close_after_frames: int | None = None,
                  eos_after_frames: int | None = None,
-                 clean_close_after_frames: int | None = None):
+                 clean_close_after_frames: int | None = None,
+                 error_after_frames: int | None = None):
         self.frames_per_chunk = frames_per_chunk
         self.hold_eos = hold_eos
         self.keep_emitting_after_eot = keep_emitting_after_eot
@@ -111,6 +112,9 @@ class FakeVoxtreamSidecar:
         # Close the connection cleanly (code 1000) after this many frames with no
         # eos: a sidecar that went away politely without finishing the reply.
         self.clean_close_after_frames = clean_close_after_frames
+        # Send an error frame after this many frames and keep the connection open:
+        # a generation that failed in the sidecar while it was speaking.
+        self.error_after_frames = error_after_frames
         self.inits: list[dict] = []
         self.chunks: list[list[str]] = []  # per connection, in order
         self.eots: list[int] = []  # connection indexes that sent eot
@@ -212,6 +216,12 @@ class FakeVoxtreamSidecar:
                                 and frame_no >= self.clean_close_after_frames:
                             await ws.close()  # code 1000, no eos
                             return
+                        if self.error_after_frames is not None \
+                                and frame_no >= self.error_after_frames:
+                            await ws.send(json.dumps(
+                                {"type": "error", "message": "fake generation fault"}))
+                            while True:
+                                await ws.recv()  # until the client closes
                 elif payload.get("event") == "eot":
                     eot = True
             with self._lock:

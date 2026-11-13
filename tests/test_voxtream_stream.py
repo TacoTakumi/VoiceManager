@@ -363,6 +363,7 @@ def test_a_pump_that_fails_mid_generation_leaves_no_unretrieved_exception(fake):
 
     class _StubGeneration:
         sample_rate = 24000
+        eos_received = False  # as the real generation has before an eos frame
 
         async def start(self):
             pass
@@ -399,6 +400,100 @@ def test_a_pump_that_fails_mid_generation_leaves_no_unretrieved_exception(fake):
     assert ws.kinds() == ["audio_start", "bytes", "audio_end"]
     assert ws.texts("audio_end")[0]["reason"] == "error"
     assert unhandled == []
+
+
+def test_frames_that_end_with_no_eos_give_reason_error_and_no_logged_failure(fake, caplog):
+    # The reason comes from the generation's eos_received, read after the frames
+    # loop. A generation whose frames end with no eos and no exception is not a
+    # complete reply, and it is not a failure of the pipeline either: nothing is
+    # logged as an exception.
+    import logging
+
+    class _StubGeneration:
+        sample_rate = 24000
+        eos_received = False
+
+        async def start(self):
+            pass
+
+        async def push(self, chunk):
+            pass
+
+        async def end(self):
+            pass
+
+        async def frames(self):
+            yield np.zeros(FRAME_SAMPLES, dtype=np.float32)
+
+        async def close(self):
+            pass
+
+    ws = _WS()
+
+    async def run():
+        engine = _engine(fake)
+        engine.open_generation = lambda voice: _StubGeneration()
+        pipe = _pipe(engine)
+        await pipe.feed_text("hello", True, ws, "r1")
+        await asyncio.wait_for(pipe.synthesis_task, 3.0)
+
+    with caplog.at_level(logging.DEBUG, logger="voicemanager.pipeline.voxtream_tts"):
+        asyncio.run(run())
+    assert ws.kinds() == ["audio_start", "bytes", "audio_end"]
+    assert ws.texts("audio_end")[0]["reason"] == "error"
+    assert [r for r in caplog.records if r.exc_info] == []
+
+
+def _failed_reply_over_the_endpoint(fake, monkeypatch) -> None:
+    """Send one request over /ws/stream to a sidecar that fails after two frames.
+
+    The client must get the two frames and an audio_end with reason error, and
+    the connection must stay open for the next request.
+    """
+    monkeypatch.setattr(ws_module, "QwenSTTPipeline", _InstantSTT)
+    engine = _engine(fake)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        client = TestClient(_tts_app(engine, executor))
+        with authkit.ws_connect(client, "/ws/stream") as ws:
+            assert ws.receive_json()["type"] == "ready"
+            for i, chunk in enumerate(CHUNKS):
+                ws.send_json({"type": "tts_stream", "text": chunk,
+                              "done": i == len(CHUNKS) - 1, "request_id": "broken"})
+            assert ws.receive_json()["type"] == "audio_start"
+            pcm = []
+            while True:
+                frame = ws.receive()
+                if frame.get("bytes") is not None:
+                    pcm.append(frame["bytes"])
+                    continue
+                end = json.loads(frame["text"])
+                break
+            assert pcm == [_fake_frame(1), _fake_frame(2)]
+            assert end["type"] == "audio_end", end
+            assert end["request_id"] == "broken"
+            assert end["reason"] == "error"
+            # The connection is still open: the next request gets its own start.
+            ws.send_json({"type": "tts_stream", "text": "again", "done": True,
+                          "request_id": "next"})
+            start = ws.receive_json()
+            assert start["type"] == "audio_start" and start["request_id"] == "next"
+    assert fake.connections == 2
+
+
+def test_an_error_frame_mid_generation_over_the_endpoint_ends_with_reason_error(monkeypatch):
+    fake = FakeVoxtreamSidecar(error_after_frames=2).start()
+    try:
+        _failed_reply_over_the_endpoint(fake, monkeypatch)
+    finally:
+        fake.stop()
+
+
+def test_a_dropped_sidecar_mid_generation_over_the_endpoint_ends_with_reason_error(monkeypatch):
+    fake = FakeVoxtreamSidecar(close_after_frames=2).start()
+    try:
+        _failed_reply_over_the_endpoint(fake, monkeypatch)
+    finally:
+        fake.stop()
 
 
 def test_no_sidecar_on_the_port_ends_with_reason_error():

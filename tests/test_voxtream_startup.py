@@ -268,3 +268,47 @@ def test_a_port_already_in_use_refuses_startup_naming_the_port_setting(fake_side
     assert "VM_VOXTREAM_PORT" in str(exc.value)
     assert sidecar.process is None
     assert not args_file.exists()  # nothing was spawned
+
+
+def test_a_stranger_that_answers_health_on_the_port_is_not_adopted(fake_sidecar, tmp_path):
+    """A process that this server did not start answers 200 on /health on the port
+    (an orphaned sidecar from a killed server). Startup must refuse and name the
+    port setting. It must not spawn a child, and it must not take the stranger for
+    its own sidecar."""
+    import subprocess
+    import urllib.request
+
+    port = _free_port()
+    stranger = subprocess.Popen(
+        [sys.executable, str(FAKE_SIDECAR), "--host", "127.0.0.1", "--port", str(port)],
+        stdin=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/health", timeout=0.5) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                pass
+            assert stranger.poll() is None, "the stranger exited"
+            assert time.monotonic() < deadline, "the stranger did not answer"
+            time.sleep(0.05)
+        # Set only now, so the stranger did not write it: only a spawned child would.
+        args_file = tmp_path / "args.json"
+        fake_sidecar("ready", VOXTREAM_FAKE_ARGS_FILE=args_file)
+        sidecar = VoxtreamSidecar(sys.executable, port, ready_timeout_s=5.0)
+        try:
+            with pytest.raises(VoxtreamStartupError) as exc:
+                sidecar.start()
+            assert "VM_VOXTREAM_PORT" in str(exc.value)
+            assert sidecar.process is None
+            assert not sidecar.ready
+            assert not args_file.exists()  # nothing was spawned
+            assert stranger.poll() is None  # and the stranger was left alone
+        finally:
+            sidecar.stop()
+    finally:
+        stranger.terminate()
+        stranger.wait(5)
