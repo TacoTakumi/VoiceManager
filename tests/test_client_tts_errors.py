@@ -12,7 +12,11 @@ frame and audio_end come after the later request started, and also when the
 reader reads them and the later request's own frames in one batch; the reasons
 complete, cancelled and interrupted return as before; stream_tts_live yields the
 audio that came before the audio_end and then raises, in its send loop and after
-it; DuplexSession.audio() yields the audio_end with no client-private key.
+it; DuplexSession.audio() yields the audio_end with no client-private key. With
+error frames that carry a request_id: a cancel ack of another id between the
+frame and its audio_end keeps the frame, an earlier request's named frame never
+marks a later request, and no stored frame outlives its request's audio_end, a
+request start or a reconnect, nor grows past a cap.
 """
 import asyncio
 import json
@@ -386,3 +390,174 @@ async def test_duplex_audio_end_has_only_wire_fields(make_client):
     assert events[-1] == ("audio_end",
                           {"type": "audio_end", "request_id": rid, "reason": "error"})
     assert client._error_queue.get_nowait()["error_type"] == "tts_unavailable"
+
+
+# A server that names the request on its TTS error frames. The client ties such a
+# frame to the audio_end of that request_id, whatever audio_end comes between.
+FOREIGN_RID = "other-request"
+
+
+def _err_for(rid: str, error_type: str, message: str) -> str:
+    return json.dumps({"type": "error", "error_type": error_type, "message": message,
+                       "request_id": rid})
+
+
+def _audiocpp_with_ack(rid: str) -> list:
+    """The audiocpp order with a cancel ack of another id after the error frame."""
+    return [_start(rid), PCM_A, _err_for(rid, "tts_unavailable", UNAVAILABLE_MSG),
+            _end(FOREIGN_RID, "cancelled"), _end(rid, "error")]
+
+
+def _voxtream_with_ack(rid: str) -> list:
+    """The VoXtream order with a cancel ack of another id after the error frame."""
+    return [_err_for(rid, "unknown_voice", UNKNOWN_VOICE_MSG),
+            _end(FOREIGN_RID, "cancelled"), _start(rid), _end(rid, "error")]
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+@pytest.mark.parametrize("order, error_type, message", [
+    (_audiocpp_with_ack, "tts_unavailable", UNAVAILABLE_MSG),
+    (_voxtream_with_ack, "unknown_voice", UNKNOWN_VOICE_MSG),
+], ids=["audiocpp_order", "voxtream_order"])
+async def test_cancel_ack_of_another_id_keeps_the_error_frame(make_client, method, order,
+                                                              error_type, message):
+    """An audio_end of another request_id does not take the request's frame.
+
+    For stream_tts_live this is the audio_end read after the send loop.
+    """
+    client, _ = make_client([order])
+    with pytest.raises(TTSError) as excinfo:
+        await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert excinfo.value.error_type == error_type
+    assert str(excinfo.value) == message
+    assert client._tts_error_frames == {}
+
+
+@pytest.mark.parametrize("order, error_type", [
+    (_audiocpp_with_ack, "tts_unavailable"),
+    (_voxtream_with_ack, "unknown_voice"),
+], ids=["audiocpp_order", "voxtream_order"])
+async def test_live_cancel_ack_of_another_id_while_text_is_sent(make_client, order,
+                                                                error_type):
+    """The same, with the audio_end read while text chunks are still sent."""
+    client, ws = make_client([])
+    rid = "live-request"
+    with pytest.raises(TTSError) as excinfo:
+        async for _ in client.stream_tts_live(_text_with_frames(ws, order(rid)),
+                                              request_id=rid):
+            pass
+    assert excinfo.value.error_type == error_type
+    assert not any(json.loads(d).get("done") for d in ws.sent)
+    assert client._tts_error_frames == {}
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+@pytest.mark.parametrize("earlier_end", [True, False], ids=["earlier_end", "no_earlier_end"])
+async def test_earlier_frame_with_its_id_does_not_mark_a_later_request(make_client, method,
+                                                                       earlier_end):
+    """An earlier request's frame, read after the later request started, is not its.
+
+    The earlier request's audio_end comes after the later one's, or never.
+    """
+    def _script(rid: str) -> list:
+        frames = [_err_for(EARLIER_RID, "unknown_voice", UNKNOWN_VOICE_MSG),
+                  _start(rid), _end(rid, "error")]
+        if earlier_end:
+            frames.append(_end(EARLIER_RID, "error"))
+        return frames
+
+    client, _ = make_client([_script])
+    with pytest.raises(TTSError) as excinfo:
+        await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert excinfo.value.error_type is None
+    assert str(excinfo.value) == "The server ended the TTS request with an error"
+
+
+def _earlier_then_own_with_ids(rid: str) -> list:
+    """The earlier request's late failure, then the later request's own, both named."""
+    return [_err_for(EARLIER_RID, "unknown_voice", UNKNOWN_VOICE_MSG), _start(EARLIER_RID),
+            _end(EARLIER_RID, "error"),
+            _err_for(rid, "tts_unavailable", UNAVAILABLE_MSG), _start(rid),
+            _end(rid, "error")]
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+async def test_own_named_error_after_an_earlier_one_read_in_one_batch(make_client, method):
+    """The reader reads all the frames first; the later request gets its own frame."""
+    client, _ = make_client([_earlier_then_own_with_ids])
+    with pytest.raises(TTSError) as excinfo:
+        await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert excinfo.value.error_type == "tts_unavailable"
+    assert str(excinfo.value) == UNAVAILABLE_MSG
+    assert client._tts_error_frames == {}
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+@pytest.mark.parametrize("reason", ["complete", "cancelled", "interrupted"])
+async def test_named_frame_is_removed_at_an_audio_end_of_another_reason(make_client, method,
+                                                                        reason):
+    """An audio_end of the request with any reason removes its stored frame."""
+    def _script(rid: str) -> list:
+        return [_start(rid), PCM_A, _err_for(rid, "unknown_voice", UNKNOWN_VOICE_MSG),
+                _end(rid, reason)]
+
+    client, _ = make_client([_script])
+    pcm, _ = await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert pcm == PCM_A
+    assert client._tts_error_frames == {}
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+async def test_named_frame_read_while_idle_is_cleared_at_request_start(make_client, method):
+    """A stored frame of a request that got no audio_end goes when a request starts."""
+    client, ws = make_client([_complete])
+    ws.push(_err_for(EARLIER_RID, "unknown_voice", UNKNOWN_VOICE_MSG))
+    await _idle(client)
+    assert EARLIER_RID in client._tts_error_frames
+
+    await asyncio.wait_for(METHODS[method](client), timeout=2.0)
+    assert client._tts_error_frames == {}
+
+
+async def test_stored_named_frames_are_capped(make_client):
+    """Frames of requests that never get an audio_end do not pile up without limit."""
+    client, ws = make_client([])
+    for n in range(200):
+        ws.push(_err_for(f"lost-{n}", "tts_unavailable", UNAVAILABLE_MSG))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert 0 < len(client._tts_error_frames) <= 32
+    # The newest frames are the ones kept.
+    assert "lost-199" in client._tts_error_frames
+
+
+async def test_reconnect_clears_stored_error_frames(monkeypatch):
+    """A new connection starts with no stored TTS error frame."""
+    from unittest.mock import AsyncMock
+
+    client = VoiceManagerClient(token="t")
+    client._tts_error_frames = {"a": {"type": "error", "error_type": "unknown_voice"}}
+    client._tts_error_frame = {"type": "error", "error_type": "tts_unavailable"}
+    monkeypatch.setattr(client, "_disconnect", AsyncMock())
+    monkeypatch.setattr(client, "_connect", AsyncMock())
+    await client._reconnect_now()
+    assert client._tts_error_frames == {}
+    assert client._tts_error_frame is None
+
+
+async def test_duplex_named_frame_audio_end_has_only_wire_fields(make_client):
+    """DuplexSession.audio() yields the wire audio_end; a cancel ack between is kept."""
+    client, ws = make_client([])
+    rid = "duplex-request"
+    for item in _audiocpp_with_ack(rid):
+        ws.push(item)
+    events: list = []
+    async with client.duplex() as session:
+        async for event in session.audio():
+            events.append(event)
+            if event[0] == "audio_end" and event[1]["request_id"] == rid:
+                break
+    ends = [e[1] for e in events if e[0] == "audio_end"]
+    assert ends == [{"type": "audio_end", "request_id": FOREIGN_RID, "reason": "cancelled"},
+                    {"type": "audio_end", "request_id": rid, "reason": "error"}]
+    assert client._tts_error_frames == {}

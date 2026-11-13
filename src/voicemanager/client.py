@@ -46,14 +46,19 @@ _TURN_ENGINE_LOST = "turn_engine_lost"
 # it from the other invalid_request frames.
 _WAKE_REFUSAL = "wake_word refused"
 # The error_types the server sends for a TTS request that fails: the TTS engine is
-# down, or the request named a voice the engine does not have. The frame has no
-# request_id; it comes before the request's audio_end, which has reason "error".
+# down, or the request named a voice the engine does not have. The frame comes
+# before the request's audio_end, which has reason "error". A current server puts
+# the request_id of that request on the frame; an older server sends none.
 _TTS_REQUEST_ERRORS = ("tts_unavailable", "unknown_voice")
+# The most TTS error frames with a request_id the reader keeps at one time. A frame
+# goes at its request's audio_end, so only frames of requests whose audio_end never
+# came stay; when one more comes, the oldest goes.
+_TTS_ERROR_FRAMES_MAX = 32
 # The message of the TTSError for an audio_end with reason "error" that no TTS
 # error frame came before (the one-shot tts path sends none).
 _TTS_FAILED_NO_FRAME = "The server ended the TTS request with an error"
 # The client-private key under which the reader puts a TTS error frame on the
-# audio_end with reason "error" that follows it on the wire. DuplexSession.audio()
+# audio_end with reason "error" of its request. DuplexSession.audio()
 # removes it before it yields the audio_end.
 _TTS_ERROR_KEY = "_tts_error"
 # The default of VoiceManagerClient._reconnect: reconnect whatever socket is current.
@@ -740,12 +745,18 @@ class VoiceManagerClient:
         self._stt_queue: asyncio.Queue = asyncio.Queue()
         self._tts_queue: asyncio.Queue = asyncio.Queue()
         self._error_queue: asyncio.Queue = asyncio.Queue()
-        # The TTS request error frame (see _TTS_REQUEST_ERRORS) the reader read and
+        # The TTS request error frames (see _TTS_REQUEST_ERRORS) the reader read and
         # has not yet tied to an audio_end. The server sends a request's error frame
-        # before that request's audio_end, so at each audio_end the reader takes it:
-        # it puts it on an audio_end with reason "error" (under _TTS_ERROR_KEY) and
-        # drops it otherwise. A one-sided TTS method also clears it when its request
-        # starts, so a frame left from an earlier connection cannot reach it.
+        # before that request's audio_end. A frame with a request_id is kept by that
+        # id until an audio_end of the same id: the reader puts it on that audio_end
+        # when its reason is "error" (under _TTS_ERROR_KEY) and drops it otherwise.
+        # An audio_end of another id, such as a cancel ack, leaves it. A frame with
+        # no request_id (an older server) is the one pending frame, which the next
+        # audio_end takes in the same way. A one-sided TTS method clears both when
+        # its request starts, and a reconnect clears both. In duplex use no request
+        # start clears them, so _TTS_ERROR_FRAMES_MAX bounds the frames of requests
+        # whose audio_end never came.
+        self._tts_error_frames: dict[str, dict] = {}
         self._tts_error_frame: dict | None = None
         # turn_started acks. turn_start() sends the control frame then
         # awaits its server-owned turn_id here, off the single reader.
@@ -1009,6 +1020,9 @@ class VoiceManagerClient:
         self._barge_state_queue = asyncio.Queue()
         self.barge_state = None
         self._wake_queue = asyncio.Queue()
+        # No TTS error frame of the old connection names a request of the new one.
+        self._tts_error_frames = {}
+        self._tts_error_frame = None
         # A fresh connection carries no pending cancellations, has not opted in to
         # a turn engine or the wake word, has sent no mic audio, and listens.
         self._wake_phrases = None
@@ -1071,12 +1085,18 @@ class VoiceManagerClient:
                     elif ftype == "audio_start":
                         await self._tts_queue.put(frame)
                     elif ftype == "audio_end":
-                        # Tie the pending TTS error frame to this audio_end, the
-                        # next one on the wire. The frames are read in wire order
-                        # here, before any method reads the queue, so the frame
-                        # rides with its own request's audio_end.
-                        error_frame = self._tts_error_frame
+                        # Tie the TTS error frame of this audio_end's request to it.
+                        # The frames are read in wire order here, before any method
+                        # reads the queue, so the frame rides with its own
+                        # request's audio_end. A frame with this request_id is the
+                        # request's own; else the pending frame with no request_id
+                        # (an older server) is taken by the next audio_end.
+                        error_frame = self._tts_error_frames.pop(
+                            frame.get("request_id"), None)
+                        pending = self._tts_error_frame
                         self._tts_error_frame = None
+                        if error_frame is None:
+                            error_frame = pending
                         if error_frame is not None and frame.get("reason") == "error":
                             frame[_TTS_ERROR_KEY] = error_frame
                         await self._tts_queue.put(frame)
@@ -1135,7 +1155,15 @@ class VoiceManagerClient:
                             self.turn_engine = None
                             self.barge_state = None
                         if error_type in _TTS_REQUEST_ERRORS:
-                            self._tts_error_frame = frame
+                            error_rid = frame.get("request_id")
+                            if error_rid is None:
+                                self._tts_error_frame = frame
+                            else:
+                                frames = self._tts_error_frames
+                                frames.pop(error_rid, None)
+                                frames[error_rid] = frame
+                                while len(frames) > _TTS_ERROR_FRAMES_MAX:
+                                    del frames[next(iter(frames))]
                         await self._error_queue.put(frame)
                     else:
                         self._logger.debug("Unhandled message type: %s", ftype)
@@ -1532,6 +1560,7 @@ class VoiceManagerClient:
             payload["voice"] = voice
         msg = json.dumps(payload)
         # An error frame read before this request started is not this request's.
+        self._tts_error_frames.clear()
         self._tts_error_frame = None
         await self._send_or_raise(msg, TTSError, "Connection lost during TTS synthesis")
 
@@ -1612,6 +1641,7 @@ class VoiceManagerClient:
         audio_buf = bytearray()
         sample_rate = 22050  # fallback; overwritten by audio_start
         # An error frame read before this request started is not this request's.
+        self._tts_error_frames.clear()
         self._tts_error_frame = None
 
         # Send all text chunks as tts_stream messages (done=True on final)
@@ -1732,6 +1762,7 @@ class VoiceManagerClient:
         # Expose the id so the caller can reach the request it just started.
         self.last_tts_request_id = request_id
         # An error frame read before this request started is not this request's.
+        self._tts_error_frames.clear()
         self._tts_error_frame = None
         send_done = False
         audio_started = False
