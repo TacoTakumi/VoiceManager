@@ -77,3 +77,17 @@ def test_env_example_lists_the_word_grace():
 
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     assert f"# {GRACE_ENV}=250" in text
+
+
+def test_the_guide_names_the_engines_of_the_clause_debug_line():
+    """The audiocpp loop and the base loop (openvoice, vibevoice) write the
+    'Clause TTS engine request' line. The voxtream engine cuts no pieces and
+    writes no such line, so the guide must not give the line to every engine."""
+    from pathlib import Path
+
+    guide = (Path(__file__).resolve().parents[1] / "docs"
+             / "client-integration.md").read_text(encoding="utf-8")
+    paragraph = next(p for p in guide.split("\n\n")
+                     if "Clause TTS engine request: request_id" in p)
+    assert "The other engines write the line" not in paragraph
+    assert "The voxtream engine writes no such line" in paragraph
