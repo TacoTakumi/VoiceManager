@@ -644,8 +644,12 @@ class DuplexSession:
                 yield ("audio_end", item)
             elif kind == "barge":
                 # The server sends no more pcm for a barged request; drop any that
-                # was already in flight, as for a cancel, until its audio_end.
-                client._cancelled_tts.add(rid)
+                # was already in flight, as for a cancel, until its audio_end. Mark
+                # only the request still playing: one whose audio_end was already
+                # read gets no second audio_end to clear the id, so it would stay
+                # in the set for the life of the client.
+                if rid is not None and rid == current:
+                    client._cancelled_tts.add(rid)
                 yield ("barge", item)
 
     async def turn_ends(self) -> AsyncIterator[dict]:

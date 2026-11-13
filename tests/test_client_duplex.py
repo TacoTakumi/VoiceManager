@@ -5,7 +5,8 @@ the frames the server would send are put on the client's reader-loop queues the 
 _reader_loop does, so the session is tested on exactly what it reads. Covers: audio
 goes out while transcripts come in; the TTS request frames (voice and chunking on the
 first frame only, flush, done, cancel); the audio event stream with a cancelled
-request's pcm dropped until its audio_end; the one-sided live methods refusing while a
+request's pcm dropped until its audio_end; a barge that marks only the request still
+playing; the one-sided live methods refusing while a
 session is open; and the errors() iterator.
 """
 import asyncio
@@ -189,6 +190,67 @@ def test_audio_events_drop_a_cancelled_requests_pcm_until_its_audio_end():
     ]
     assert client.last_tts_sample_rate == 24000
     assert second not in client._cancelled_tts  # cleared by its audio_end
+
+
+async def _collect_audio(client: VoiceManagerClient, session, frames: list) -> list:
+    """Feed the frames to the audio stream, end it, and return every event it yielded."""
+    events = []
+
+    async def collect():
+        async for event in session.audio():
+            events.append(event)
+    task = asyncio.create_task(collect())
+    for frame in frames:
+        await client._tts_queue.put(frame)
+    await client._tts_queue.put(None)  # the reader loop's end-of-connection sentinel
+    await asyncio.wait_for(task, 2.0)
+    return events
+
+
+def test_a_barge_after_the_requests_audio_end_leaves_the_cancelled_set_unchanged():
+    # The audio_end was already read, so no pcm of that request can follow and no
+    # second audio_end will come to clear the id: marking it would leak it forever.
+    client = _client()
+
+    async def run():
+        async with client.duplex() as session:
+            rid = session.tts_request().request_id
+            events = await _collect_audio(client, session, [
+                {"type": "audio_start", "request_id": rid, "sample_rate": 24000},
+                b"\x01\x01",
+                {"type": "audio_end", "request_id": rid, "reason": "complete"},
+                {"type": "barge", "request_id": rid},
+            ])
+            return rid, events
+    rid, events = asyncio.run(run())
+    assert [e[0] for e in events] == ["audio_start", "pcm", "audio_end", "barge"]
+    assert events[-1] == ("barge", {"type": "barge", "request_id": rid})
+    assert client._cancelled_tts == set()
+
+
+def test_a_barge_before_the_requests_audio_end_drops_its_pcm_until_the_audio_end():
+    client = _client()
+
+    async def run():
+        async with client.duplex() as session:
+            rid = session.tts_request().request_id
+            events = await _collect_audio(client, session, [
+                {"type": "audio_start", "request_id": rid, "sample_rate": 24000},
+                b"\x01\x01",
+                {"type": "barge", "request_id": rid},
+                b"\x01\x02",  # still in flight after the barge: dropped
+                b"\x01\x03",
+                {"type": "audio_end", "request_id": rid, "reason": "interrupted"},
+            ])
+            return rid, events
+    rid, events = asyncio.run(run())
+    assert events == [
+        ("audio_start", {"type": "audio_start", "request_id": rid, "sample_rate": 24000}),
+        ("pcm", b"\x01\x01", rid),
+        ("barge", {"type": "barge", "request_id": rid}),
+        ("audio_end", {"type": "audio_end", "request_id": rid, "reason": "interrupted"}),
+    ]
+    assert client._cancelled_tts == set()  # cleared by its audio_end
 
 
 def test_errors_yields_error_frames():
