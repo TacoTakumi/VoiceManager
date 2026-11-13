@@ -815,13 +815,20 @@ class VoiceManagerClient:
     # ------------------------------------------------------------------
 
     async def _connect(self) -> None:
-        """Open WebSocket, read handshake, start reader task."""
+        """Open WebSocket, read handshake, start reader task.
+
+        The new socket becomes ``self._ws`` only after a valid ``ready`` frame,
+        and the reader starts with it, so a socket in ``self._ws`` always has a
+        reader. When the handshake does not finish (the read is cancelled or
+        raises, or the first frame is not ``ready``) the socket is closed and
+        ``self._ws`` is left as it was.
+        """
         ws_scheme = "wss" if self.use_ssl else "ws"
         # The token travels only in the Authorization header, never in the URL.
         url = f"{ws_scheme}://{self.host}:{self.port}/ws/stream"
 
         try:
-            self._ws = await websockets.asyncio.client.connect(
+            ws = await websockets.asyncio.client.connect(
                 url, additional_headers=self._auth_headers()
             )
         except websockets.exceptions.InvalidStatus as exc:
@@ -832,15 +839,21 @@ class VoiceManagerClient:
             ) from exc
 
         # Read handshake: {"type": "ready", "session_id": "...", "audio_format": {...}}
-        raw = await self._ws.recv()
-        msg = json.loads(raw)
-        if msg.get("type") != "ready":
-            await self._ws.close()
-            raise ConnectionError(
-                f"Unexpected first frame type: {msg.get('type')!r}"
-            )
+        try:
+            raw = await ws.recv()
+            msg = json.loads(raw)
+            if msg.get("type") != "ready":
+                raise ConnectionError(
+                    f"Unexpected first frame type: {msg.get('type')!r}"
+                )
+            session_id = msg["session_id"]
+        except BaseException:
+            # A cancel too: the socket has no reader and must not stay open.
+            await self._close_unused(ws)
+            raise
 
-        self.session_id = msg["session_id"]
+        self._ws = ws
+        self.session_id = session_id
         self._audio_format = msg.get("audio_format", {})
         self.stt_engine = msg.get("stt_engine", "whisper")
         self.tts_engine = msg.get("tts_engine", "openvoice")
@@ -851,6 +864,18 @@ class VoiceManagerClient:
         self._reader = asyncio.create_task(self._reader_loop())
         self.connected = True
         self._logger.info("Connected session=%s", self.session_id)
+
+    async def _close_unused(self, ws) -> None:
+        """Close a socket whose handshake did not finish, best effort.
+
+        A close error is logged and dropped, so the caller's own exception is
+        the one that propagates.
+        """
+        try:
+            await ws.close()
+        except Exception:
+            self._logger.debug("Closing a socket whose handshake failed raised",
+                               exc_info=True)
 
     async def _disconnect(self) -> None:
         """Cancel reader task, close WebSocket, drain queues."""

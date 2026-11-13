@@ -9,6 +9,8 @@ the same closed socket cause one new connection, whose mic counts count only the
 frames sent on it, and no other socket or reader task stays open. A cancel with no
 socket raises TTSError and leaves the cancelled set of the new connection empty; a
 cancel with a socket marks the id before the cancel frame is sent.
+A connect or reconnect attempt whose handshake does not finish closes its socket
+and leaves the client with no socket.
 """
 import asyncio
 import json
@@ -342,3 +344,175 @@ def test_a_cancel_with_a_connection_marks_the_id_before_the_frame_goes_out(
     assert [json.loads(f) for f in ws.sent] == [
         {"type": "tts_cancel", "request_id": "rid-1"}]
     assert cancelled == {"rid-1"}
+
+
+# ---------------------------------------------------------------------------
+# The handshake: a connect that does not finish it leaves no socket behind
+# ---------------------------------------------------------------------------
+
+_READY = json.dumps({"type": "ready", "session_id": "s-new", "audio_format": {}})
+
+
+class _HandshakeWS(_FakeWS):
+    """A fake socket whose ``recv`` answers the handshake read.
+
+    ``answer`` is the ready read's result: a frame (str), an exception to raise,
+    or None to block until the read is cancelled. ``close_error`` makes
+    ``close`` raise after it marks the socket closed.
+    """
+
+    def __init__(self, answer=_READY, close_error: Exception | None = None) -> None:
+        super().__init__()
+        self.answer = answer
+        self.close_error = close_error
+        self.reading = asyncio.Event()
+
+    async def recv(self):
+        self.reading.set()
+        if self.answer is None:
+            await asyncio.Event().wait()
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+    async def close(self) -> None:
+        await super().close()
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _open_sockets(monkeypatch, *sockets: _HandshakeWS) -> list:
+    """Make each websockets connect call return the next fake socket."""
+    pending = list(sockets)
+    urls: list = []
+
+    async def fake_connect(url, **kwargs):
+        urls.append(url)
+        return pending.pop(0)
+
+    monkeypatch.setattr(websockets.asyncio.client, "connect", fake_connect)
+    return urls
+
+
+def test_a_cancelled_ready_read_closes_the_socket_and_leaves_none(monkeypatch):
+    ws = _HandshakeWS(answer=None)
+    _open_sockets(monkeypatch, ws)
+    client = VoiceManagerClient(token="vmp_test")
+
+    async def run():
+        task = asyncio.create_task(client._connect())
+        await ws.reading.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert ws.closed
+    assert client._ws is None
+    assert client._reader is None
+    assert client.connected is False
+    # With no socket, a call raises at once and does not hang.
+    with pytest.raises(STTError):
+        client._check_socket(STTError)
+
+
+@pytest.mark.parametrize("answer, error", [
+    (OSError("read failed"), OSError),
+    (websockets.exceptions.ConnectionClosed(None, None),
+     websockets.exceptions.ConnectionClosed),
+    (json.dumps({"type": "error", "message": "nope"}), ClientConnectionError),
+    ("not json", json.JSONDecodeError),
+    (json.dumps({"type": "ready"}), KeyError),
+], ids=["recv_raises", "recv_closed", "other_frame_type", "bad_json", "no_session_id"])
+def test_a_failed_handshake_closes_the_socket_and_leaves_none(monkeypatch, answer, error):
+    ws = _HandshakeWS(answer=answer)
+    _open_sockets(monkeypatch, ws)
+    client = VoiceManagerClient(token="vmp_test")
+
+    async def run():
+        with pytest.raises(error):
+            await client._connect()
+
+    asyncio.run(run())
+    assert ws.closed
+    assert client._ws is None
+    assert client._reader is None
+    assert client.connected is False
+    assert client.session_id is None
+
+
+@pytest.mark.parametrize("answer", [None, OSError("read failed")],
+                         ids=["cancelled", "recv_raises"])
+def test_a_close_error_does_not_hide_the_handshake_failure(monkeypatch, answer):
+    ws = _HandshakeWS(answer=answer, close_error=RuntimeError("close failed"))
+    _open_sockets(monkeypatch, ws)
+    client = VoiceManagerClient(token="vmp_test")
+
+    async def run():
+        task = asyncio.create_task(client._connect())
+        await ws.reading.wait()
+        if answer is None:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(OSError):
+                await task
+
+    asyncio.run(run())
+    assert ws.closed
+    assert client._ws is None
+
+
+def test_a_valid_handshake_sets_the_socket_and_starts_the_reader(monkeypatch):
+    ws = _HandshakeWS()
+    _open_sockets(monkeypatch, ws)
+    client = VoiceManagerClient(token="vmp_test")
+
+    async def run():
+        await client._connect()
+        state = (client._ws, client.session_id, client.connected,
+                 client._reader is not None and not client._reader.done())
+        await client._disconnect()
+        return state
+
+    assert asyncio.run(run()) == (ws, "s-new", True, True)
+    assert not ws.sent
+
+
+@pytest.mark.parametrize("answer", [
+    OSError("read failed"),
+    json.dumps({"type": "error", "message": "nope"}),
+], ids=["recv_raises", "other_frame_type"])
+def test_a_failed_reconnect_attempt_closes_its_socket_before_the_next(monkeypatch, answer):
+    first = _HandshakeWS(answer=answer)
+    second = _HandshakeWS()
+    urls = _open_sockets(monkeypatch, first, second)
+    client = VoiceManagerClient(token="vmp_test")
+    old = _FakeWS()
+    client._ws = old
+    client.connected = True
+    real_sleep = asyncio.sleep
+    closed_before_retry = []
+
+    async def no_wait(delay, *args, **kwargs):
+        if delay:
+            closed_before_retry.append(first.closed)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+
+    async def run():
+        await client._reconnect()
+        state = (client._ws, client.reconnected, client.connected,
+                 client._reader is not None and not client._reader.done())
+        await client._disconnect()
+        return state
+
+    current, reconnected, connected, reading = asyncio.run(run())
+    assert len(urls) == 2
+    assert closed_before_retry == [True]
+    assert first.closed
+    assert old.closed
+    assert current is second
+    assert (reconnected, connected, reading) == (True, True, True)
