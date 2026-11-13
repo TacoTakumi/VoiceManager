@@ -6,7 +6,9 @@ Covers: a send from another task while a reconnect runs (there is no socket) rai
 the documented error type of that call, sends nothing and starts no reconnect, and
 leaves the state of the new connection as it was; two tasks whose sends both find
 the same closed socket cause one new connection, whose mic counts count only the
-frames sent on it, and no other socket or reader task stays open.
+frames sent on it, and no other socket or reader task stays open. A cancel with no
+socket raises TTSError and leaves the cancelled set of the new connection empty; a
+cancel with a socket marks the id before the cancel frame is sent.
 """
 import asyncio
 import json
@@ -274,3 +276,69 @@ def test_a_send_that_finds_its_socket_already_replaced_does_not_reconnect(monkey
 
     assert asyncio.run(run()) == (160, 1)
     assert len(connect.gates) == 1
+
+
+# A cancel with no socket raises TTSError and marks nothing: a mark made then would
+# land in the cancelled set of the new connection and stay there for good.
+_CANCELS = {
+    "cancel_tts": lambda c, s: c.cancel_tts("rid-1"),
+    "tts_request_cancel": lambda c, s: s.tts_request(request_id="rid-1").cancel(),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CANCELS))
+def test_a_cancel_while_another_task_reconnects_marks_nothing(monkeypatch, name):
+    call = _CANCELS[name]
+    client, old, connect = _client(monkeypatch)
+    old.closed = True
+
+    async def run():
+        async with client.duplex() as session:
+            first = asyncio.create_task(session.send_audio(CHUNK))
+            await _wait_for_gate(connect, 1)       # the reconnect waits for its socket
+            with pytest.raises(TTSError):
+                await call(client, session)
+            await _settle()
+            connect.gates[0].set()
+            with pytest.raises(STTError):
+                await first
+            await _settle()
+            for gate in connect.gates:              # a second reconnect, if one started
+                gate.set()
+            await _settle()
+            cancelled = set(client._cancelled_tts)
+            new = client._ws
+        for reader in connect.readers:
+            reader.cancel()
+        return cancelled, new
+
+    cancelled, new = asyncio.run(run())
+    assert len(connect.gates) == 1                  # one connect, and no second one
+    assert new is connect.sockets[0]
+    assert new.sent == []                           # the refused cancel went nowhere
+    assert cancelled == set()                       # the new connection starts clean
+
+
+@pytest.mark.parametrize("name", sorted(_CANCELS))
+def test_a_cancel_with_a_connection_marks_the_id_before_the_frame_goes_out(
+        monkeypatch, name):
+    call = _CANCELS[name]
+    client, ws, _ = _client(monkeypatch)
+    marked_at_send = []
+
+    async def send(data):
+        marked_at_send.append("rid-1" in client._cancelled_tts)
+        ws.sent.append(data)
+
+    ws.send = send
+
+    async def run():
+        async with client.duplex() as session:
+            await call(client, session)
+        return set(client._cancelled_tts)
+
+    cancelled = asyncio.run(run())
+    assert marked_at_send == [True]
+    assert [json.loads(f) for f in ws.sent] == [
+        {"type": "tts_cancel", "request_id": "rid-1"}]
+    assert cancelled == {"rid-1"}

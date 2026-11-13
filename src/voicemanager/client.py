@@ -1696,8 +1696,13 @@ class VoiceManagerClient:
                 one supplied to stream_tts_live(), or read from
                 client.last_tts_request_id after starting any TTS request.
         """
-        # Mark first, then send: once marked, the live-yield path drops binary
-        # frames for this id even if the cancel frame and the next PCM chunk race.
+        # Check, mark, then send. With no socket (a reconnect runs or failed) this
+        # raises TTSError and marks nothing, so no id stays in the cancelled set of
+        # the new connection. The check does not await, so the mark still lands
+        # before the cancel frame goes out: once marked, the live-yield path drops
+        # binary frames for this id even if the cancel frame and the next PCM
+        # chunk race.
+        self._check_socket(TTSError)
         self._cancelled_tts.add(request_id)
         msg = json.dumps({"type": "tts_cancel", "request_id": request_id})
         await self._send_or_raise(msg, TTSError)
