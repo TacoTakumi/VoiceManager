@@ -268,8 +268,10 @@ class Settings(BaseSettings):
     audiocpp_tts_seam_silence_ms: int = Field(default=400)   # VM_AUDIOCPP_TTS_SEAM_SILENCE_MS
     # Operator request-option overrides for the TTS sidecar: the same
     # comma-separated KEY=VALUE shape as VM_AUDIOCPP_REQUEST_OPTIONS, forwarded
-    # opaquely and merged sidecar-side over the registry pins (text_chunk_size=200,
-    # max_tokens=500, text_chunk_mode=default). Empty = the pins stand.
+    # opaquely and merged sidecar-side over the registry pins of the model (for
+    # Breeze text_chunk_size=200, guidance_scale=1.0, stream_frames_per_event=4;
+    # for dots text_chunk_size=200, max_tokens=500, text_chunk_mode=default; the
+    # others are in the client guide). Empty = the pins stand.
     # seed=2 keeps Breeze output the same from run to run.
     audiocpp_tts_request_options: str = Field(default="seed=2")  # VM_AUDIOCPP_TTS_REQUEST_OPTIONS
     # tts_stream coalescing window: after the FIRST batch has dispatched, keep

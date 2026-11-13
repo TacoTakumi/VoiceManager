@@ -306,12 +306,15 @@ way.
 A synthesis request, valid only on a connection whose HELLO selected a TTS model_task.
 Carries the text to speak plus the voice reference material. `ref_text` is **per-model**:
 required and non-empty for `dots-tts-streaming` (dots_tts conditions on the
-reference WAV *and* its exact transcript), optional for `voxcpm2-tts-streaming`
+reference WAV *and* its exact transcript), for `breeze-tts-streaming` and for
+`qwen3-tts-streaming` (both clone from the reference clip plus its transcript),
+optional for `voxcpm2-tts-streaming`
 (voxcpm2 ignores the transcript unless continuation audio is also supplied). The
 sidecar enforces this via the descriptor's `ref_text_required` flag, never a family
-string comparison: a dots TEXT frame missing an empty `ref_text` is rejected with
-ERROR `bad_frame` before dispatch; a voxcpm2 TEXT frame may omit `ref_text` and the
-reference_transcript option key is then simply not set on the request.
+string comparison: a dots, breeze or qwen3 TEXT frame with a missing or empty `ref_text` is
+rejected with ERROR `bad_frame` before dispatch; a voxcpm2 TEXT frame may omit
+`ref_text` and the reference_transcript option key is then simply not set on the
+request.
 
 ```json
 {
@@ -324,12 +327,13 @@ reference_transcript option key is then simply not set on the request.
 - `text` (string, required): the text to synthesize.
 - `voice_wav` (string, required): absolute path to the reference-speaker WAV, readable
   by the sidecar process (same machine - this is an AF_UNIX-local protocol).
-- `ref_text` (string, required for dots, optional for voxcpm2): the exact transcript of
-  `voice_wav`. A voxcpm2 request may omit it (or send it empty).
+- `ref_text` (string, required for dots, breeze and qwen3, optional for voxcpm2): the
+  exact transcript of `voice_wav`. A voxcpm2 request may omit it (or send it empty).
 
 One TEXT frame is one synthesis request; the reply is a stream of TTS_AUDIO frames
 closed by exactly one TTS_DONE. The registry's request-option defaults (for dots:
-`text_chunk_size=200`, `max_tokens=500`; for voxcpm2: `retry_badcase=false`, mandatory
+`text_chunk_size=200`, `max_tokens=500`; for breeze: `text_chunk_size=200`,
+`guidance_scale=1.0`, `stream_frames_per_event=4`; for qwen3: none; for voxcpm2: `retry_badcase=false`, mandatory
 for streaming - generate_streaming throws without it - and `voxcpm2.chunk_strategy=stateless`,
 which keeps each long-form chunk synthesised from the reference prompt alone as release-0.6
 did, where v0.7.3 defaults to carrying the previous chunk forward) apply to every request; the
