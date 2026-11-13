@@ -483,7 +483,8 @@ class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
         # flush: nothing to do, the generation already has every word
 
     async def _run_generation(self, websocket, request_id: str, voice: str | None) -> None:
-        from voicemanager.protocol import AudioEndMessage, AudioStartMessage, ErrorMessage
+        from voicemanager.protocol import (
+            AudioEndMessage, AudioStartMessage, RequestErrorMessage)
 
         engine = self._tts_pipeline._engine
         queue = self._sentence_queue
@@ -508,8 +509,11 @@ class VoxtreamTTSStreamPipeline(TTSStreamPipeline):
                 generation = engine.open_generation(voice)  # before any connection
             except UnknownVoiceError as exc:
                 logger.warning("tts_stream request_id=%s: %s", request_id, exc)
-                await websocket.send_text(ErrorMessage(
-                    error_type="unknown_voice", message=str(exc)).model_dump_json())
+                # The frame names the request it ends, so a client ties it to
+                # this request's audio_end by id and not by wire order.
+                await websocket.send_text(RequestErrorMessage(
+                    error_type="unknown_voice", message=str(exc),
+                    request_id=request_id).model_dump_json())
                 return  # the finally block ends the request on the wire
             await generation.start()
             pump = asyncio.create_task(pump_text())

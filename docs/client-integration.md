@@ -630,10 +630,13 @@ cannot load its model because the card has no free memory. The connection
 stays open, and the next request tries the load again, so it can succeed.
 The `message` names the sidecar error code, for example `load_failed`. It does
 not contain the sidecar's detail text. A failure with no code gets a fixed
-message.
+message. The frame carries the `request_id` of the request it ends, so a client
+can tie it to that request's `audio_end` by id and not by wire order. The
+`request_id` field is new in 0.10.0. An older server sends the frame without
+it. A client should ignore fields it does not know.
 
 ```json
-{ "type": "error", "error_type": "tts_unavailable", "message": "The TTS engine is unavailable (load_failed). A later request may succeed." }
+{ "type": "error", "error_type": "tts_unavailable", "message": "The TTS engine is unavailable (load_failed). A later request may succeed.", "request_id": "r1" }
 ```
 
 A `voice` that is not a loaded preset is the client's error, not the engine's.
@@ -641,10 +644,12 @@ It does not get `tts_unavailable`. It gets an `error` frame with
 `error_type: "unknown_voice"`, as on the VoXtream engine. The `message` names
 the valid presets. Then `audio_end` with `reason: "error"` follows for the same
 `request_id`. Nothing goes to the sidecar, and the connection stays open. Do not
-send the same voice again: pick a name from `available_voices`.
+send the same voice again: pick a name from `available_voices`. Like
+`tts_unavailable`, the frame carries the `request_id` of the request it ends
+(new in 0.10.0).
 
 ```json
-{ "type": "error", "error_type": "unknown_voice", "message": "unknown voice 'no-such-voice'; valid presets: designed_female_s101, designed_gm_02, designed_male_s202, lcars_demo" }
+{ "type": "error", "error_type": "unknown_voice", "message": "unknown voice 'no-such-voice'; valid presets: designed_female_s101, designed_gm_02, designed_male_s202, lcars_demo", "request_id": "r1" }
 ```
 
 ### The VoXtream TTS engine: one generation per request
@@ -670,8 +675,10 @@ What changes for a client:
 - The voice is a preset from `VM_VOXTREAM_VOICES` (the reference WAV of each
   entry; the transcript is unused), chosen as in [Voice selection](#voice-selection).
   An unknown `voice` ends the request with an `error` frame (`error_type`
-  `"unknown_voice"`, `message` naming the presets), then `audio_start` and one
-  `audio_end` with `reason: "error"`; the connection stays open.
+  `"unknown_voice"`, `message` naming the presets, `request_id` naming the
+  request), then `audio_start` and one `audio_end` with `reason: "error"`; the
+  connection stays open. Here the `error` frame comes before `audio_start`, so
+  tie it to the request by its `request_id` (new in 0.10.0), not by wire order.
 - A generation that fails before the engine finishes (the sidecar is
   unreachable, refuses the request, or drops the connection mid-reply) ends the
   request with `audio_start` (if not yet sent) and one `audio_end` with
@@ -699,9 +706,11 @@ For engines with preset voices (VibeVoice, audiocpp and voxtream), the voice of 
    a warning and speaks with the configured default (`VM_VIBEVOICE_VOICE`)
    instead. Under voxtream an unknown name on `tts_stream` ends that request
    and nothing else: the server sends an `error` frame with `error_type`
-   `"unknown_voice"` whose `message` lists the valid presets, then `audio_start`
-   and one `audio_end` with `reason: "error"`, and the connection stays open
-   for the next request. Pick names from `available_voices` to avoid all three.
+   `"unknown_voice"` whose `message` lists the valid presets and whose
+   `request_id` names the request, then `audio_start` and one `audio_end` with
+   `reason: "error"`, and the connection stays open for the next request.
+   The audiocpp `unknown_voice` frame carries the `request_id` too. Both are
+   new in 0.10.0. Pick names from `available_voices` to avoid all three.
 2. **The token's voice**, when the token that opened the connection has one and
    the running engine offers it. Set it with
    `voicemanager user token voice USER NAME VOICE` (clear it with `--clear`),
@@ -1488,6 +1497,15 @@ such as the inactivity `timeout_warning`. See [Close codes](#close-codes).
 | `type` | string | `"error"` | Frame discriminator. |
 | `error_type` | string | *(required)* | Machine-readable category (e.g. `"timeout_warning"`). |
 | `message` | string | *(required)* | Human-readable detail. |
+| `request_id` | string | *(absent)* | Only on the two TTS request errors, `tts_unavailable` and `unknown_voice`: the `request_id` of the request the frame ends. Every other `error` frame has no `request_id` key. New in 0.10.0; an older server never sends it. |
+
+A frame that ends one TTS request is a `RequestErrorMessage`: an
+`ErrorMessage` with a required `request_id`. A client should ignore fields it
+does not know, so a client written before 0.10.0 reads it as before.
+
+```json
+{ "type": "error", "error_type": "unknown_voice", "message": "unknown voice 'nope'; valid presets: designed_female_s101", "request_id": "r1" }
+```
 
 ### Client to server frames
 

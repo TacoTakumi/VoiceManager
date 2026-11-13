@@ -1080,7 +1080,7 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
 
     async def _synthesis_loop(self, websocket, request_id: str) -> None:
         from voicemanager.protocol import (
-            AudioEndMessage, AudioStartMessage, ErrorMessage, TTS_UNAVAILABLE,
+            AudioEndMessage, AudioStartMessage, RequestErrorMessage, TTS_UNAVAILABLE,
         )
 
         engine = self._tts_pipeline._engine
@@ -1374,12 +1374,17 @@ class AudioCppTTSStreamPipeline(TTSStreamPipeline):
             # An unknown voice is the client's error, not the engine's: it gets
             # unknown_voice with the message naming the presets, as the VoXtream
             # engine sends it, so the client does not retry the same voice.
+            # Both frames name the request they end, so a client ties the frame
+            # to this request's audio_end by id and not by wire order.
             if failure is not None and not isinstance(failure, SidecarFault):
                 if isinstance(failure, UnknownVoiceError):
-                    error = ErrorMessage(error_type="unknown_voice", message=str(failure))
+                    error = RequestErrorMessage(error_type="unknown_voice",
+                                                message=str(failure),
+                                                request_id=request_id)
                 else:
-                    error = ErrorMessage(error_type=TTS_UNAVAILABLE,
-                                         message=tts_unavailable_message(failure))
+                    error = RequestErrorMessage(error_type=TTS_UNAVAILABLE,
+                                                message=tts_unavailable_message(failure),
+                                                request_id=request_id)
                 try:
                     await websocket.send_text(error.model_dump_json())
                 except Exception:

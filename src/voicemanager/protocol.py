@@ -79,6 +79,17 @@ class ErrorMessage(BaseModel):
     message: str
 
 
+class RequestErrorMessage(ErrorMessage):
+    """An error frame that ends one TTS request: tts_unavailable or unknown_voice.
+
+    It is an ErrorMessage plus the request_id of the request it ends, so a client
+    ties the frame to that request's audio_end by id and not by wire order. Only
+    the TTS stream pipelines send it. Every other error frame stays a plain
+    ErrorMessage, with no request_id key on the wire.
+    """
+    request_id: str
+
+
 class TranscriptionMessage(BaseModel):
     """STT result sent back to client."""
     type: Literal["transcription"] = "transcription"

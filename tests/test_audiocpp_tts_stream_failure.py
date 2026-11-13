@@ -4,7 +4,8 @@ When the TTS sidecar cannot load (for example a CUDA buffer that does not fit on
 card another session fills), every request on the session fails in the engine. The
 client must not see audio_start, no audio and a normal end: it gets an error frame
 of error_type tts_unavailable, then audio_end with reason "error", and the
-connection stays open, because a later load can succeed.
+connection stays open, because a later load can succeed. The error frame carries
+the request_id of the request it ends.
 
 The error message names the sidecar error code (load_failed) and never carries the
 sidecar's free-form detail text (an allocator line, a path). A raise that has no
@@ -127,6 +128,9 @@ def _assert_failed_request(frames: list, request_id: str) -> dict:
     assert frames[0]["request_id"] == request_id
     error = frames[1]
     assert error["error_type"] == protocol.TTS_UNAVAILABLE == "tts_unavailable"
+    # The error frame names the request it ends, so a client ties it to that
+    # request's audio_end by id and not by wire order.
+    assert error["request_id"] == request_id, error
     assert ALLOCATOR_DETAIL not in error["message"]
     assert "alloc_tensor_range" not in error["message"]
     assert frames[2]["request_id"] == request_id
@@ -142,6 +146,7 @@ def _assert_unknown_voice_request(frames: list, request_id: str) -> dict:
     assert frames[0]["request_id"] == request_id
     error = frames[1]
     assert error["error_type"] == "unknown_voice", error
+    assert error["request_id"] == request_id, error
     assert not any(isinstance(f, dict) and f.get("error_type") == "tts_unavailable"
                    for f in frames)
     # The message is the one the VoXtream engine gives: it names the presets.
