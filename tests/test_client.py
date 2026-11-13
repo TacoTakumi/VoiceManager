@@ -601,7 +601,7 @@ class TestSTTLive:
         )
 
         # Mock _reconnect so it doesn't actually try to reconnect
-        async def _noop_reconnect():
+        async def _noop_reconnect(failed=None):
             pass
         client._reconnect = _noop_reconnect
 
@@ -872,7 +872,7 @@ class TestCancelTTS:
             side_effect=websockets.exceptions.ConnectionClosed(None, None))
         reconnects = []
 
-        async def _reconnect():
+        async def _reconnect(failed=None):
             reconnects.append(True)
         client._reconnect = _reconnect
 
@@ -931,7 +931,7 @@ class TestFlushTTS:
             side_effect=websockets.exceptions.ConnectionClosed(None, None))
         reconnects = []
 
-        async def _reconnect():
+        async def _reconnect(failed=None):
             reconnects.append(True)
         client._reconnect = _reconnect
 

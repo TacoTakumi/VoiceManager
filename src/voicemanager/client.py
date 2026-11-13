@@ -45,6 +45,8 @@ _TURN_ENGINE_LOST = "turn_engine_lost"
 # a wake_word opt-in. The refusal has no error_type of its own, so the message tells
 # it from the other invalid_request frames.
 _WAKE_REFUSAL = "wake_word refused"
+# The default of VoiceManagerClient._reconnect: reconnect whatever socket is current.
+_CURRENT_SOCKET = object()
 
 
 def _wav_payload_offset(data: bytes) -> int | None:
@@ -320,11 +322,13 @@ class DuplexSession:
             dormant = True
         else:
             dormant = False
+        # With no socket (another task reconnects, or a reconnect failed) the frame
+        # is not counted and not sent; the new connection's counts stay as they are.
+        ws = client._check_socket(STTError)
         # The frame is counted before the send is awaited. A send can wait for room
         # in the write buffer with the frame already on the wire, and the reader
         # (a wake frame) or another task (an opt-in, a listen_stop) that runs in
         # that wait must find the frame in the count, as the server will.
-        ws = client._ws
         if dormant:
             client._dormant_bytes += len(pcm)
             counted = len(pcm)
@@ -339,10 +343,10 @@ class DuplexSession:
             # the new connection start at 0.
             raise
         except Exception:
-            # Nothing was sent: there is no socket while another task reconnects,
-            # or the socket refused the data. The frame comes out of the count
-            # again, unless a reconnect started the counts over in the meantime.
-            # A cancelled send is not caught here: its frame is on the wire.
+            # Nothing was sent: the socket refused the data. The frame comes out
+            # of the count again, unless a reconnect started the counts over in
+            # the meantime. A cancelled send is not caught here: its frame is on
+            # the wire.
             if client._ws is ws:
                 if dormant:
                     client._dormant_bytes -= counted
@@ -372,12 +376,14 @@ class DuplexSession:
         new connection listens.
 
         Raises:
-            VoiceManagerError: The session is closed (nothing is sent), or the
+            VoiceManagerError: The session is closed or there is no connection
+                (nothing is sent and the session is as it was), or the
                 connection was lost while sending the frame.
         """
         client = self._client
         if self.closed:
             raise VoiceManagerError("the duplex session is closed")
+        client._check_socket(VoiceManagerError)
         if client._wake_phrases is not None:
             if client._listen_stopped:
                 # Sent while dormant. If the server hears a phrase before this frame
@@ -425,12 +431,14 @@ class DuplexSession:
         session can then count as listening while the server is dormant.
 
         Raises:
-            VoiceManagerError: The session is closed (nothing is sent), or the
+            VoiceManagerError: The session is closed or there is no connection
+                (nothing is sent and the session is as it was), or the
                 connection was lost while sending the frame.
         """
         client = self._client
         if self.closed:
             raise VoiceManagerError("the duplex session is closed")
+        client._check_socket(VoiceManagerError)
         client._listen_stopped = False
         await client._send_or_raise(json.dumps({"type": "listen_start"}), VoiceManagerError)
 
@@ -472,11 +480,13 @@ class DuplexSession:
             WakeWordError: The server refused the opt-in (``error_type`` holds its
                 error_type), or no answer came within ``timeout`` or before the
                 connection closed (``error_type`` is None). The session is then as
-                it was before the call.
+                it was before the call. Also raised, with nothing sent, when there
+                is no connection, and when the connection was lost while sending.
         """
         client = self._client
         if self.closed:
             raise VoiceManagerError("the duplex session is closed")
+        client._check_socket(WakeWordError)
         frame: dict = {"type": "wake_word"}
         if phrases is not None:
             frame["phrases"] = list(phrases)
@@ -534,11 +544,14 @@ class DuplexSession:
                 opt-in was already sent on this connection; nothing is sent.
             TurnEngineError: The server refused the opt-in (``error_type`` holds its
                 error_type), or no answer came within ``timeout`` or before the
-                connection closed (``error_type`` is None).
+                connection closed (``error_type`` is None). Also raised, with
+                nothing sent, when there is no connection, and when the
+                connection was lost while sending.
         """
         client = self._client
         if self.closed:
             raise VoiceManagerError("the duplex session is closed")
+        client._check_socket(TurnEngineError)
         if client._mic_frames:
             raise VoiceManagerError(
                 "enable_turn_engine must come before the first audio frame")
@@ -692,6 +705,10 @@ class VoiceManagerClient:
 
         self._ws = None
         self._reader: asyncio.Task | None = None
+        # Set while a reconnect runs; its result is True when a new connection came
+        # up. Every task whose send finds the connection lost waits for this one
+        # reconnect instead of starting its own.
+        self._reconnecting: asyncio.Future | None = None
 
         # Per-operation dispatch queues (single reader, multiple waiters)
         self._stt_queue: asyncio.Queue = asyncio.Queue()
@@ -857,13 +874,42 @@ class VoiceManagerClient:
                     break
             await q.put(None)
 
-    async def _reconnect(self) -> None:
-        """Reconnect with exponential backoff.
+    async def _reconnect(self, failed=_CURRENT_SOCKET) -> None:
+        """Reconnect with exponential backoff; one reconnect serves every task.
 
-        Raises ConnectionError after max_retries attempts.
+        ``failed`` is the socket the caller saw closed. When it was already
+        replaced by a new connection this does nothing. When another task is
+        reconnecting already, this waits for that reconnect and opens no
+        connection of its own. Without ``failed`` the current socket is replaced.
+
+        Raises ConnectionError after max_retries attempts (also in a task that
+        waited for the reconnect of another task).
         Sets self.reconnected = True on success - consumer must re-upload
         their voice profile.
         """
+        running = self._reconnecting
+        if running is not None:
+            # Shielded: a waiter that is cancelled must not cancel the reconnect.
+            if not await asyncio.shield(running):
+                raise ConnectionError("Failed to reconnect: the connection is gone")
+            return
+        if failed is not _CURRENT_SOCKET and failed is not self._ws:
+            return
+        # Set before the first await, so a send from another task from now on finds
+        # no socket and no other task starts a second reconnect.
+        running = asyncio.get_running_loop().create_future()
+        self._reconnecting = running
+        ok = False
+        try:
+            await self._reconnect_now()
+            ok = True
+        finally:
+            self._reconnecting = None
+            if not running.done():
+                running.set_result(ok)
+
+    async def _reconnect_now(self) -> None:
+        """Close the connection, start the state of a new one, and connect."""
         await self._disconnect()
 
         # Reset queues for the new connection
@@ -1135,13 +1181,29 @@ class VoiceManagerClient:
             raise VoiceManagerError(
                 f"{method} cannot run while a duplex session is open; use the session")
 
-    async def _send_or_raise(self, data, error: type) -> None:
-        """Send one frame; a closed connection reconnects and raises ``error``."""
+    def _check_socket(self, error: type):
+        """Return the socket to send on, or raise ``error`` when there is none.
+
+        There is no socket while a reconnect runs (in this task or another one),
+        and after a reconnect that failed. A call that gets the error sends nothing
+        and starts no reconnect.
+        """
+        if self._ws is None or self._reconnecting is not None:
+            raise error("Not connected: the connection was lost and no new one is up")
+        return self._ws
+
+    async def _send_or_raise(self, data, error: type,
+                             message: str = "Connection lost during duplex session") -> None:
+        """Send one frame; a closed connection reconnects and raises ``error``.
+
+        With no socket (see ``_check_socket``) it raises ``error`` at once.
+        """
+        ws = self._check_socket(error)
         try:
-            await self._ws.send(data)
+            await ws.send(data)
         except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise error("Connection lost during duplex session")
+            await self._reconnect(ws)
+            raise error(message)
 
     def _count_mic(self, data: bytes) -> None:
         """Count one sent binary mic frame the way the server counts it.
@@ -1195,19 +1257,15 @@ class VoiceManagerClient:
         """
         self._require_no_duplex("stream_stt")
         results: list[dict] = []
-        try:
-            async for chunk in audio_chunks:
-                await self._ws.send(chunk)
-                self._count_mic(chunk)
-                # Drain any transcriptions that arrived while sending
-                while not self._stt_queue.empty():
-                    item = self._stt_queue.get_nowait()
-                    if item is None:
-                        return results
-                    results.append(self._stamp_turn_id(item))
-        except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise STTError("Connection lost during STT streaming")
+        async for chunk in audio_chunks:
+            await self._send_or_raise(chunk, STTError, "Connection lost during STT streaming")
+            self._count_mic(chunk)
+            # Drain any transcriptions that arrived while sending
+            while not self._stt_queue.empty():
+                item = self._stt_queue.get_nowait()
+                if item is None:
+                    return results
+                results.append(self._stamp_turn_id(item))
 
         # Wait for remaining transcriptions (VAD may still be processing)
         try:
@@ -1261,13 +1319,12 @@ class VoiceManagerClient:
                 # Send next audio chunk
                 try:
                     chunk = await send_iter.__anext__()
-                    await self._ws.send(chunk)
-                    self._count_mic(chunk)
                 except StopAsyncIteration:
                     send_done = True
-                except websockets.exceptions.ConnectionClosed:
-                    await self._reconnect()
-                    raise STTError("Connection lost during STT streaming")
+                else:
+                    await self._send_or_raise(
+                        chunk, STTError, "Connection lost during STT streaming")
+                    self._count_mic(chunk)
 
                 # Drain any transcriptions that arrived
                 while not self._stt_queue.empty():
@@ -1317,11 +1374,8 @@ class VoiceManagerClient:
         Raises:
             STTError: If the connection is lost or the ack does not arrive in time.
         """
-        try:
-            await self._ws.send(json.dumps({"type": "turn_start"}))
-        except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise STTError("Connection lost sending turn_start")
+        await self._send_or_raise(
+            json.dumps({"type": "turn_start"}), STTError, "Connection lost sending turn_start")
 
         try:
             async with asyncio.timeout(timeout):
@@ -1360,7 +1414,7 @@ class VoiceManagerClient:
         if voice is not None:
             payload["voice"] = voice
         msg = json.dumps(payload)
-        await self._ws.send(msg)
+        await self._send_or_raise(msg, TTSError, "Connection lost during TTS synthesis")
 
         audio_buf = bytearray()
         sample_rate = 22050  # fallback; overwritten by audio_start
@@ -1434,37 +1488,29 @@ class VoiceManagerClient:
 
         # Send all text chunks as tts_stream messages (done=True on final)
         first_chunk = True
-        try:
-            async for chunk in text_chunks:
-                payload = {
-                    "type": "tts_stream",
-                    "request_id": request_id,
-                    "text": chunk,
-                    "done": False,
-                }
-                if first_chunk:
-                    if voice is not None:
-                        payload["voice"] = voice
-                    if chunking is not None:
-                        payload["chunking"] = chunking
-                    first_chunk = False
-                msg = json.dumps(payload)
-                await self._ws.send(msg)
-        except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise TTSError("Connection lost during streaming TTS")
-
-        # Send done=True to flush server buffer
-        try:
-            await self._ws.send(json.dumps({
+        async for chunk in text_chunks:
+            payload = {
                 "type": "tts_stream",
                 "request_id": request_id,
-                "text": "",
-                "done": True,
-            }))
-        except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise TTSError("Connection lost sending TTS stream done signal")
+                "text": chunk,
+                "done": False,
+            }
+            if first_chunk:
+                if voice is not None:
+                    payload["voice"] = voice
+                if chunking is not None:
+                    payload["chunking"] = chunking
+                first_chunk = False
+            msg = json.dumps(payload)
+            await self._send_or_raise(msg, TTSError, "Connection lost during streaming TTS")
+
+        # Send done=True to flush server buffer
+        await self._send_or_raise(json.dumps({
+            "type": "tts_stream",
+            "request_id": request_id,
+            "text": "",
+            "done": True,
+        }), TTSError, "Connection lost sending TTS stream done signal")
 
         # Collect audio until audio_end (same pattern as synthesize_tts: filter by request_id)
         try:
@@ -1574,19 +1620,17 @@ class VoiceManagerClient:
                             payload["chunking"] = chunking
                         first_chunk = False
                     msg = json.dumps(payload)
-                    await self._ws.send(msg)
+                    await self._send_or_raise(
+                        msg, TTSError, "Connection lost during streaming TTS")
                 except StopAsyncIteration:
                     # All text sent - send done=True
-                    await self._ws.send(json.dumps({
+                    await self._send_or_raise(json.dumps({
                         "type": "tts_stream",
                         "request_id": request_id,
                         "text": "",
                         "done": True,
-                    }))
+                    }), TTSError, "Connection lost during streaming TTS")
                     send_done = True
-                except websockets.exceptions.ConnectionClosed:
-                    await self._reconnect()
-                    raise TTSError("Connection lost during streaming TTS")
 
                 # Drain any audio that arrived while sending
                 while not self._tts_queue.empty():

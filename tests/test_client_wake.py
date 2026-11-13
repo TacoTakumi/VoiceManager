@@ -509,7 +509,7 @@ def test_a_mic_frame_that_was_not_sent_for_want_of_a_socket_is_not_counted():
         async with client.duplex() as session:
             client._ws = None
             for _ in range(3):
-                with pytest.raises(AttributeError):
+                with pytest.raises(STTError):
                     await session.send_audio(CHUNK)
             counts = (session.mic_sample, client._mic_frames)
             client._ws = ws                       # the reconnect is done
@@ -530,7 +530,7 @@ def test_a_dormant_frame_that_was_not_sent_for_want_of_a_socket_is_not_counted()
             await session.enable_wake_word()
             await session.send_audio(CHUNK)
             client._ws = None
-            with pytest.raises(AttributeError):
+            with pytest.raises(STTError):
                 await session.send_audio(CHUNK)
             client._ws = ws
             ws.end()
