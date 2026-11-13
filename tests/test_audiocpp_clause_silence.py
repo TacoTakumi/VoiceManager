@@ -95,12 +95,14 @@ class _Engine:
 class _WS:
     def __init__(self) -> None:
         self.audio = bytearray()
+        self.frames: list[bytes] = []  # each binary frame as sent
 
     async def send_text(self, data: str) -> None:
         json.loads(data)
 
     async def send_bytes(self, data: bytes) -> None:
         self.audio += data
+        self.frames.append(bytes(data))
 
 
 def _pipe(engine, **kwargs) -> AudioCppTTSStreamPipeline:
@@ -108,10 +110,11 @@ def _pipe(engine, **kwargs) -> AudioCppTTSStreamPipeline:
     return AudioCppTTSStreamPipeline(TTSPipeline(engine=engine, executor=None), **options)
 
 
-def _speak(signal: np.ndarray, chunking: str = "clause", chunk: int = CHUNK, **kwargs):
+def _speak(signal: np.ndarray, chunking: str = "clause", chunk: int = CHUNK,
+           ws: _WS | None = None, **kwargs):
     """One request with one engine request; returns (bytes sent, samples reported)."""
     engine = _Engine([signal], chunk=chunk)
-    ws = _WS()
+    ws = ws or _WS()
     reported: list[int] = []
 
     async def run() -> None:
@@ -158,6 +161,26 @@ def test_the_start_buffer_holds_audio_after_the_limiter():
     sent, reported = _speak(LONG_PAUSE, clause_silence_ms=400, start_buffer_ms=250)
     assert abs(len(sent) // 2 - int(SR * 1.4)) <= WINDOW
     assert reported == len(sent) // 2
+
+
+def test_the_start_buffer_counts_the_audio_that_the_limiter_let_through():
+    """The engine starts with 0.6 s of silence and the cap is 100 ms. The start
+    buffer comes after the limiter, so the first frame has 250 ms of the audio
+    that goes to the client: the 100 ms of silence and the start of the tone.
+    A buffer in front of the limiter would fill with 250 ms of silence, and the
+    client would get a first frame of 100 ms."""
+    signal = np.concatenate([silence(0.6), tone(0.5)])
+    expected = pcm(_limited(signal, 100))
+    assert len(expected) // 2 == int(SR * 0.6)
+    ws = _WS()
+    sent, reported = _speak(signal, ws=ws, clause_silence_ms=100, start_buffer_ms=250)
+    assert sent == expected
+    assert reported == len(expected) // 2
+    first = ws.frames[0]
+    assert len(first) // 2 >= SR * 250 // 1000
+    assert len(first) // 2 < SR * 250 // 1000 + CHUNK   # and not more than one chunk over
+    assert first == expected[:len(first)]
+    assert not any(first[:2 * SR // 10]) and any(first[2 * SR // 10:])
 
 
 def test_a_run_across_two_engine_requests_is_one_run():
@@ -224,11 +247,24 @@ def test_the_rest_of_an_unaligned_request_is_sent_before_it_ends(chunk, start_bu
 
 def test_the_rest_goes_on_into_the_next_engine_request_and_out_at_the_end():
     """Two engine requests, neither a whole number of windows: the rest of the
-    first joins the second, and the rest of the second goes out at the end."""
+    first joins the second, and the rest of the second goes out at the end.
+
+    The second request has 140 quiet samples (not zero) between its pause and
+    its tone. With the 100 samples that wait from the first request they fill
+    one window, a silent one past the cap, so the client gets none of them. A
+    limiter that sent its rest at the end of the first engine request would cut
+    the windows of the second 100 samples earlier: the quiet samples then share
+    a window with the tone and are sent, and so are the 100."""
+    quiet = np.full(140, 0.001, dtype=np.float32)        # -60 dBFS
+    assert any(pcm(quiet))
     first = np.concatenate([tone(0.5), silence(0.3), np.zeros(100, dtype=np.float32)])
-    second = np.concatenate([silence(0.3), tone(0.5), _ramp(57)])
+    second = np.concatenate([silence(0.3), quiet, tone(0.5), _ramp(57)])
     assert len(first) % WINDOW and len(second) % WINDOW
     expected = _limited(np.concatenate([first, second]), 400)
+    # 0.4 s of silence between the tones, and no quiet sample.
+    assert len(expected) == 2 * len(tone(0.5)) + int(SR * 0.4) + 57
+    head = len(pcm(tone(0.5)))
+    assert not any(pcm(expected)[head:head + 2 * int(SR * 0.4)])
     ws = _WS()
     reported: list[int] = []
 
