@@ -28,10 +28,15 @@ least 4 such frames while the output still plays. Printed per call: each mid-rep
 span with its highest debounced yield (the lower of two frames in a row) in the
 span and the 0.4 s after it, each barge with whether user speech was marked in the
 0.6 s before it, the calibrated gate, when the session enrolled, the per-hop time and the GPU memory of
-this process. The checks: on calls with mid-reply spans every span reaches 0.6 or
-more (the sidecar's barge threshold), and no barge falls outside user speech.
+this process. The checks: on calls with mid-reply spans every span reaches the
+sidecar's barge threshold, and no barge falls outside user speech.
+
+The pre-filter floor, the voice gate, the Tyger model and revision and the barge
+threshold are the shipped defaults (the Settings fields and TurnRuleSettings), read
+from the source, so the check runs at the values the sidecar runs at.
 """
 import argparse
+import ast
 import importlib.util
 import json
 import os
@@ -48,7 +53,35 @@ REPO = Path(__file__).resolve().parents[1]
 TYGER_DIR = REPO / "src" / "voicemanager" / "pipeline" / "tyger"
 SR, HOP, FRAME = 16000, 5120, 1280
 BRIDGE_FRAMES = 10                  # 0.8 s of 80 ms frames
-FLOOR_DB, GATE_DB = -52.0, -50.0
+
+
+def shipped_default(path, class_name, field):
+    """The default of one field of a class, read from the shipped source.
+
+    The sidecar environment this script runs in has neither pydantic-settings nor
+    the voicemanager package, so the values are read from the source rather than
+    imported. Both forms are read: ``field: T = value`` (a dataclass) and
+    ``field: T = Field(default=value, ...)`` (the Settings class).
+    """
+    tree = ast.parse(Path(path).read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    for node in cls.body:
+        if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                and node.target.id == field):
+            value = node.value
+            if isinstance(value, ast.Call):
+                value = next(k.value for k in value.keywords if k.arg == "default")
+            return ast.literal_eval(value)
+    raise LookupError(f"{class_name}.{field} has no default in {path}")
+
+
+# The values the sidecar runs with when nothing is configured.
+_CONFIG = REPO / "src" / "voicemanager" / "config.py"
+FLOOR_DB = shipped_default(_CONFIG, "Settings", "tyger_prefilter_floor_db")
+GATE_DB = shipped_default(_CONFIG, "Settings", "tyger_voice_gate_db")
+TYGER_MODEL = shipped_default(_CONFIG, "Settings", "tyger_model")
+TYGER_REVISION = shipped_default(_CONFIG, "Settings", "tyger_revision")
+BARGE_THRESHOLD = shipped_default(TYGER_DIR / "rules.py", "TurnRuleSettings", "barge_threshold")
 
 
 def load_sidecar_package():
@@ -190,7 +223,7 @@ def call(tg, tyger_scorer, factory, stem):
     for a0, a1 in spans:
         w = deb[a0:min(len(deb), a1 + 5)]
         peak = float(w.max()) if w.size else float("nan")
-        span_ok &= peak >= 0.6
+        span_ok &= peak >= BARGE_THRESHOLD
         print(f"   mid-reply span {a0 * 0.08:6.2f}-{a1 * 0.08:6.2f} s  highest yield {peak:.3f}")
     outside = []
     for b in barges:
@@ -217,8 +250,7 @@ def main():
     parser.add_argument("--device", default="cuda:3")
     args = parser.parse_args()
     tg = load_sidecar_package()
-    tyger_scorer = tg.scorer.TygerScorer.load("nineninesix/tyger",
-                                             "a5d4d73bb74fa4a7082dcd4387e44a1e5ac151b6", args.device)
+    tyger_scorer = tg.scorer.TygerScorer.load(TYGER_MODEL, TYGER_REVISION, args.device)
     factory = tg.voxlock.VoxLockFactory.load(args.device)
     print(f"VoxLock providers: {factory.chunk_session.get_providers()[:1]} on {args.device}")
     all_t, failed = [], []
@@ -226,7 +258,7 @@ def main():
         spans, ok, outside, t = call(tg, tyger_scorer, factory, stem)
         all_t += t
         if spans and not ok:
-            failed.append(f"{os.path.basename(stem)}: a mid-reply span under 0.6")
+            failed.append(f"{os.path.basename(stem)}: a mid-reply span under {BARGE_THRESHOLD}")
         if outside:
             failed.append(f"{os.path.basename(stem)}: barge outside user speech")
     mem = gpu_mib()
