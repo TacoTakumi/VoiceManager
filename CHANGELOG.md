@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.9.3]
 
+### Added
+
+- A new `error_type`, `tts_unavailable` (`protocol.TTS_UNAVAILABLE`). The
+  audiocpp engine sends it when the engine fails a `tts_stream` request, for
+  example when the TTS sidecar cannot load its model. `audio_end` with
+  `reason: "error"` follows for the same `request_id`. The message names the
+  sidecar error code (for example `load_failed`) and not the sidecar's detail
+  text. The connection stays open, and a later request can succeed. See the
+  audio.cpp TTS section of the client guide.
+
 ### Changed
 
 - Documentation only, no change of behaviour. The client guide
@@ -32,13 +42,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The audiocpp engine: a `tts_stream` request whose engine fails (for example
   a TTS sidecar that cannot load its model because the card is full) no longer
-  ends like a normal reply with no audio. The client now gets an `error` frame
-  with the new `error_type` `tts_unavailable`, then `audio_end` with
-  `reason: "error"` for that `request_id`. The message names the sidecar error
-  code (for example `load_failed`) and not the sidecar's detail text. The
-  connection stays open, and a later request can succeed. The constant is
-  `protocol.TTS_UNAVAILABLE`. A sidecar that dies still gets
+  ends like a normal reply with no audio. It ends with the new
+  `tts_unavailable` error frame (see Added), then `audio_end` with
+  `reason: "error"` for that `request_id`. A sidecar that dies still gets
   `tts_backend_fault` and a `1011` close.
+- Turn engine: the mic hold of a reply whose `audio_end` went out and whose
+  playback stop the client never reports now ends at the reply's open end
+  (its start plus its played length plus the start wait), with the same wait
+  for the sidecar's progress that a reported stop gets. Before, the user's
+  answer reached the STT about 5 s late, in one burst. A hold that has ended
+  also stays ended when a later hop sent in speaking mode covers the reply,
+  so a barge can no longer pick that reply as if its audio were still held.
+- Python client: tasks whose sends find the same lost connection now share
+  one reconnect. Before, two reconnects at once could leave the new
+  connection's mic counts wrong. A send while a reconnect runs, or after a
+  reconnect that failed, now raises the call's documented error type (for
+  example `STTError` or `TTSError`) and sends nothing, where it raised
+  `AttributeError` before. `synthesize_tts` now raises `TTSError` on a lost
+  connection, not the raw `ConnectionClosed`.
+- Python client: a `barge` frame for a request whose `audio_end` was already
+  read no longer adds the request to the set of cancelled requests, which
+  grew for the life of the client.
 
 ## [0.9.2]
 
