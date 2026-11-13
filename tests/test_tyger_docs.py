@@ -242,6 +242,16 @@ def test_the_guide_says_what_the_stt_gets_after_a_barge():
     assert LEAD_SETTING in hold and "lead-in" in hold
 
 
+def test_the_guide_gives_the_barge_boundary_only_with_the_lead_in_on():
+    """With the lead-in off the server does not flush at a barge, so the barge
+    audio goes on in the open utterance. The guide must not give the utterance
+    boundary with no condition."""
+    hold = section(turn_engine_section(), "### The mic hold")
+    bullet = next(line for line in hold.splitlines() if "utterance boundary" in line)
+    assert "With the lead-in on" in bullet
+    assert "With the lead-in off" in bullet and "goes on in the open utterance" in bullet
+
+
 def test_the_readme_names_the_lead_in_and_the_stt_language():
     tyger = section(README, "### Tyger")
     assert LEAD_SETTING in tyger
