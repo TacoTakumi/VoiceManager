@@ -1395,44 +1395,43 @@ class VoiceManagerClient:
         """
         self._require_no_duplex("stream_stt_live")
         send_done = False
-        try:
-            send_iter = audio_chunks.__aiter__()
-            while not send_done:
-                # Send next audio chunk
-                try:
-                    chunk = await send_iter.__anext__()
-                except StopAsyncIteration:
-                    send_done = True
-                else:
-                    await self._send_or_raise(
-                        chunk, STTError, "Connection lost during STT streaming")
-                    self._count_mic(chunk)
+        # Each send handles a closed socket itself. Any other exception, also a
+        # ConnectionClosed from the caller's own iterator, propagates unchanged and
+        # leaves the client's connection as it is.
+        send_iter = audio_chunks.__aiter__()
+        while not send_done:
+            # Send next audio chunk
+            try:
+                chunk = await send_iter.__anext__()
+            except StopAsyncIteration:
+                send_done = True
+            else:
+                await self._send_or_raise(
+                    chunk, STTError, "Connection lost during STT streaming")
+                self._count_mic(chunk)
 
-                # Drain any transcriptions that arrived
-                while not self._stt_queue.empty():
-                    item = self._stt_queue.get_nowait()
+            # Drain any transcriptions that arrived
+            while not self._stt_queue.empty():
+                item = self._stt_queue.get_nowait()
+                if item is None:
+                    return
+                yield self._stamp_turn_id(item)
+
+        # Audio exhausted - wait for remaining transcriptions
+        try:
+            async with asyncio.timeout(5.0):
+                while True:
+                    item = await self._stt_queue.get()
                     if item is None:
                         return
                     yield self._stamp_turn_id(item)
-
-            # Audio exhausted - wait for remaining transcriptions
-            try:
-                async with asyncio.timeout(5.0):
-                    while True:
-                        item = await self._stt_queue.get()
-                        if item is None:
-                            return
-                        yield self._stamp_turn_id(item)
-                        try:
-                            async with asyncio.timeout(2.0):
-                                continue
-                        except TimeoutError:
-                            return
-            except TimeoutError:
-                pass
-        except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise STTError("Connection lost during STT streaming")
+                    try:
+                        async with asyncio.timeout(2.0):
+                            continue
+                    except TimeoutError:
+                        return
+        except TimeoutError:
+            pass
 
     async def turn_start(self, timeout: float = 5.0) -> int:
         """Open a new conversation turn and return the server-assigned turn_id.
@@ -1720,41 +1719,66 @@ class VoiceManagerClient:
         audio_started = False
         first_chunk = True
 
+        # Each send handles a closed socket itself. Any other exception, also a
+        # ConnectionClosed from the caller's own iterator, propagates unchanged and
+        # leaves the client's connection as it is.
+        send_iter = text_chunks.__aiter__()
+
+        while not send_done:
+            # Send next text chunk
+            try:
+                chunk = await send_iter.__anext__()
+                payload = {
+                    "type": "tts_stream",
+                    "request_id": request_id,
+                    "text": chunk,
+                    "done": False,
+                }
+                if first_chunk:
+                    if voice is not None:
+                        payload["voice"] = voice
+                    if chunking is not None:
+                        payload["chunking"] = chunking
+                    first_chunk = False
+                msg = json.dumps(payload)
+                await self._send_or_raise(
+                    msg, TTSError, "Connection lost during streaming TTS")
+            except StopAsyncIteration:
+                # All text sent - send done=True
+                await self._send_or_raise(json.dumps({
+                    "type": "tts_stream",
+                    "request_id": request_id,
+                    "text": "",
+                    "done": True,
+                }), TTSError, "Connection lost during streaming TTS")
+                send_done = True
+
+            # Drain any audio that arrived while sending
+            while not self._tts_queue.empty():
+                item = self._tts_queue.get_nowait()
+                if item is None:
+                    raise TTSError("Connection lost during streaming TTS")
+                if isinstance(item, bytes):
+                    # Discard PCM for a cancelled request until its audio_end.
+                    if audio_started and request_id not in self._cancelled_tts:
+                        yield item
+                elif isinstance(item, dict):
+                    ftype = item.get("type")
+                    item_rid = item.get("request_id")
+                    if ftype == "audio_start" and item_rid == request_id:
+                        self.last_tts_sample_rate = item.get("sample_rate", 22050)
+                        audio_started = True
+                    elif ftype == "audio_end" and item_rid == request_id:
+                        self._cancelled_tts.discard(request_id)
+                        if item.get("reason") == "error":
+                            raise self._tts_request_failed()
+                        return
+
+        # Text exhausted - collect remaining audio until audio_end
         try:
-            send_iter = text_chunks.__aiter__()
-
-            while not send_done:
-                # Send next text chunk
-                try:
-                    chunk = await send_iter.__anext__()
-                    payload = {
-                        "type": "tts_stream",
-                        "request_id": request_id,
-                        "text": chunk,
-                        "done": False,
-                    }
-                    if first_chunk:
-                        if voice is not None:
-                            payload["voice"] = voice
-                        if chunking is not None:
-                            payload["chunking"] = chunking
-                        first_chunk = False
-                    msg = json.dumps(payload)
-                    await self._send_or_raise(
-                        msg, TTSError, "Connection lost during streaming TTS")
-                except StopAsyncIteration:
-                    # All text sent - send done=True
-                    await self._send_or_raise(json.dumps({
-                        "type": "tts_stream",
-                        "request_id": request_id,
-                        "text": "",
-                        "done": True,
-                    }), TTSError, "Connection lost during streaming TTS")
-                    send_done = True
-
-                # Drain any audio that arrived while sending
-                while not self._tts_queue.empty():
-                    item = self._tts_queue.get_nowait()
+            async with asyncio.timeout(120.0):
+                while True:
+                    item = await self._tts_queue.get()
                     if item is None:
                         raise TTSError("Connection lost during streaming TTS")
                     if isinstance(item, bytes):
@@ -1772,35 +1796,8 @@ class VoiceManagerClient:
                             if item.get("reason") == "error":
                                 raise self._tts_request_failed()
                             return
-
-            # Text exhausted - collect remaining audio until audio_end
-            try:
-                async with asyncio.timeout(120.0):
-                    while True:
-                        item = await self._tts_queue.get()
-                        if item is None:
-                            raise TTSError("Connection lost during streaming TTS")
-                        if isinstance(item, bytes):
-                            # Discard PCM for a cancelled request until its audio_end.
-                            if audio_started and request_id not in self._cancelled_tts:
-                                yield item
-                        elif isinstance(item, dict):
-                            ftype = item.get("type")
-                            item_rid = item.get("request_id")
-                            if ftype == "audio_start" and item_rid == request_id:
-                                self.last_tts_sample_rate = item.get("sample_rate", 22050)
-                                audio_started = True
-                            elif ftype == "audio_end" and item_rid == request_id:
-                                self._cancelled_tts.discard(request_id)
-                                if item.get("reason") == "error":
-                                    raise self._tts_request_failed()
-                                return
-            except TimeoutError:
-                raise TTSError("Timed out waiting for streaming TTS audio")
-
-        except websockets.exceptions.ConnectionClosed:
-            await self._reconnect()
-            raise TTSError("Connection lost during streaming TTS")
+        except TimeoutError:
+            raise TTSError("Timed out waiting for streaming TTS audio")
 
     async def cancel_tts(self, request_id: str) -> None:
         """Cancel an in-progress TTS synthesis request.
