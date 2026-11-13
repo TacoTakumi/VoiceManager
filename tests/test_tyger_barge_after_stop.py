@@ -620,3 +620,29 @@ def test_the_sidecar_sends_progress_lines_only_when_asked():
             ws.send_bytes(b"not a hop")
             # Not asked: the quiet hop sends nothing, so the error line comes first.
             assert [type(e) for e in wire.parse_events(ws.receive_text())] == [wire.ErrorEvent]
+
+
+def test_a_hold_that_ended_stays_ended_when_a_later_hop_speaks_over_the_reply():
+    # The stop's reply_sample puts the played span past the hop the stop is in.
+    feed = te.HopFeed()
+    feed.on_tts_text("r1", _audio_start("r1"))
+    feed.on_tts_pcm("r1", b"\x01\x00" * 16000)
+    assert feed.playback(_start("r1", 0)) is None
+    hold = te.MicHold(feed, tail_samples=TAIL, start_wait_samples=32000)
+    hold.on_scored(0)
+    first = _s(0, wire.HOP_SAMPLES)
+    hold.push(0, first, feed.feed_mic(first))
+    assert len(feed.due_hops()) == 1
+    assert feed.playback(_stop("r1", 2000, 8000)) is None
+    reply = feed.reply("r1")
+    assert hold.on_scored(wire.HOP_SAMPLES) is True
+    assert hold.take() == [_s(2000 + TAIL, wire.HOP_SAMPLES)]
+    assert hold.hold_state(reply) is False
+    # The next hop still speaks over the reply and raises its last speaking hop end.
+    second = _s(wire.HOP_SAMPLES, 2 * wire.HOP_SAMPLES)
+    hold.push(wire.HOP_SAMPLES, second, feed.feed_mic(second))
+    assert [job.mode for job in feed.due_hops()] == [wire.MODE_SPEAKING]
+    assert hold.hold_state(reply) is False
+    assert hold.on_scored(wire.HOP_SAMPLES + 1) is False
+    assert feed.played_reply(7000, 1500, TAIL, hold.hold_state) is None
+    assert hold.take() == [second]

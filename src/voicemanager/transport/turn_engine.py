@@ -152,7 +152,16 @@ each reply's playback state from the ``HopFeed``; positions are mic samples:
   is dropped; with a barge, it is fed as below. A sidecar that reports no progress
   leaves nothing to wait for: the audio is dropped at the stop. A slow one is waited
   for until the mic stream is the start wait (in mic samples) past the stop plus the
-  tail; the audio is then dropped as if no barge came.
+  tail; the audio is then dropped as if no barge came. Once that wait has ended, it
+  stays ended: a hop cut later in speaking mode over the reply does not make it wait
+  again.
+* A reply whose audio_end went out and that has no stop plays at most up to its open
+  end: its start plus its played length plus the start wait. Once the mic stream
+  passes the open end, the reply counts as stopped there, with the same wait for the
+  sidecar's progress, counted from the open end (no tail is dropped past it): the
+  audio from the open end on goes to the STT in order once the sidecar has scored
+  through the open end plus the tail, or with no such progress once the mic stream
+  is the start wait past that.
 * A barge the session acts on (it picked a played reply) feeds the held audio from
   ``max(onset_mic_sample, mic_sample - BARGE_LOOKBACK_SAMPLES)``: every reply whose
   audio_start went out by the barge's mic_sample stops holding there (one with no
@@ -176,7 +185,8 @@ Memory is bounded. In-play audio is kept for ``BARGE_LOOKBACK_SAMPLES`` plus
 as no barge can reach it. Audio waiting for a start is kept for the start wait plus
 ``HOLD_MARGIN_SAMPLES``; older audio is fed, as if that reply had not played. A reply
 that ended with no stop yet is in play for at most its length plus the start wait, so
-a client that never reports its stop costs only that. A stopped reply waits for the
+a client that never reports its stop costs only that, plus the wait of a stop at its
+open end. A stopped reply waits for the
 sidecar's progress for at most the start wait of mic audio past its stop plus the
 tail (and keeps only the last ``BARGE_LOOKBACK_SAMPLES`` plus ``HOLD_MARGIN_SAMPLES``
 of its in-play audio meanwhile), so a slow sidecar cannot grow the hold without
@@ -425,6 +435,7 @@ class _Reply:
     # The mic hold's own marks (see "The mic hold" in the module docstring).
     start_wait_over: bool = False     # no start came by the start wait: never held again
     barge_at: int | None = None       # a barge ended its hold here
+    hold_over: bool = False           # its wait for the sidecar ended: never waits again
 
     @property
     def length16(self) -> int:
@@ -867,8 +878,8 @@ class MicHold:
             return False  # nothing waited for progress before the first line
         return any(before < self._wait_end(reply) <= mic_sample
                    for reply in self._feed.replies()
-                   if reply.start is not None and reply.stop_mic is not None
-                   and reply.barge_at is None)
+                   if self._stopped_at(reply) is not None
+                   and reply.barge_at is None and not reply.hold_over)
 
     def hold_state(self, reply: _Reply) -> bool | None:
         """For a stopped reply: whether its hold still waits for the sidecar's progress.
@@ -876,32 +887,57 @@ class MicHold:
         True while it waits (a barge for it may still come and be fed), False once it
         has ended (dropped, or released by a barge), None when the sidecar reports no
         progress, or when the hold never held the reply (its start came after the start
-        wait), so nothing waits."""
-        if self._scored is None or reply.start_wait_over:
+        wait), so nothing waits. Once False, it stays False: a hop cut later in speaking
+        mode over the reply does not make an ended hold wait again, as its audio is
+        gone."""
+        if (self._scored is None or reply.start_wait_over
+                or self._stopped_at(reply) is None):
             return None
         if reply.barge_at is not None:
             return False
         return self._waits(reply, self._feed.mic_samples)
 
+    def _stopped_at(self, reply: _Reply) -> int | None:
+        """Where the reply's play ends on the mic stream, for the hold.
+
+        Its stop; for a reply whose audio_end went out and that has no stop, its open
+        end (the start plus the played length plus the start wait), as no client
+        plays it past that; None for a reply with no start, or one still sending."""
+        if reply.start is None:
+            return None
+        if reply.stop_mic is not None:
+            return reply.stop_mic
+        if reply.done:
+            return reply.start + reply.length16 + self._start_wait
+        return None
+
     def _wait_end(self, reply: _Reply) -> int:
         """How far the sidecar must score before no barge can come for a stopped reply.
 
-        The stop plus the tail, or the end of the last hop sent in speaking mode over
-        the reply when that is later: the yield head may decide a barge on any frame
-        of a speaking hop, and a late stop leaves hops already sent with the reply
-        past the cut."""
-        return max(reply.stop_mic + self._tail, reply.speaking_end or 0)
+        The stop (or the open end) plus the tail, or the end of the last hop sent in
+        speaking mode over the reply when that is later: the yield head may decide a
+        barge on any frame of a speaking hop, and a late stop leaves hops already sent
+        with the reply past the cut."""
+        return max(self._stopped_at(reply) + self._tail, reply.speaking_end or 0)
 
     def _waits(self, reply: _Reply, now: int) -> bool:
         """The stopped reply's in-play audio still waits for the sidecar's progress.
 
         False when the sidecar reports no progress (as before it could), when it has
         scored through the reply's wait end, or when the mic stream is the start wait
-        past the stop plus the tail with no such progress: a slow sidecar holds the
-        audio no longer than that."""
-        end = reply.stop_mic + self._tail
-        return (self._scored is not None and self._scored < self._wait_end(reply)
-                and now < end + self._start_wait)
+        past the stop (or the open end) plus the tail with no such progress: a slow
+        sidecar holds the audio no longer than that. Once that wait has ended with
+        progress reported, the reply never waits again (``hold_over``): the audio it
+        held is gone, and a later speaking hop that raises its wait end must not make
+        a barge for it look fed."""
+        if reply.hold_over:
+            return False
+        end = self._stopped_at(reply) + self._tail
+        waits = (self._scored is not None and self._scored < self._wait_end(reply)
+                 and now < end + self._start_wait)
+        if not waits and self._scored is not None:
+            reply.hold_over = True
+        return waits
 
     @property
     def held_samples(self) -> int:
@@ -1059,7 +1095,16 @@ class MicHold:
                 rules.append((max(reply.seen_at, now - self._pending_keep), math.inf, _HOLD))
                 continue
             start = reply.start
-            end = None if reply.stop_mic is None else reply.stop_mic + self._tail
+            open_end = self._stopped_at(reply) if reply.stop_mic is None else None
+            if reply.stop_mic is not None:
+                end = reply.stop_mic + self._tail
+            elif open_end is not None and now >= open_end:
+                # Done with no stop, and the mic stream is past its open end: it
+                # counts as stopped there. What came after the open end is not its
+                # echo, so no tail is dropped past it.
+                end = open_end
+            else:
+                end = None
             if reply.barge_at is not None:
                 end = reply.barge_at if end is None else min(end, reply.barge_at)
             elif end is not None and self._waits(reply, now):
@@ -1076,8 +1121,9 @@ class MicHold:
                 continue
             # Still playing: a barge may yet come for the last BARGE_LOOKBACK of it.
             # A reply that ended with no stop yet plays at most its length plus the
-            # start wait, so a client that never reports its stop costs only that.
-            open_end = (start + reply.length16 + self._start_wait) if reply.done else math.inf
+            # start wait (its open end); from there it counts as stopped, above.
+            if open_end is None:
+                open_end = math.inf
             keep_from = max(start, now - self._play_keep)
             if keep_from > start:
                 rules.append((start, min(keep_from, open_end), _DROP))

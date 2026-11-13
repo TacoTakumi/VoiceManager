@@ -290,7 +290,10 @@ def test_a_barge_feeds_the_held_audio_from_its_onset_before_later_audio(
         assert made[0].fed == _s(0, 3000) + _s(10000, 21120)
 
 
-def test_a_barge_feeds_at_most_four_seconds_back(tyger, client, made, dispatched):
+def test_a_barge_feeds_at_most_four_seconds_back(tyger, client, made, dispatched, env):
+    # The reply is short and the client reports no stop: its open end (the start plus
+    # its length plus the start wait) must be past the barge for it to be in play.
+    env(VM_TYGER_START_WAIT_MS=10000)
     with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
         _opted_in(ws, tyger)
         mic = _Mic(ws)
@@ -406,3 +409,69 @@ def test_audio_before_a_start_is_kept_only_for_the_start_wait_and_then_fed():
     assert max(held) <= bound + FRAME
     total = n_frames * FRAME
     assert fed == _s(0, total - held[-1])    # the oldest goes on, in order
+
+
+# --- a reply that ended with no stop: its hold ends at its open end ----------------
+
+#: r1 is 1 s long and plays from mic sample 3000: its open end is the start plus the
+#: played length plus the start wait.
+_NO_STOP_START = 3000
+_OPEN_END = _NO_STOP_START + 16000 + 32000
+
+
+def _no_stop_hold(*, progress: bool):
+    """r1 sent at sample 0, 1 s at 16 kHz, done, started at 3000 and never stopped."""
+    feed = te.HopFeed()
+    hold = te.MicHold(feed, tail_samples=TAIL, start_wait_samples=32000)
+    feed.on_tts_text("r1", _audio_start(16000))
+    feed.on_tts_pcm("r1", b"\x01\x00" * 16000)
+    feed.on_tts_text("r1", json.dumps({"type": "audio_end", "request_id": "r1"}))
+    assert feed.playback(_start("r1", _NO_STOP_START)) is None
+    if progress:
+        hold.on_scored(0)
+    return feed, hold
+
+
+def _push_to(feed, hold, end: int) -> list[tuple[int, bytes]]:
+    """Push mic frames up to sample ``end``; (mic count, audio fed) per frame."""
+    out = []
+    while feed.mic_samples < end:
+        at = feed.mic_samples
+        data = _s(at, min(at + FRAME, end))
+        hold.push(at, data, feed.feed_mic(data))
+        out.append((feed.mic_samples, b"".join(hold.take())))
+    return out
+
+
+def test_a_reply_with_no_stop_frees_the_audio_past_its_open_end_on_progress():
+    feed, hold = _no_stop_hold(progress=True)
+    steps = _push_to(feed, hold, 60 * FRAME)
+    assert b"".join(c for _, c in steps) == _s(0, _NO_STOP_START)
+    assert hold.on_scored(_OPEN_END + TAIL - 1) is False
+    assert hold.take() == []
+    assert hold.on_scored(_OPEN_END + TAIL) is True
+    assert b"".join(hold.take()) == _s(_OPEN_END, 60 * FRAME)
+    # From the open end on, the STT gets the mic stream as sent, in order.
+    later = _push_to(feed, hold, 70 * FRAME)
+    assert b"".join(c for _, c in later) == _s(60 * FRAME, 70 * FRAME)
+
+
+def test_a_reply_with_no_stop_and_a_slow_sidecar_frees_the_audio_by_the_start_wait():
+    feed, hold = _no_stop_hold(progress=True)
+    steps = _push_to(feed, hold, 140 * FRAME)
+    fed = b"".join(c for _, c in steps)
+    # Nothing past the reply's start until the mic count is the open end plus the
+    # tail plus the start wait: the first frame boundary at or past it.
+    bound = _OPEN_END + TAIL + 32000
+    first = next(count for count, chunk in steps if count > FRAME * 3 and chunk)
+    assert first == -(-bound // FRAME) * FRAME
+    assert first != 131072
+    assert fed == _s(0, _NO_STOP_START) + _s(_OPEN_END, 140 * FRAME)
+
+
+def test_a_reply_with_no_stop_and_no_progress_reported_frees_the_audio_at_its_open_end():
+    feed, hold = _no_stop_hold(progress=False)
+    steps = _push_to(feed, hold, 60 * FRAME)
+    first = next(count for count, chunk in steps if count > FRAME * 3 and chunk)
+    assert first == -(-_OPEN_END // FRAME) * FRAME
+    assert b"".join(c for _, c in steps) == _s(0, _NO_STOP_START) + _s(_OPEN_END, 60 * FRAME)
