@@ -1116,6 +1116,24 @@ def test_a_second_barge_from_an_earlier_place_keeps_the_break_for_no_audio_of_it
     assert rig.marked() == [BARGE, _s(18048, 20096)]
 
 
+def test_a_second_barge_from_a_later_place_gets_a_gap_break_after_the_reply_between():
+    # The first barge is at the mic count and keeps its mark. r2 is sent before the
+    # next mic frame and plays from that same sample, and a second barge comes on r2
+    # from a later place. The mark stays at the first place, r2's echo dropped from
+    # there to the second place takes it, and the second barge's audio gets a gap.
+    rig = _rig_with_a_reply_in_play()
+    rig.barge(18048, 18048)                  # at the mic count: none of its audio is in
+    assert rig.marked() == []
+    rig.reply("r2")                          # sent before the next mic frame
+    rig.playback(_start("r2", 18048))        # and it plays from the barge's own sample
+    rig.mic(30000)
+    assert rig.marked() == []                # r2 plays: its echo waits in the hold
+    rig.barge(26000, 28000)                  # on r2, from a later place
+    assert rig.marked() == [GAP, _s(26000, 30000)]
+    rig.mic(32048)
+    assert rig.marked() == [_s(30000, 32048)]            # and no break after that one
+
+
 def _barge_at_the_mic_count_then_a_second_reply(ws, tyger, dispatched, mic: _Mic) -> None:
     """r1 plays from sample 3000 and a barge comes at the newest mic sample (18048), so
     the hold has none of the barge's audio. Then r2 is sent with no mic frame in
@@ -1152,6 +1170,41 @@ def test_with_no_vad_a_barge_with_no_audio_of_its_own_gives_no_lead_in_after_the
         assert ("finalize",) not in stt.events
         assert _no_lead_in(stt)
         assert stt.fed == _s(0, 3000) + _s(24000 + TAIL, 30336)
+
+
+def test_with_no_vad_a_second_barge_from_a_later_place_gets_no_flush_and_no_lead_in(
+        tyger, client, made, dispatched, env):
+    env(VM_TYGER_BARGE_LEAD_MS=600, VM_AUDIOCPP_SILENCE_MS=30000)
+    with client as c, authkit.ws_connect(c, "/ws/stream") as ws:
+        _opted_in(ws, tyger)
+        mic = _Mic(ws)
+        stt = made[0]
+        mic.send(2048)
+        speak(ws, "r1")
+        mic.send(16000)                      # to 18048
+        ws.send_json(_start("r1", 3000))
+        assert errors(barrier(ws)) == []
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=18048, mic_sample=18048))
+        assert [f["request_id"] for f in frames
+                if isinstance(f, dict) and f["type"] == "barge"] == ["r1"]
+        speak(ws, "r2")                      # holding from sample 18048
+        ws.send_json(_start("r2", 18048))
+        mic.send(8 * FRAME)                  # to 26240, under the reply
+        assert errors(barrier(ws)) == []
+        assert stt.fed == _s(0, 3000)        # all the rest is r2's echo so far
+
+        frames = _events(ws, tyger, dispatched,
+                         wire.BargeEvent(onset_mic_sample=26000, mic_sample=26240))
+        assert [f["request_id"] for f in frames
+                if isinstance(f, dict) and f["type"] == "barge"] == ["r2"]
+        mic.send(4 * FRAME)                  # to 30336
+        assert errors(barrier(ws)) == []
+        # The audio from the second barge's place follows r2's echo, which took the
+        # mark of the first barge: a gap. No flush, no lead-in, only the mic audio.
+        assert ("finalize",) not in stt.events
+        assert _no_lead_in(stt)
+        assert stt.fed == _s(0, 3000) + _s(26000, 30336)
 
 
 def test_under_the_idle_gate_a_barge_with_no_audio_of_its_own_arms_no_lead_in(

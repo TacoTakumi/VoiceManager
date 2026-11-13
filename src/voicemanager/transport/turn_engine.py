@@ -974,11 +974,21 @@ class MicHold:
         played there before the barge got any audio of its own (the barge was at the
         newest mic sample, and the reply was sent before the next mic frame). The
         audio after that reply is not the barge's, so the mark goes and that audio
-        gets a GAP. This cannot take the mark of a barge that has audio: a reply
-        sent by the barge stops holding at the barge's place, so what it drops ends
-        there, and a reply sent after the barge drops its echo only behind the
-        audio between the barge's place and its playback start, which is fed first
-        and takes the BARGE break."""
+        gets a GAP. This cannot take the mark of a barge that has audio at its own
+        place: a reply sent by the barge stops holding at the barge's place, so what
+        it drops ends there, and a reply sent after the barge drops its echo only
+        behind the audio between the barge's place and its playback start, which is
+        fed first and takes the BARGE break.
+
+        One state does lose a BARGE break for audio of a barge. The first barge is
+        at the newest mic sample and keeps its mark, the later reply plays from that
+        sample, and a second barge comes on that reply from a later place.
+        ``mark_barge`` leaves the mark at the first place, the echo dropped from
+        there to the second place takes it, and the audio of the second barge gets
+        a GAP: no flush and no lead-in. The shipped sidecar cannot send that second
+        barge (its barge latch holds while the hops stay in speaking mode). A client
+        that reports a playback start before the ``audio_start`` of its reply
+        reaches the same result."""
         if (self._barge_from is not None and count > 0
                 and start + count > self._barge_from):
             self._barge_from = None
