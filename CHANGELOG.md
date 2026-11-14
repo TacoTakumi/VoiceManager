@@ -70,6 +70,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Python client: `max_retries` now sets the number of attempts of each
+  reconnect. Before, the client always made three attempts whatever the
+  value, while the error message named `max_retries`. The wait between two
+  attempts starts at 1 s and doubles, up to 8 s, so the default 3 behaves as
+  before (waits of 1 and 2 s). A `max_retries` below 1 raises `ValueError`.
 - Server: a `tts_cancel` that comes after a request's error `audio_end` no
   longer sends a second `audio_end` for that request. The rule that a request
   gets at most one `audio_end` now holds for a request that failed too, on the

@@ -326,3 +326,32 @@ def test_failing_socket_close_resets_the_client_and_raises(monkeypatch):
                 [q.get_nowait() for q in _queues(client)])
 
     assert asyncio.run(run()) == (None, None, False, [None] * 7)
+
+
+@pytest.mark.parametrize("max_retries, waits", [
+    (1, []),
+    (5, [1, 2, 4, 8]),
+    (6, [1, 2, 4, 8, 8]),               # the wait stops doubling at 8 s
+])
+def test_max_retries_sets_the_number_of_reconnect_attempts(monkeypatch, max_retries,
+                                                           waits):
+    client = VoiceManagerClient(token="vmp_test", max_retries=max_retries)
+    client._ws = _FakeWS()
+    client.connected = True
+    connects: list = []
+    monkeypatch.setattr(client, "_connect", _refusing_connect(connects))
+    delays = _no_backoff(monkeypatch)
+
+    async def run():
+        with pytest.raises(ClientConnectionError, match=f"after {max_retries} attempts"):
+            await client.reconnect()
+
+    asyncio.run(run())
+    assert len(connects) == max_retries
+    assert delays == waits
+
+
+@pytest.mark.parametrize("max_retries", [0, -1])
+def test_max_retries_below_one_is_refused(max_retries):
+    with pytest.raises(ValueError, match="max_retries"):
+        VoiceManagerClient(token="vmp_test", max_retries=max_retries)

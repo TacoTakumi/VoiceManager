@@ -63,6 +63,8 @@ _TTS_FAILED_NO_FRAME = "The server ended the TTS request with an error"
 _TTS_ERROR_KEY = "_tts_error"
 # The default of VoiceManagerClient._reconnect: reconnect whatever socket is current.
 _CURRENT_SOCKET = object()
+# The longest wait, in seconds, between two reconnect attempts.
+_RECONNECT_MAX_WAIT = 8
 
 
 def _wav_payload_offset(data: bytes) -> int | None:
@@ -731,6 +733,8 @@ class VoiceManagerClient:
         self.host = host
         self.port = port
         self.token = token
+        if max_retries < 1:
+            raise ValueError(f"max_retries must be 1 or more, got {max_retries}")
         self.max_retries = max_retries
         self.use_ssl = use_ssl
 
@@ -989,8 +993,9 @@ class VoiceManagerClient:
         before the first audio), the session listens, and the set of cancelled
         TTS requests is empty.
 
-        Raises ConnectionError when every attempt fails (three attempts, with
-        waits of 1 and 2 s between them), also when it waited for the reconnect
+        Raises ConnectionError when every attempt fails (max_retries attempts; the
+        wait between two attempts starts at 1 s and doubles, up to 8 s, so the
+        default 3 waits 1 and 2 s), also when it waited for the reconnect
         of another task.
         The client then has no connection, and this can be called again.
         """
@@ -1064,7 +1069,9 @@ class VoiceManagerClient:
         self._listen_acks_seen = 0
         self._listen_waiters = {}
 
-        delays = [1, 2, 4]
+        # max_retries attempts; the wait between two attempts starts at 1 s and
+        # doubles, up to 8 s.
+        delays = [min(2 ** n, _RECONNECT_MAX_WAIT) for n in range(self.max_retries)]
         for attempt, delay in enumerate(delays):
             try:
                 await self._connect()
