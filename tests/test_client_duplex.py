@@ -341,3 +341,33 @@ def test_error_queue_keeps_the_64_newest_frames_when_nobody_reads_it():
         return kept
 
     assert asyncio.run(run()) == [f"m{n}" for n in range(36, 100)]
+
+
+def test_cancelled_ids_whose_audio_end_never_comes_do_not_stay_for_good():
+    """A cancel_tts after the request's audio_end gets no second audio_end, so nothing
+    removes its id. The client keeps only the 64 newest cancelled ids."""
+    client = _client()
+
+    async def run():
+        for n in range(100):
+            await client.cancel_tts(f"r{n}")
+
+    asyncio.run(run())
+    assert len(client._cancelled_tts) == 64
+    assert "r35" not in client._cancelled_tts
+    assert all(f"r{n}" in client._cancelled_tts for n in range(36, 100))
+
+
+def test_a_cancelled_id_added_again_after_its_audio_end_keeps_its_new_place():
+    client = _client()
+
+    async def run():
+        await client.cancel_tts("again")
+        client._cancelled_tts.discard("again")      # its audio_end was read
+        await client.cancel_tts("again")            # cancelled again, now the oldest
+        for n in range(63):
+            await client.cancel_tts(f"r{n}")
+
+    asyncio.run(run())
+    assert len(client._cancelled_tts) == 64
+    assert "again" in client._cancelled_tts

@@ -70,6 +70,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Python client: the set of cancelled TTS requests keeps at most the 64 newest
+  ids. A `cancel_tts` of a request whose `audio_end` already came gets no
+  second `audio_end`, so before, its id stayed in the set for the life of the
+  connection. The client guide now says that such a cancel is a no-op with no
+  ack.
 - Server: a `tts_stream` request on the OpenVoice or VibeVoice engine whose
   synthesis fails now ends with `audio_end` reason `error`. Before, it ended
   with reason `complete`, so a client took the failed request as a normal

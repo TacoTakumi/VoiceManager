@@ -309,7 +309,9 @@ await client.cancel_tts(rid)   # fire-and-forget; server acks with an immediate 
 
 `cancel_tts` returns as soon as the `tts_cancel` frame is sent. The server acks
 with exactly one `audio_end` carrying `reason: "cancelled"`, and the client
-discards any PCM still in flight for that id until the ack lands. A cancelled
+discards any PCM still in flight for that id until the ack lands. When the
+request's own `audio_end` already went out (the reply completed or failed just
+before the cancel), the cancel is a no-op and no second `audio_end` comes. A cancelled
 `request_id` is permanently dead - **mint a fresh id for the next reply**. See
 behaviours 6 and 7 in [Turn-taking protocol surface](#turn-taking-protocol-surface).
 
@@ -942,7 +944,10 @@ to stop, because the synthesis is blocked in an executor thread that cannot be
 interrupted; that doomed task keeps running and will later try to emit its own
 audio and its own `audio_end`, all of which the server silently drops. The
 contract a client can therefore rely on is: **exactly one `audio_end` per
-`request_id`, and no PCM after it.**
+`request_id`, and no PCM after it.** A cancel of a request whose `audio_end`
+already went out (with reason `complete` or `error`) is therefore a no-op: the
+server sends no ack, because the request already has its one `audio_end`. Do
+not wait for an ack after such a cancel.
 
 Because the ack can arrive while binary frames are still in flight, a client must
 discard PCM for a cancelled `request_id` until its `audio_end` lands; the
@@ -2087,6 +2092,9 @@ until that `request_id`'s `audio_end` (carrying `reason: "cancelled"`) lands,
 drop every binary frame for it. The Python client does this with the
 `_cancelled_tts` set: `cancel_tts(request_id)` adds the id, the receive path
 drops binary frames for it, and the id is cleared when the `audio_end` arrives.
+A cancel of a request whose `audio_end` was already read gets no `audio_end`,
+so its id is never cleared that way; the client keeps only the 64 newest
+cancelled ids, so such ids do not build up.
 
 **Do not wait for `audio_end` to consider the turn over - stop local playback
 immediately.** The ack can lag the cancel by roughly a second, because synthesis

@@ -67,6 +67,36 @@ _CURRENT_SOCKET = object()
 _ERROR_QUEUE_MAX = 64
 # The longest wait, in seconds, between two reconnect attempts.
 _RECONNECT_MAX_WAIT = 8
+# The most cancelled TTS request ids the client keeps; the oldest drops past it.
+_CANCELLED_TTS_MAX = 64
+
+
+class _CancelledIds(set):
+    """The set of cancelled TTS request ids, kept to the newest few.
+
+    An id leaves when its audio_end is read. A cancel of a request whose audio_end
+    already went out gets no second one, so nothing would remove that id: past the
+    cap the oldest id drops. A client has a few requests in flight at most, so the
+    cap never drops the id of a live request.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._order: dict[str, None] = {}  # the ids in the order they were added
+
+    def add(self, request_id: str) -> None:
+        if request_id in self:
+            return
+        super().add(request_id)
+        self._order[request_id] = None
+        while len(self) > _CANCELLED_TTS_MAX:
+            oldest = next(iter(self._order))
+            del self._order[oldest]
+            super().discard(oldest)
+
+    def discard(self, request_id: str) -> None:
+        super().discard(request_id)
+        self._order.pop(request_id, None)
 
 
 def _wav_payload_offset(data: bytes) -> int | None:
@@ -835,7 +865,7 @@ class VoiceManagerClient:
         # request_ids the caller has cancelled. cancel_tts() adds one here
         # and returns immediately without awaiting audio_end; the live-yield path
         # discards binary frames for a cancelled request until its audio_end lands.
-        self._cancelled_tts: set[str] = set()
+        self._cancelled_tts: set[str] = _CancelledIds()
         # The open DuplexSession, if any; the one-sided methods refuse while it is set.
         self._duplex: DuplexSession | None = None
 
@@ -1072,7 +1102,7 @@ class VoiceManagerClient:
         self._wake_sent = None
         self._dormant_bytes = 0
         self._dormant_stop_marks = []
-        self._cancelled_tts = set()
+        self._cancelled_tts = _CancelledIds()
         self._turn_engine_sent = None
         self.turn_engine = None
         self._mic_bytes = 0
