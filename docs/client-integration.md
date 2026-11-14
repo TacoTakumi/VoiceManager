@@ -1707,7 +1707,7 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `TTSRequest.done` | `()` | `None` | End the text; the server answers with one `audio_end`. A later `send` raises. |
 | `TTSRequest.cancel` | `()` | `None` | Stop the reply; the server answers with one `audio_end` carrying `reason: "cancelled"`. |
 | `DuplexSession.audio` | `()` | `AsyncIterator[tuple]` | Yield `("audio_start", frame)`, `("pcm", bytes, request_id)` and `("audio_end", frame)` in arrival order. The pcm of a cancelled request is dropped until its `audio_end`, which is still yielded. |
-| `DuplexSession.errors` | `()` | `AsyncIterator[dict]` | Yield the server's `error` frames (timeout warnings, invalid requests, `turn_engine_lost`). |
+| `DuplexSession.errors` | `()` | `AsyncIterator[dict]` | Yield the server's `error` frames (timeout warnings, invalid requests, `turn_engine_lost`). The client keeps at most the 64 newest frames for it: when nothing reads them, as in one-sided use, the oldest frame drops when a new one comes. |
 | `DuplexSession.enable_turn_engine` | `(engine="tyger", timeout=10.0)` | `str` | Send the `turn_engine` opt-in before the first `send_audio` and wait for `turn_engine_ready`; returns the engine. Raises `TurnEngineError` (its `error_type` is the server's, or `None` on a timeout) on a refusal. |
 | `DuplexSession.mic_sample` | property | `int` | Mic samples sent on this connection since its first audio frame: the index a `playback` frame's `mic_sample` counts in. |
 | `DuplexSession.playback_start` | `(request, mic_sample=None)` | `None` | Send `playback` `start` for a `TTSRequest` or `request_id`; `mic_sample` defaults to `mic_sample` now. |

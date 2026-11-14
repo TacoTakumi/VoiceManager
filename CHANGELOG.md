@@ -70,6 +70,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Python client: the queue of error frames that `DuplexSession.errors()`
+  reads keeps at most the 64 newest frames. Before, a client that never
+  opened a duplex session kept every error frame for its whole life.
 - Python client: `max_retries` now sets the number of attempts of each
   reconnect. Before, the client always made three attempts whatever the
   value, while the error message named `max_retries`. The wait between two

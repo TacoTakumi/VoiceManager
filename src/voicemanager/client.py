@@ -63,6 +63,8 @@ _TTS_FAILED_NO_FRAME = "The server ended the TTS request with an error"
 _TTS_ERROR_KEY = "_tts_error"
 # The default of VoiceManagerClient._reconnect: reconnect whatever socket is current.
 _CURRENT_SOCKET = object()
+# The most error frames the client keeps for DuplexSession.errors(); older ones drop.
+_ERROR_QUEUE_MAX = 64
 # The longest wait, in seconds, between two reconnect attempts.
 _RECONNECT_MAX_WAIT = 8
 
@@ -703,7 +705,11 @@ class DuplexSession:
             yield frame
 
     async def errors(self) -> AsyncIterator[dict]:
-        """Yield the server's error frames (timeout warnings, invalid requests)."""
+        """Yield the server's error frames (timeout warnings, invalid requests).
+
+        The client keeps at most the 64 newest frames for this; an older frame that
+        nothing read drops when a new one comes.
+        """
         while (frame := await self._client._error_queue.get()) is not None:
             yield frame
 
@@ -1196,7 +1202,11 @@ class VoiceManagerClient:
                                 frames[error_rid] = frame
                                 while len(frames) > _TTS_ERROR_FRAMES_MAX:
                                     del frames[next(iter(frames))]
-                        await self._error_queue.put(frame)
+                        # Only DuplexSession.errors() reads this queue, so in one-sided
+                        # use nothing does: keep the newest frames, drop the oldest.
+                        while self._error_queue.qsize() >= _ERROR_QUEUE_MAX:
+                            self._error_queue.get_nowait()
+                        self._error_queue.put_nowait(frame)
                     else:
                         self._logger.debug("Unhandled message type: %s", ftype)
         except websockets.exceptions.ConnectionClosed:

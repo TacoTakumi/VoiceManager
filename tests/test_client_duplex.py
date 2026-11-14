@@ -295,3 +295,49 @@ def test_one_sided_methods_refuse_while_a_session_is_open_and_work_after_close()
         assert got == []
         assert isinstance(client.duplex(), DuplexSession)
     asyncio.run(run())
+
+
+class _FeedWS:
+    """A socket whose incoming frames the test puts on a queue; None ends the stream."""
+
+    def __init__(self) -> None:
+        self.incoming: asyncio.Queue = asyncio.Queue()
+
+    async def send(self, data) -> None:
+        pass
+
+    async def close(self) -> None:
+        self.incoming.put_nowait(None)
+
+    def __aiter__(self):
+        return self._frames()
+
+    async def _frames(self):
+        while (frame := await self.incoming.get()) is not None:
+            yield frame
+
+
+def test_error_queue_keeps_the_64_newest_frames_when_nobody_reads_it():
+    """One-sided use never reads the error queue, so the reader keeps only the newest
+    frames there and the queue cannot grow for the life of the client."""
+    client = VoiceManagerClient(token="vmp_test")
+    ws = _FeedWS()
+
+    async def run():
+        client._ws = ws
+        client.connected = True
+        client._reader = asyncio.create_task(client._reader_loop())
+        for n in range(100):
+            ws.incoming.put_nowait(json.dumps(
+                {"type": "error", "error_type": "invalid_request", "message": f"m{n}"}))
+        await _until(lambda: ws.incoming.empty())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        kept = []
+        while not client._error_queue.empty():
+            kept.append(client._error_queue.get_nowait()["message"])
+        await ws.close()
+        await asyncio.wait_for(client._reader, timeout=1.0)
+        return kept
+
+    assert asyncio.run(run()) == [f"m{n}" for n in range(36, 100)]
