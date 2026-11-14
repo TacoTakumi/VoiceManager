@@ -769,6 +769,8 @@ class VoiceManagerClient:
         self.host = host
         self.port = port
         self.token = token
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise TypeError(f"max_retries must be an int, got {max_retries!r}")
         if max_retries < 1:
             raise ValueError(f"max_retries must be 1 or more, got {max_retries}")
         self.max_retries = max_retries

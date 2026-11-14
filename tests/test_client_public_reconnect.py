@@ -430,3 +430,9 @@ def test_a_large_max_retries_does_not_stall_the_reconnect(monkeypatch):
     asyncio.run(run())
     assert time.monotonic() - start < 1.0
     assert (len(attempts), delays) == (3, [1, 2])
+
+
+@pytest.mark.parametrize("max_retries", [2.0, "3", True, None])
+def test_max_retries_that_is_not_an_int_is_refused(max_retries):
+    with pytest.raises(TypeError, match="max_retries"):
+        VoiceManagerClient(token="vmp_test", max_retries=max_retries)
