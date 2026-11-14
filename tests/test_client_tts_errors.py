@@ -585,3 +585,31 @@ async def test_cancelled_request_that_fails_raises_no_error(make_client, method)
     assert audio == PCM_A
     # The audio_end ends the cancel, so the id does not stay in the cancelled set.
     assert rid not in client._cancelled_tts
+
+
+async def test_live_cancelled_request_that_fails_while_text_is_sent(make_client):
+    """The barge-in path: the caller cancels while text chunks are still sent, and the
+    request's error frame and audio_end with reason error are read in the send loop.
+    The iteration ends with no TTSError, and the done frame is never sent."""
+    client, ws = make_client([])
+    rid = "barged-request"
+
+    async def text():
+        yield "Hello there."
+        ws.push(_start(rid))
+        ws.push(PCM_A)
+        await _idle(client)
+        await client.cancel_tts(rid)
+        ws.push(_err_for(rid, "tts_unavailable", UNAVAILABLE_MSG))
+        ws.push(_end(rid, "error"))
+        await _idle(client)
+        yield "How are you?"
+        yield "Fine."
+
+    got: list = []
+    async for pcm in client.stream_tts_live(text(), request_id=rid):
+        got.append(pcm)
+    # The send loop reads the audio only after the cancel, so it drops it.
+    assert got == []
+    assert rid not in client._cancelled_tts
+    assert not any(json.loads(d).get("done") for d in ws.sent)
