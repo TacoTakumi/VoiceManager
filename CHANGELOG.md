@@ -128,7 +128,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python client: a cancel or an error during the socket close, when the
   client closes or reopens the connection, no longer leaves the client with a
   socket that nothing reads. The client now has no connection, the waiting
-  calls end, and the cancel or the error reaches the caller. Before, the
+  calls end, and the cancel or the error reaches the caller. When a cancel
+  came while the client waited for its reader and the close then failed, the
+  cancel wins: the task ends with `CancelledError`, and the close error is its
+  cause. Before, the
   client kept the socket, `connected` stayed true, and later calls sent on a
   socket that nothing read.
 

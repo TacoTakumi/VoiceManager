@@ -355,3 +355,43 @@ def test_max_retries_sets_the_number_of_reconnect_attempts(monkeypatch, max_retr
 def test_max_retries_below_one_is_refused(max_retries):
     with pytest.raises(ValueError, match="max_retries"):
         VoiceManagerClient(token="vmp_test", max_retries=max_retries)
+
+
+def test_cancel_during_the_reader_wait_wins_over_a_close_error(monkeypatch):
+    """When reconnect() is cancelled while the old reader ends and the old socket's
+    close then fails, the task ends as cancelled, with the close error as the cause."""
+    client = VoiceManagerClient(token="vmp_test")
+    client._ws = _FailingCloseWS()
+    client.connected = True
+    _no_backoff(monkeypatch)
+    connect = _GatedConnect(client, open_at_once=True)
+    monkeypatch.setattr(client, "_connect", connect)
+    ending = asyncio.Event()
+
+    async def slow_reader():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            ending.set()
+            await asyncio.Event().wait()    # slow to end: only a second cancel ends it
+            raise
+
+    async def run():
+        client._reader = asyncio.create_task(slow_reader())
+        await _settle()
+        task = asyncio.create_task(client.reconnect())
+        await ending.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError as exc:
+            cause = exc.__cause__
+        else:
+            cause = "no CancelledError"
+        return (task.cancelled(), cause, client._ws, client._reader, client.connected,
+                len(connect.sockets))
+
+    cancelled, cause, ws, reader, connected, opened = asyncio.run(run())
+    assert cancelled is True
+    assert isinstance(cause, RuntimeError) and str(cause) == "close failed"
+    assert (ws, reader, connected, opened) == (None, None, False, 0)

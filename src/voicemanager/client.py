@@ -934,7 +934,8 @@ class VoiceManagerClient:
         raised again once the close is done, so the caller sees it and no socket
         stays open with no reader. A cancel or an error during the socket close
         reaches the caller too, after the client state is reset and the queues
-        are drained.
+        are drained. When both come (a cancel during the reader wait, then a close
+        error), the caller gets CancelledError, with the close error as its cause.
         """
         cancelled = False
         if self._reader is not None:
@@ -953,6 +954,12 @@ class VoiceManagerClient:
         try:
             if self._ws is not None:
                 await self._ws.close()
+        except Exception as exc:
+            # This task was cancelled while it waited for the reader: the cancel wins,
+            # so the task ends as cancelled, with the close error as the cause.
+            if cancelled:
+                raise asyncio.CancelledError from exc
+            raise
         finally:
             # Also when a cancel or an error stops the close: the client must not
             # keep a socket that nothing reads. No await here, so a second cancel
