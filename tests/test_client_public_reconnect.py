@@ -5,7 +5,8 @@ fake, and the backoff sleeps are patched so no test waits the real 1, 2 and 4 s.
 Covers: after a reconnect whose attempts all fail there is no socket, and
 reconnect() opens a new one, so a send works again on it and reconnected is True;
 reconnect() while another reconnect runs waits for that one and opens no
-connection of its own; reconnect() whose attempts all fail raises ConnectionError.
+connection of its own; reconnect() whose attempts all fail raises ConnectionError; a cancel of reconnect()
+while it waits for the old reader reaches the caller after the old socket is closed.
 """
 import asyncio
 
@@ -181,3 +182,44 @@ def test_reconnect_whose_attempts_all_fail_raises_connection_error(monkeypatch):
     assert delays == [1, 2]
     assert (current, reconnected, running) == (None, False, None)
     assert old.closed
+
+
+def test_cancelled_reconnect_closes_the_socket_and_raises_the_cancel(monkeypatch):
+    """A cancel of reconnect() while it waits for the old reader to end reaches the
+    caller. The old socket is closed first, so no socket stays open with no reader,
+    and a later reconnect() opens a new connection."""
+    client, old = _client(monkeypatch)
+    _no_backoff(monkeypatch)
+    connect = _GatedConnect(client, open_at_once=True)
+    monkeypatch.setattr(client, "_connect", connect)
+    ending = asyncio.Event()
+
+    async def slow_reader():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            ending.set()
+            await asyncio.Event().wait()    # slow to end: only a second cancel ends it
+            raise
+
+    async def run():
+        client._reader = asyncio.create_task(slow_reader())
+        await _settle()
+        task = asyncio.create_task(client.reconnect())
+        await ending.wait()                 # the disconnect cancelled the reader and waits
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        after_cancel = (client._ws, client.connected, client._reconnecting,
+                        len(connect.sockets))
+        await client.reconnect()
+        state = (client._ws, client.connected, client.reconnected)
+        await client._disconnect()
+        return after_cancel, state
+
+    after_cancel, (current, connected, reconnected) = asyncio.run(run())
+    assert old.closed
+    assert after_cancel == (None, False, None, 0)
+    assert len(connect.sockets) == 1
+    assert current is connect.sockets[0]
+    assert (connected, reconnected) == (True, True)

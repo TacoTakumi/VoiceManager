@@ -918,13 +918,23 @@ class VoiceManagerClient:
                                exc_info=True)
 
     async def _disconnect(self) -> None:
-        """Cancel reader task, close WebSocket, drain queues."""
+        """Cancel reader task, close WebSocket, drain queues.
+
+        A cancel of the task that runs this, while it waits for the reader, is
+        raised again once the close is done, so the caller sees it and no socket
+        stays open with no reader.
+        """
+        cancelled = False
         if self._reader is not None:
             self._reader.cancel()
             try:
                 await self._reader
             except asyncio.CancelledError:
-                pass
+                # The reader ends with CancelledError because it was cancelled above.
+                # A cancel of this task lands here too: tell the two apart by the
+                # cancel requests this task has pending.
+                task = asyncio.current_task()
+                cancelled = task is not None and task.cancelling() > 0
 
         if self._ws is not None:
             await self._ws.close()
@@ -942,6 +952,9 @@ class VoiceManagerClient:
                 except asyncio.QueueEmpty:
                     break
             await q.put(None)
+
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def reconnect(self) -> None:
         """Open a new connection to the server, replacing the current one.

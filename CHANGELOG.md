@@ -105,6 +105,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python client: `cancel_tts` and `TTSRequest.cancel` with no connection raise
   `TTSError` and mark nothing. Before, the request stayed in the cancelled set
   of the new connection for good.
+- Python client: a cancel of a task that closes or reopens the connection
+  (`reconnect()`, an automatic reconnect, or leaving `async with`) while it
+  waits for the reader to end now reaches the caller as `CancelledError`. The
+  socket is closed first, so the client has no connection, and `reconnect()`
+  opens a new one. Before, the cancel was swallowed and the task went on to
+  reconnect.
 
 ## [0.9.2]
 
