@@ -41,7 +41,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `unknown_voice`), or None when the server sent none or the connection was
   lost. `synthesize_tts` and `stream_tts` drop the partial audio.
   `stream_tts_live` raises after the audio that it already yielded. A caller
-  that checked for empty audio must now catch `TTSError`.
+  that checked for empty audio must now catch `TTSError`. A request that the
+  caller cancelled with `cancel_tts` raises no `TTSError`, also when the server
+  failed it before the cancel landed: the method returns, or the iteration
+  ends. `synthesize_tts` and `stream_tts` now also end the cancel at the
+  request's `audio_end`, so a cancelled id does not stay in the client.
 
 - Documentation only, no change of behaviour. The client guide
   (`docs/client-integration.md`), `.env.example`, `sidecar/PROTOCOL.md`, some

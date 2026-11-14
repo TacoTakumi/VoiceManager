@@ -16,7 +16,9 @@ it; DuplexSession.audio() yields the audio_end with no client-private key. With
 error frames that carry a request_id: a cancel ack of another id between the
 frame and its audio_end keeps the frame, an earlier request's named frame never
 marks a later request, and no stored frame outlives its request's audio_end, a
-request start or a reconnect, nor grows past a cap.
+request start or a reconnect, nor grows past a cap. A request that the caller
+cancelled raises no TTSError, also when its audio_end has reason error, and its id
+leaves the cancelled set.
 """
 import asyncio
 import json
@@ -561,3 +563,25 @@ async def test_duplex_named_frame_audio_end_has_only_wire_fields(make_client):
     assert ends == [{"type": "audio_end", "request_id": FOREIGN_RID, "reason": "cancelled"},
                     {"type": "audio_end", "request_id": rid, "reason": "error"}]
     assert client._tts_error_frames == {}
+
+
+def _started(rid: str) -> list:
+    """The request starts and sends audio, then nothing more until the test says so."""
+    return [_start(rid), PCM_A]
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+async def test_cancelled_request_that_fails_raises_no_error(make_client, method):
+    """A request the caller cancelled ends quietly, also when its audio_end has reason
+    error: a barge-in loop needs no try block for its own cancel."""
+    client, ws = make_client([_started])
+    task = asyncio.create_task(METHODS[method](client))
+    await _idle(client)
+    rid = client.last_tts_request_id
+    await client.cancel_tts(rid)
+    ws.push(_err_for(rid, "tts_unavailable", UNAVAILABLE_MSG))
+    ws.push(_end(rid, "error"))
+    audio, _ = await asyncio.wait_for(task, timeout=1.0)
+    assert audio == PCM_A
+    # The audio_end ends the cancel, so the id does not stay in the cancelled set.
+    assert rid not in client._cancelled_tts

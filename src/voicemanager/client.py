@@ -1517,6 +1517,17 @@ class VoiceManagerClient:
     # TTS methods
     # ------------------------------------------------------------------
 
+    def _end_cancel(self, request_id: str) -> bool:
+        """At a one-sided request's audio_end, end its cancel, if there is one.
+
+        Returns True when the caller cancelled the request with cancel_tts. Such a
+        request raises no TTSError, also when the server failed it before the
+        cancel landed: the caller asked for it to stop, and it stopped.
+        """
+        cancelled = request_id in self._cancelled_tts
+        self._cancelled_tts.discard(request_id)
+        return cancelled
+
     @staticmethod
     def _tts_request_failed(audio_end: dict) -> TTSError:
         """Build the TTSError for an audio_end with reason "error".
@@ -1546,7 +1557,8 @@ class VoiceManagerClient:
 
         Raises:
             TTSError: If the connection is lost or times out (``error_type`` is
-                None), or if the request's audio_end has reason "error". Then any
+                None), or if the request's audio_end has reason "error" and the
+                caller did not cancel it with cancel_tts. Then any
                 partial audio is dropped, and ``error_type`` holds the error_type
                 of the server's TTS error frame for the request
                 (``tts_unavailable`` or ``unknown_voice``), or None when no such
@@ -1588,7 +1600,8 @@ class VoiceManagerClient:
 
                         elif ftype == "audio_end":
                             if item_rid == request_id:
-                                if item.get("reason") == "error":
+                                if (not self._end_cancel(request_id)
+                                        and item.get("reason") == "error"):
                                     raise self._tts_request_failed(item)
                                 break
                             # else: stale audio_end - discard
@@ -1627,7 +1640,8 @@ class VoiceManagerClient:
 
         Raises:
             TTSError: If the connection is lost or times out (``error_type`` is
-                None), or if the request's audio_end has reason "error". Then any
+                None), or if the request's audio_end has reason "error" and the
+                caller did not cancel it with cancel_tts. Then any
                 partial audio is dropped, and ``error_type`` holds the error_type
                 of the server's TTS error frame for the request
                 (``tts_unavailable`` or ``unknown_voice``), or None when no such
@@ -1692,7 +1706,8 @@ class VoiceManagerClient:
 
                         elif ftype == "audio_end":
                             if item_rid == request_id:
-                                if item.get("reason") == "error":
+                                if (not self._end_cancel(request_id)
+                                        and item.get("reason") == "error"):
                                     raise self._tts_request_failed(item)
                                 break
                             # else: stale audio_end - discard
@@ -1748,7 +1763,8 @@ class VoiceManagerClient:
 
         Raises:
             TTSError: If the connection is lost or times out (``error_type`` is
-                None), or if the request's audio_end has reason "error". Then the
+                None), or if the request's audio_end has reason "error" and the
+                caller did not cancel it with cancel_tts. Then the
                 audio that came before it has already been yielded, and
                 ``error_type`` holds the error_type of the server's TTS error
                 frame for the request (``tts_unavailable`` or ``unknown_voice``),
@@ -1818,8 +1834,8 @@ class VoiceManagerClient:
                         self.last_tts_sample_rate = item.get("sample_rate", 22050)
                         audio_started = True
                     elif ftype == "audio_end" and item_rid == request_id:
-                        self._cancelled_tts.discard(request_id)
-                        if item.get("reason") == "error":
+                        if (not self._end_cancel(request_id)
+                                and item.get("reason") == "error"):
                             raise self._tts_request_failed(item)
                         return
 
@@ -1841,8 +1857,8 @@ class VoiceManagerClient:
                             self.last_tts_sample_rate = item.get("sample_rate", 22050)
                             audio_started = True
                         elif ftype == "audio_end" and item_rid == request_id:
-                            self._cancelled_tts.discard(request_id)
-                            if item.get("reason") == "error":
+                            if (not self._end_cancel(request_id)
+                                    and item.get("reason") == "error"):
                                 raise self._tts_request_failed(item)
                             return
         except TimeoutError:

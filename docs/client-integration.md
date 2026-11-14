@@ -276,7 +276,7 @@ async for pcm_chunk in client.stream_tts_live(token_stream(), voice="Carter"):
 ```
 
 Both raise `TTSError` when the server fails the request (an `audio_end` with
-`reason: "error"`). Its `error_type` tells why. See
+`reason: "error"`) and you did not cancel it. Its `error_type` tells why. See
 [Client method reference](#client-method-reference).
 
 **Per-segment seam.** One-shot synthesis renders the whole string as a single
@@ -1661,7 +1661,10 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 
 **A failed request raises `TTSError`.** `synthesize_tts`, `stream_tts` and
 `stream_tts_live` raise `TTSError` when their request's `audio_end` has
-`reason: "error"`. The error's `error_type` attribute then holds the
+`reason: "error"`, unless you cancelled the request with `cancel_tts`. A
+request you cancelled raises no `TTSError`, also when the server failed it
+before the cancel landed: the method returns the audio so far, or the iteration
+ends. The error's `error_type` attribute then holds the
 `error_type` of the TTS `error` frame the server sent for that request:
 `tts_unavailable` (the engine failed, a later request may succeed) or
 `unknown_voice` (pick a voice from `available_voices`). The message is the
