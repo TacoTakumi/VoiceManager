@@ -359,15 +359,31 @@ def test_cancelled_ids_whose_audio_end_never_comes_do_not_stay_for_good():
 
 
 def test_a_cancelled_id_added_again_after_its_audio_end_keeps_its_new_place():
+    """An id cancelled, cleared by its audio_end and cancelled again is the newest id,
+    so the cap drops the ids added before it first."""
     client = _client()
 
     async def run():
         await client.cancel_tts("again")
-        client._cancelled_tts.discard("again")      # its audio_end was read
-        await client.cancel_tts("again")            # cancelled again, now the oldest
-        for n in range(63):
+        for n in range(62):
             await client.cancel_tts(f"r{n}")
+        client._cancelled_tts.discard("again")      # its audio_end was read
+        await client.cancel_tts("again")            # cancelled again: now the newest
+        await client.cancel_tts("r62")
+        await client.cancel_tts("r63")              # one past the cap
 
     asyncio.run(run())
     assert len(client._cancelled_tts) == 64
     assert "again" in client._cancelled_tts
+    assert "r0" not in client._cancelled_tts
+
+
+@pytest.mark.parametrize("method", ["remove", "pop", "clear", "update"])
+def test_the_cancelled_ids_offer_no_set_method_that_skips_the_cap(method):
+    """Only add, discard, membership, len and iteration keep the order and the cap;
+    any other set method is not there, so a change that needs one fails loudly."""
+    ids = VoiceManagerClient(token="vmp_test")._cancelled_tts
+    ids.add("a")
+    assert set(ids) == {"a"} and ids == {"a"} and len(ids) == 1 and "a" in ids
+    with pytest.raises(AttributeError):
+        getattr(ids, method)
