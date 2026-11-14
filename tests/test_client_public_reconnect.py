@@ -6,7 +6,8 @@ Covers: after a reconnect whose attempts all fail there is no socket, and
 reconnect() opens a new one, so a send works again on it and reconnected is True;
 reconnect() while another reconnect runs waits for that one and opens no
 connection of its own; reconnect() whose attempts all fail raises ConnectionError; a cancel of reconnect()
-while it waits for the old reader reaches the caller after the old socket is closed.
+while it waits for the old reader reaches the caller after the old socket is closed,
+and a cancel that the task swallowed earlier does not make a later reconnect() raise.
 """
 import asyncio
 
@@ -221,5 +222,35 @@ def test_cancelled_reconnect_closes_the_socket_and_raises_the_cancel(monkeypatch
     assert old.closed
     assert after_cancel == (None, False, None, 0)
     assert len(connect.sockets) == 1
+    assert current is connect.sockets[0]
+    assert (connected, reconnected) == (True, True)
+
+
+def test_reconnect_in_a_task_with_an_old_swallowed_cancel_succeeds(monkeypatch):
+    """A task that once swallowed a cancel keeps a pending cancel count of 1. A
+    reconnect() in it that nobody cancels must still open the new connection."""
+    client, old = _client(monkeypatch)
+    _no_backoff(monkeypatch)
+    connect = _GatedConnect(client, open_at_once=True)
+    monkeypatch.setattr(client, "_connect", connect)
+
+    async def run():
+        client._reader = asyncio.create_task(asyncio.Event().wait())
+        await _settle()
+        me = asyncio.current_task()
+        me.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass                            # swallowed, with no uncancel()
+        stale = me.cancelling()
+        await client.reconnect()
+        state = (client._ws, client.connected, client.reconnected)
+        await client._disconnect()
+        return stale, state
+
+    stale, (current, connected, reconnected) = asyncio.run(run())
+    assert stale == 1
+    assert old.closed
     assert current is connect.sockets[0]
     assert (connected, reconnected) == (True, True)

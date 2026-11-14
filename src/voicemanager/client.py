@@ -926,15 +926,17 @@ class VoiceManagerClient:
         """
         cancelled = False
         if self._reader is not None:
+            # Count this task's pending cancel requests first: one that the task
+            # swallowed earlier, with no uncancel(), stays in the count.
+            task = asyncio.current_task()
+            pending = task.cancelling() if task is not None else 0
             self._reader.cancel()
             try:
                 await self._reader
             except asyncio.CancelledError:
                 # The reader ends with CancelledError because it was cancelled above.
-                # A cancel of this task lands here too: tell the two apart by the
-                # cancel requests this task has pending.
-                task = asyncio.current_task()
-                cancelled = task is not None and task.cancelling() > 0
+                # A cancel of this task lands here too: it adds to the count.
+                cancelled = task is not None and task.cancelling() > pending
 
         if self._ws is not None:
             await self._ws.close()
