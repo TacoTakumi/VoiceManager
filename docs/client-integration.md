@@ -595,9 +595,9 @@ and no voiced audio is ever dropped.
 
 **Cancel semantics and measured latency.** The
 [cancel contract](#turn-taking-protocol-surface) is unchanged - fire-and-forget
-`tts_cancel`, exactly one `audio_end` with `reason: "cancelled"`, discard PCM
-until it lands - but this engine honors it faster than the Python engines:
-the `audio_end` ack and the halt of delivered audio are effectively immediate
+`tts_cancel`, exactly one `audio_end` with `reason: "cancelled"` (none for a
+request that already ended), discard PCM until it lands - but this engine
+honors it faster than the Python engines: the `audio_end` ack and the halt of delivered audio are effectively immediate
 (**under 1 ms** measured), because the sidecar is told to stop generating rather
 than being left to run doomed. The sidecar stops within about one vocoder merge
 group (~0.35 s of *generated, undelivered* audio), the warm session is reused,
@@ -945,7 +945,8 @@ interrupted; that doomed task keeps running and will later try to emit its own
 audio and its own `audio_end`, all of which the server silently drops. The
 contract a client can therefore rely on is: **exactly one `audio_end` per
 `request_id`, and no PCM after it.** A cancel of a request whose `audio_end`
-already went out (with reason `complete` or `error`) is therefore a no-op: the
+already went out (with any reason: `complete`, `error`, `cancelled` or
+`interrupted`) is therefore a no-op: the
 server sends no ack, because the request already has its one `audio_end`. Do
 not wait for an ack after such a cancel.
 
@@ -1548,7 +1549,8 @@ semantics.
 #### `tts_cancel` - `TTSCancelMessage`
 
 Cancel an in-flight TTS reply. The server acks with an immediate
-`audio_end` carrying `reason: "cancelled"`.
+`audio_end` carrying `reason: "cancelled"`. A cancel of a reply that already
+ended (its `audio_end` went out) is a no-op: no `audio_end` comes.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -1639,7 +1641,7 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 |---|---|---|
 | `VoiceManagerClient` | `(host="localhost", port=8255, token="", max_retries=3, use_ssl=False)` | Construct a client. No socket opens until you enter the context manager. `max_retries` is the number of attempts of each reconnect: the wait between two attempts starts at 1 s and doubles, up to 8 s. A value that is not an int raises `TypeError`, and a value below 1 raises `ValueError`. |
 | `async with client:` | `__aenter__` / `__aexit__` | Opens the WebSocket, reads the `ready` handshake, starts the single reader task; closes the socket and drains queues on exit. |
-| `reconnect` | `() -> None` | Opens a new connection and closes the current one, if there is one. Use it after a call raised `ConnectionError` because a reconnect failed: the client then has no connection, and every WebSocket call raises "Not connected" until this succeeds. Call it on a client inside `async with`. While a reconnect runs, it waits for that one and opens none of its own. Raises `ConnectionError` when all `max_retries` attempts fail; you can call it again. A cancel of the call ends it with `CancelledError` and leaves the client with no connection, also when the old socket's close then fails (the close error is the cause). On success it sets `reconnected = True`. The new connection is a new session: upload the voice profile again, and opt in to the wake word and the turn engine again. The mic sample counts start at zero, the session listens, and no TTS request is cancelled. |
+| `reconnect` | `() -> None` | Opens a new connection and closes the current one, if there is one. Use it after a call raised `ConnectionError` because a reconnect failed: the client then has no connection, and every WebSocket call raises "Not connected" until this succeeds. Call it on a client inside `async with`. While a reconnect runs, it waits for that one and opens none of its own. Raises `ConnectionError` when all `max_retries` attempts fail; you can call it again. A cancel of a call that runs the reconnect ends it with `CancelledError` and leaves the client with no connection, also when the old socket's close then fails (the close error is the cause). A cancel of a call that waits for the reconnect of another task ends only that wait: the reconnect goes on and can still connect. On success it sets `reconnected = True`. The new connection is a new session: upload the voice profile again, and opt in to the wake word and the turn engine again. The mic sample counts start at zero, the session listens, and no TTS request is cancelled. |
 
 ### Speech to text
 
@@ -1710,7 +1712,7 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `TTSRequest.send` | `(text, flush=False)` | `None` | Append text (the first frame carries `voice` and `chunking`); with `flush` the server speaks the held text now. |
 | `TTSRequest.flush` | `()` | `None` | Speak the held text now and keep the request open. |
 | `TTSRequest.done` | `()` | `None` | End the text; the server answers with one `audio_end`. A later `send` raises. |
-| `TTSRequest.cancel` | `()` | `None` | Stop the reply; the server answers with one `audio_end` carrying `reason: "cancelled"`. |
+| `TTSRequest.cancel` | `()` | `None` | Stop the reply; the server answers with one `audio_end` carrying `reason: "cancelled"`. When the reply already ended (its `audio_end` went out), the cancel is a no-op and no `audio_end` comes. |
 | `DuplexSession.audio` | `()` | `AsyncIterator[tuple]` | Yield `("audio_start", frame)`, `("pcm", bytes, request_id)` and `("audio_end", frame)` in arrival order. The pcm of a cancelled request is dropped until its `audio_end`, which is still yielded. |
 | `DuplexSession.errors` | `()` | `AsyncIterator[dict]` | Yield the server's `error` frames (timeout warnings, invalid requests, `turn_engine_lost`). The client keeps at most the 64 newest frames for it: when nothing reads them, as in one-sided use, the oldest frame drops when a new one comes. |
 | `DuplexSession.enable_turn_engine` | `(engine="tyger", timeout=10.0)` | `str` | Send the `turn_engine` opt-in before the first `send_audio` and wait for `turn_engine_ready`; returns the engine. Raises `TurnEngineError` (its `error_type` is the server's, or `None` on a timeout) on a refusal. |

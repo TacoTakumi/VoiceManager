@@ -279,7 +279,11 @@ class TTSRequest:
         await self._client._send_or_raise(json.dumps(payload), TTSError)
 
     async def cancel(self) -> None:
-        """Stop the reply: the server answers with one audio_end, reason cancelled."""
+        """Stop the reply: the server answers with one audio_end, reason cancelled.
+
+        When the reply already ended (its audio_end went out), the cancel is a no-op
+        on the server and no audio_end comes.
+        """
         self.cancelled = True
         self.done_sent = True
         await self._client.cancel_tts(self.request_id)
