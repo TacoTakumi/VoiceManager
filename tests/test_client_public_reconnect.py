@@ -275,6 +275,11 @@ class _FailingCloseWS(_FakeWS):
         raise RuntimeError("close failed")
 
 
+def _first(q: asyncio.Queue):
+    """The first item of a queue, or "empty", so a failing assert shows every field."""
+    return "empty" if q.empty() else q.get_nowait()
+
+
 def _queues(client) -> tuple:
     return (client._stt_queue, client._tts_queue, client._error_queue, client._turn_queue,
             client._turn_end_queue, client._turn_empty_queue, client._barge_state_queue)
@@ -300,7 +305,7 @@ def test_cancel_during_the_socket_close_resets_the_client(monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await task
         after_cancel = (client._ws, client._reader, client.connected,
-                        [q.get_nowait() for q in _queues(client)])
+                        [_first(q) for q in _queues(client)])
         await client.reconnect()
         state = (client._ws, client.connected)
         await client._disconnect()
@@ -323,7 +328,7 @@ def test_failing_socket_close_resets_the_client_and_raises(monkeypatch):
         with pytest.raises(RuntimeError, match="close failed"):
             await client._disconnect()
         return (client._ws, client._reader, client.connected,
-                [q.get_nowait() for q in _queues(client)])
+                [_first(q) for q in _queues(client)])
 
     assert asyncio.run(run()) == (None, None, False, [None] * 7)
 
