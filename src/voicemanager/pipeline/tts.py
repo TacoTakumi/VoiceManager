@@ -747,6 +747,9 @@ class TTSStreamPipeline:
         effective_tgt_se = self._tts_pipeline.target_se
         effective_sample_rate = 22050 if effective_tgt_se is not None else self._tts_pipeline._engine.sample_rate
         sentences_synthesized = 0
+        # Set when the loop raised an error (not a cancel), so the audio_end that ends
+        # the request says so and the client does not take the request as complete.
+        failed = False
 
         try:
             while True:
@@ -833,6 +836,9 @@ class TTSStreamPipeline:
                     "Streamed TTS sentence: request_id=%s sentence=%s",
                     request_id, sentence[:30],
                 )
+        except Exception:
+            failed = True
+            raise
         finally:
             # Send audio_end after all sentences synthesized
             if not self._audio_started:
@@ -845,7 +851,9 @@ class TTSStreamPipeline:
                 )
             try:
                 await websocket.send_text(
-                    AudioEndMessage(request_id=request_id).model_dump_json()
+                    AudioEndMessage(request_id=request_id,
+                                    reason="error" if failed else "complete")
+                    .model_dump_json()
                 )
             except Exception:
                 logger.debug("Could not send audio_end for request_id=%s", request_id)

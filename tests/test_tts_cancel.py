@@ -1404,17 +1404,17 @@ def test_cancelling_a_one_shot_that_failed_emits_no_second_audio_end():
 
 
 def test_cancelling_a_stream_that_failed_emits_no_second_audio_end():
-    # The stream pipeline sends its audio_end on the way out of a failed synthesis,
-    # then the task raises. A late cancel of the id sends no second audio_end.
+    # The stream pipeline sends audio_end(reason='error') on the way out of a failed
+    # synthesis, then the task raises. A late cancel of the id sends no second one.
     ws = _FakeWebSocket()
 
     async def run():
         session = _session(_FailingEngine(), ws)
         await session.feed_stream(chunk="Hello there.", done=True, request_id="r1")
         await _wait_failed(session)
-        assert len(_ends_of(ws, "r1")) == 1
+        assert _ends_of(ws, "r1") == ["error"]
         await session.cancel("r1")
-        assert len(_ends_of(ws, "r1")) == 1
+        assert _ends_of(ws, "r1") == ["error"]
 
     asyncio.run(run())
 

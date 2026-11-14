@@ -70,6 +70,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Server: a `tts_stream` request on the OpenVoice or VibeVoice engine whose
+  synthesis fails now ends with `audio_end` reason `error`. Before, it ended
+  with reason `complete`, so a client took the failed request as a normal
+  reply. A cancel still ends with the `cancelled` ack.
 - Python client: the queue of error frames that `DuplexSession.errors()`
   reads keeps at most the 64 newest frames. Before, a client that never
   opened a duplex session kept every error frame for its whole life.
