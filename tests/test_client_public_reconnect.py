@@ -400,3 +400,33 @@ def test_cancel_during_the_reader_wait_wins_over_a_close_error(monkeypatch):
     assert cancelled is True
     assert isinstance(cause, RuntimeError) and str(cause) == "close failed"
     assert (ws, reader, connected, opened) == (None, None, False, 0)
+
+
+def test_a_large_max_retries_does_not_stall_the_reconnect(monkeypatch):
+    """Each wait is computed when it is needed, so a huge max_retries costs nothing
+    up front: a reconnect that succeeds on its third attempt returns at once."""
+    import time
+
+    client = VoiceManagerClient(token="vmp_test", max_retries=100_000)
+    client._ws = _FakeWS()
+    client.connected = True
+    delays = _no_backoff(monkeypatch)
+    opened = _GatedConnect(client, open_at_once=True)
+    attempts: list = []
+
+    async def connect():
+        attempts.append(True)
+        if len(attempts) < 3:
+            raise OSError("refused")
+        await opened()
+
+    monkeypatch.setattr(client, "_connect", connect)
+
+    async def run():
+        await client.reconnect()
+        await client._disconnect()
+
+    start = time.monotonic()
+    asyncio.run(run())
+    assert time.monotonic() - start < 1.0
+    assert (len(attempts), delays) == (3, [1, 2])

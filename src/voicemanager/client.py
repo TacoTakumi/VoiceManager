@@ -1083,9 +1083,10 @@ class VoiceManagerClient:
         self._listen_waiters = {}
 
         # max_retries attempts; the wait between two attempts starts at 1 s and
-        # doubles, up to 8 s.
-        delays = [min(2 ** n, _RECONNECT_MAX_WAIT) for n in range(self.max_retries)]
-        for attempt, delay in enumerate(delays):
+        # doubles, up to 8 s. Each wait is computed when it is needed, so a large
+        # max_retries costs nothing up front.
+        delay = 1
+        for attempt in range(self.max_retries):
             try:
                 await self._connect()
                 self.reconnected = True
@@ -1095,17 +1096,18 @@ class VoiceManagerClient:
                 )
                 return
             except Exception:
-                if attempt == len(delays) - 1:
+                if attempt == self.max_retries - 1:
                     raise ConnectionError(
                         f"Failed to reconnect after {self.max_retries} attempts"
                     ) from None
                 self._logger.warning(
                     "Reconnect attempt %d/%d failed, retrying in %ds",
                     attempt + 1,
-                    len(delays),
+                    self.max_retries,
                     delay,
                 )
                 await asyncio.sleep(delay)
+                delay = min(delay * 2, _RECONNECT_MAX_WAIT)
 
     # ------------------------------------------------------------------
     # Reader task (mandatory single reader)
