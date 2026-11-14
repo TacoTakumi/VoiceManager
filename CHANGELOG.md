@@ -22,10 +22,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   frames. See the audio.cpp TTS section of the client guide.
 - Python client: `VoiceManagerClient.reconnect()` opens a new connection.
   Call it after a reconnect that failed with `ConnectionError`: from then on
-  every call raises "Not connected" until a connection is up again. It waits
-  for a reconnect that already runs, sets `reconnected`, and raises
-  `ConnectionError` when its attempts fail. The session state starts over,
-  as after an automatic reconnect.
+  every WebSocket call raises "Not connected" until a connection is up
+  again. It is for a client inside `async with`. It waits for a reconnect
+  that already runs, sets `reconnected`, and raises `ConnectionError` when
+  its attempts fail. The session state starts over, as after an automatic
+  reconnect.
 
 ### Changed
 

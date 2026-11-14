@@ -961,9 +961,11 @@ class VoiceManagerClient:
 
         Call this when a call raised ConnectionError because a reconnect failed
         (every attempt to reach the server failed). The client then has no
-        connection, and every later call raises "Not connected" until this
-        succeeds. It also works with a live connection, which it closes and
-        replaces, and on a client that has no connection yet.
+        connection, and every later WebSocket call raises "Not connected" until
+        this succeeds (the REST calls health(), info() and upload_voice() do not
+        use the socket). It also works with a live connection, which it closes
+        and replaces. Call it on a client inside ``async with``: the context
+        manager opens the first connection and closes the last one.
 
         When a reconnect runs already (one that a lost connection started, or
         another call of this method), this waits for that reconnect and opens

@@ -331,9 +331,10 @@ If the client transparently reconnects mid-session it sets `reconnected = True`
 and starts a fresh server-side session, so a previously uploaded voice profile
 must be re-uploaded (it clears the flag once you do). When every attempt of that
 reconnect fails, the call raises `ConnectionError` and the client has no
-connection: every later call raises "Not connected". Call `await
-client.reconnect()` to open a new connection; it sets `reconnected = True` in the
-same way. For a clean end of work, simply exit the context manager.
+connection: every later WebSocket call raises "Not connected" (the REST calls
+`health()`, `info()` and `upload_voice()` do not use the socket). Inside the
+`async with` block, call `await client.reconnect()` to open a new connection; it
+sets `reconnected = True` in the same way. For a clean end of work, simply exit the context manager.
 
 ## Speech-to-text (STT)
 
@@ -1633,7 +1634,7 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 |---|---|---|
 | `VoiceManagerClient` | `(host="localhost", port=8255, token="", max_retries=3, use_ssl=False)` | Construct a client. No socket opens until you enter the context manager. |
 | `async with client:` | `__aenter__` / `__aexit__` | Opens the WebSocket, reads the `ready` handshake, starts the single reader task; closes the socket and drains queues on exit. |
-| `reconnect` | `() -> None` | Opens a new connection and closes the current one, if there is one. Use it after a call raised `ConnectionError` because a reconnect failed: the client then has no connection, and every call raises "Not connected" until this succeeds. While a reconnect runs, it waits for that one and opens none of its own. Raises `ConnectionError` when all three attempts fail; you can call it again. On success it sets `reconnected = True`. The new connection is a new session: upload the voice profile again, and opt in to the wake word and the turn engine again. The mic sample counts start at zero, the session listens, and no TTS request is cancelled. |
+| `reconnect` | `() -> None` | Opens a new connection and closes the current one, if there is one. Use it after a call raised `ConnectionError` because a reconnect failed: the client then has no connection, and every WebSocket call raises "Not connected" until this succeeds. Call it on a client inside `async with`. While a reconnect runs, it waits for that one and opens none of its own. Raises `ConnectionError` when all three attempts fail; you can call it again. On success it sets `reconnected = True`. The new connection is a new session: upload the voice profile again, and opt in to the wake word and the turn engine again. The mic sample counts start at zero, the session listens, and no TTS request is cancelled. |
 
 ### Speech to text
 
