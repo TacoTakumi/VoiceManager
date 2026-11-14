@@ -922,7 +922,9 @@ class VoiceManagerClient:
 
         A cancel of the task that runs this, while it waits for the reader, is
         raised again once the close is done, so the caller sees it and no socket
-        stays open with no reader.
+        stays open with no reader. A cancel or an error during the socket close
+        reaches the caller too, after the client state is reset and the queues
+        are drained.
         """
         cancelled = False
         if self._reader is not None:
@@ -938,22 +940,28 @@ class VoiceManagerClient:
                 # A cancel of this task lands here too: it adds to the count.
                 cancelled = task is not None and task.cancelling() > pending
 
-        if self._ws is not None:
-            await self._ws.close()
+        try:
+            if self._ws is not None:
+                await self._ws.close()
+        finally:
+            # Also when a cancel or an error stops the close: the client must not
+            # keep a socket that nothing reads. No await here, so a second cancel
+            # cannot cut the reset short.
+            self.connected = False
+            self._ws = None
+            self._reader = None
 
-        self.connected = False
-        self._ws = None
-        self._reader = None
-
-        # Drain all queues - put sentinel None to unblock any waiters
-        for q in (self._stt_queue, self._tts_queue, self._error_queue, self._turn_queue,
-                  self._turn_end_queue, self._turn_empty_queue, self._barge_state_queue):
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-            await q.put(None)
+            # Drain all queues - put sentinel None to unblock any waiters. The
+            # queues are unbounded, so put_nowait never raises QueueFull.
+            for q in (self._stt_queue, self._tts_queue, self._error_queue,
+                      self._turn_queue, self._turn_end_queue, self._turn_empty_queue,
+                      self._barge_state_queue):
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                q.put_nowait(None)
 
         if cancelled:
             raise asyncio.CancelledError

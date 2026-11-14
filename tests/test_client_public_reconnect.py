@@ -7,7 +7,9 @@ reconnect() opens a new one, so a send works again on it and reconnected is True
 reconnect() while another reconnect runs waits for that one and opens no
 connection of its own; reconnect() whose attempts all fail raises ConnectionError; a cancel of reconnect()
 while it waits for the old reader reaches the caller after the old socket is closed,
-and a cancel that the task swallowed earlier does not make a later reconnect() raise.
+and a cancel that the task swallowed earlier does not make a later reconnect() raise;
+a cancel or an error during the old socket's close resets the client and reaches the
+caller.
 """
 import asyncio
 
@@ -254,3 +256,73 @@ def test_reconnect_in_a_task_with_an_old_swallowed_cancel_succeeds(monkeypatch):
     assert old.closed
     assert current is connect.sockets[0]
     assert (connected, reconnected) == (True, True)
+
+
+class _SlowCloseWS(_FakeWS):
+    """A socket whose close waits until the task that runs it is cancelled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closing = asyncio.Event()
+
+    async def close(self) -> None:
+        self.closing.set()
+        await asyncio.Event().wait()
+
+
+class _FailingCloseWS(_FakeWS):
+    async def close(self) -> None:
+        raise RuntimeError("close failed")
+
+
+def _queues(client) -> tuple:
+    return (client._stt_queue, client._tts_queue, client._error_queue, client._turn_queue,
+            client._turn_end_queue, client._turn_empty_queue, client._barge_state_queue)
+
+
+def test_cancel_during_the_socket_close_resets_the_client(monkeypatch):
+    """A cancel of reconnect() while the old socket's close waits reaches the caller,
+    and the client keeps no socket, so no later call sends on a socket nothing reads."""
+    client = VoiceManagerClient(token="vmp_test")
+    old = _SlowCloseWS()
+    client._ws = old
+    client.connected = True
+    _no_backoff(monkeypatch)
+    connect = _GatedConnect(client, open_at_once=True)
+    monkeypatch.setattr(client, "_connect", connect)
+
+    async def run():
+        client._reader = asyncio.create_task(asyncio.Event().wait())
+        await _settle()
+        task = asyncio.create_task(client.reconnect())
+        await old.closing.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        after_cancel = (client._ws, client._reader, client.connected,
+                        [q.get_nowait() for q in _queues(client)])
+        await client.reconnect()
+        state = (client._ws, client.connected)
+        await client._disconnect()
+        return after_cancel, state
+
+    after_cancel, (current, connected) = asyncio.run(run())
+    assert after_cancel == (None, None, False, [None] * 7)
+    assert current is connect.sockets[0]
+    assert connected is True
+
+
+def test_failing_socket_close_resets_the_client_and_raises(monkeypatch):
+    client = VoiceManagerClient(token="vmp_test")
+    client._ws = _FailingCloseWS()
+    client.connected = True
+
+    async def run():
+        client._reader = asyncio.create_task(asyncio.Event().wait())
+        await _settle()
+        with pytest.raises(RuntimeError, match="close failed"):
+            await client._disconnect()
+        return (client._ws, client._reader, client.connected,
+                [q.get_nowait() for q in _queues(client)])
+
+    assert asyncio.run(run()) == (None, None, False, [None] * 7)

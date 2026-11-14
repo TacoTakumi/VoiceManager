@@ -112,6 +112,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   socket is closed first, so the client has no connection, and `reconnect()`
   opens a new one. Before, the cancel was swallowed and the task went on to
   reconnect.
+- Python client: a cancel or an error during the socket close, when the
+  client closes or reopens the connection, no longer leaves the client with a
+  socket that nothing reads. The client now has no connection, the waiting
+  calls end, and the cancel or the error reaches the caller. Before, the
+  client kept the socket, `connected` stayed true, and later calls sent on a
+  socket that nothing read.
 
 ## [0.9.2]
 
