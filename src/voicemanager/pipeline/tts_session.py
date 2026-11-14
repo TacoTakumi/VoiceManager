@@ -58,6 +58,7 @@ clears.
 import asyncio
 import collections
 import functools
+import json
 import logging
 
 from voicemanager.pipeline.tts import TTSPipeline, TTSStreamPipeline
@@ -81,10 +82,13 @@ class _GuardedSocket:
     the frames are dropped at the door rather than raced against.
     """
 
-    def __init__(self, websocket, request_id: str, is_cancelled, tap=None):
+    def __init__(self, websocket, request_id: str, is_cancelled, tap=None, on_end=None):
         self._websocket = websocket
         self._request_id = request_id
         self._is_cancelled = is_cancelled  # callable: (request_id) -> bool
+        # callable: (request_id) -> None, called once this request's audio_end went out,
+        # whatever its reason, so the session knows the request has its terminal frame.
+        self._on_end = on_end
         # callable: () -> the session's audio tap or None. Read per frame, so a tap
         # set after this request began still sees the rest of it.
         self._tap = tap
@@ -94,6 +98,11 @@ class _GuardedSocket:
             logger.debug("Dropped text frame from cancelled request_id=%s", self._request_id)
             return
         await self._websocket.send_text(data)
+        if self._on_end is not None and '"audio_end"' in data:
+            frame = json.loads(data)
+            if (frame.get("type") == "audio_end"
+                    and frame.get("request_id") == self._request_id):
+                self._on_end(self._request_id)
         tap = self._tap() if self._tap is not None else None
         if tap is not None:
             _call_tap(tap.on_tts_text, self._request_id, data)
@@ -204,11 +213,16 @@ class TTSSession:
             self._dead_ids.append(request_id)
 
     def _is_completed(self, request_id: str) -> bool:
-        """True once this id finished on its own and sent its audio_end('complete')."""
+        """True once this id sent its own terminal audio_end, of any reason."""
         return request_id in self._completed_ids
 
     def _mark_completed(self, request_id: str) -> None:
-        """Record that this id already reached its terminal audio_end via normal completion."""
+        """Record that this id already reached its terminal audio_end on its own.
+
+        Called by the guarded socket the moment the request's audio_end goes out, also
+        one with reason 'error' from a synthesis that then raises, and by the
+        done-callback when a task finishes normally.
+        """
         if request_id not in self._completed_ids:
             self._completed_ids.append(request_id)
 
@@ -218,8 +232,9 @@ class TTSSession:
         A task that COMPLETED normally has already sent its own audio_end('complete'), so
         the id is terminal: a later cancel of it must be a no-op, not a second audio_end.
         A task that was CANCELLED (a tts_cancel or a supersede) is skipped - cancel() has
-        already acked and marked it dead - and so is one that errored out (no clean
-        audio_end went out to be a duplicate of).
+        already acked and marked it dead - and so is one that errored out. When an
+        errored task's audio_end went out, its guarded socket has already marked the id;
+        when none went out, the id stays open, so a later cancel still acks it.
 
         Attached at dispatch, BEFORE anything awaits the task, so it runs ahead of any
         waiter (wait_idle) and the id is marked the instant the task settles.
@@ -228,7 +243,7 @@ class TTSSession:
             return
         exc = task.exception()
         if exc is not None:
-            # No clean audio_end('complete') went out, so this id is NOT terminal. Log it
+            # Terminal only if its audio_end went out (the guarded socket marked it). Log it
             # rather than let it vanish - reading exception() here retrieves it, which would
             # otherwise suppress asyncio's "Task exception was never retrieved" diagnostic.
             logger.warning("TTS synthesis for request_id=%s failed: %r", request_id, exc)
@@ -238,7 +253,7 @@ class TTSSession:
     def _socket_for(self, request_id: str) -> _GuardedSocket:
         """The socket this request's synthesis task speaks through - silenced if cancelled."""
         return _GuardedSocket(self._websocket, request_id, self._is_cancelled,
-                              tap=self._current_tap)
+                              tap=self._current_tap, on_end=self._mark_completed)
 
     def _current_tap(self):
         return self.audio_tap

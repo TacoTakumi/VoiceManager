@@ -1345,3 +1345,91 @@ def test_cancelling_an_unrelated_id_leaves_the_in_flight_request_running():
         _assert_last_audio_start_wins(ws)  # single-flight ordering held throughout
 
     asyncio.run(run())
+
+
+# --- a request that failed after its audio_end went out --------------------
+
+class _FailingEngine:
+    """Every synthesis raises before it yields any audio."""
+
+    @property
+    def sample_rate(self) -> int:
+        return 24000
+
+    async def stream_synthesize(self, text: str, **kwargs):
+        raise RuntimeError("engine failed")
+        yield  # pragma: no cover - makes this an async generator
+
+
+class _AudioStartFailsWebSocket(_FakeWebSocket):
+    """The first audio_start send fails, so the request raises before any audio_end."""
+
+    def __init__(self):
+        super().__init__()
+        self._failed = False
+
+    async def send_text(self, data: str) -> None:
+        if not self._failed and json.loads(data)["type"] == "audio_start":
+            self._failed = True
+            raise RuntimeError("socket send failed")
+        await super().send_text(data)
+
+
+async def _wait_failed(session) -> None:
+    """Wait for a request whose synthesis raised; wait_idle raises that error again."""
+    try:
+        await asyncio.wait_for(session.wait_idle(), 2.0)
+    except RuntimeError:
+        pass
+
+
+def _ends_of(ws: _FakeWebSocket, rid: str) -> list:
+    return [e["reason"] for e in ws.audio_ends() if e["request_id"] == rid]
+
+
+def test_cancelling_a_one_shot_that_failed_emits_no_second_audio_end():
+    # The one-shot path sends audio_end(reason='error') and then raises. That audio_end
+    # is the request's one terminal frame, so a late cancel of the id is a no-op.
+    ws = _FakeWebSocket()
+
+    async def run():
+        session = _session(_FailingEngine(), ws)
+        await session.speak(text="Hello there.", request_id="r1")
+        await _wait_failed(session)
+        assert _ends_of(ws, "r1") == ["error"]
+        await session.cancel("r1")
+        assert _ends_of(ws, "r1") == ["error"]
+
+    asyncio.run(run())
+
+
+def test_cancelling_a_stream_that_failed_emits_no_second_audio_end():
+    # The stream pipeline sends its audio_end on the way out of a failed synthesis,
+    # then the task raises. A late cancel of the id sends no second audio_end.
+    ws = _FakeWebSocket()
+
+    async def run():
+        session = _session(_FailingEngine(), ws)
+        await session.feed_stream(chunk="Hello there.", done=True, request_id="r1")
+        await _wait_failed(session)
+        assert len(_ends_of(ws, "r1")) == 1
+        await session.cancel("r1")
+        assert len(_ends_of(ws, "r1")) == 1
+
+    asyncio.run(run())
+
+
+def test_cancelling_a_request_that_failed_before_any_audio_end_still_acks():
+    # A task that raised before any audio_end went out left the client with no
+    # terminal frame, so the cancel ack is still sent: it is the one audio_end.
+    ws = _AudioStartFailsWebSocket()
+
+    async def run():
+        session = _session(_FakeEngine(), ws)
+        await session.speak(text="Hello there.", request_id="r1")
+        await _wait_failed(session)
+        assert _ends_of(ws, "r1") == []
+        await session.cancel("r1")
+        assert _ends_of(ws, "r1") == ["cancelled"]
+
+    asyncio.run(run())

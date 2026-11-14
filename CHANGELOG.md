@@ -70,6 +70,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Server: a `tts_cancel` that comes after a request's error `audio_end` no
+  longer sends a second `audio_end` for that request. The rule that a request
+  gets at most one `audio_end` now holds for a request that failed too, on the
+  one-shot and the streaming path. A request that failed before any
+  `audio_end` went out still gets the cancel ack.
 - The audiocpp engine: a `tts_stream` request whose engine fails (for example
   a TTS sidecar that cannot load its model because the card is full) no longer
   ends like a normal reply with no audio. It ends with the new
