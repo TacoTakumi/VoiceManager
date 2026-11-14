@@ -110,8 +110,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`reconnect()`, an automatic reconnect, or leaving `async with`) while it
   waits for the reader to end now reaches the caller as `CancelledError`. The
   socket is closed first, so the client has no connection, and `reconnect()`
-  opens a new one. Before, the cancel was swallowed and the task went on to
-  reconnect.
+  opens a new one. Before, the cancel was swallowed and the task went on as
+  if it was not cancelled.
 - Python client: a cancel or an error during the socket close, when the
   client closes or reopens the connection, no longer leaves the client with a
   socket that nothing reads. The client now has no connection, the waiting

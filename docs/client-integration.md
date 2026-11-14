@@ -1662,10 +1662,8 @@ Every method is a coroutine (`await` it) unless marked. `stream_stt_live` and
 
 **A failed request raises `TTSError`.** `synthesize_tts`, `stream_tts` and
 `stream_tts_live` raise `TTSError` when their request's `audio_end` has
-`reason: "error"`, unless you cancelled the request with `cancel_tts`. A
-request you cancelled raises no `TTSError`, also when the server failed it
-before the cancel landed: the method returns the audio so far, or the iteration
-ends. The error's `error_type` attribute then holds the
+`reason: "error"`, unless you cancelled the request (see the end of this
+paragraph). The error's `error_type` attribute holds the
 `error_type` of the TTS `error` frame the server sent for that request:
 `tts_unavailable` (the engine failed, a later request may succeed) or
 `unknown_voice` (pick a voice from `available_voices`). The message is the
@@ -1681,7 +1679,10 @@ has already yielded the audio that came before the `audio_end`, then it raises.
 The `error` frame also still goes to the error queue that
 `DuplexSession.errors()` reads. A lost connection or a timeout also raises
 `TTSError`, with `error_type` `None`. The reasons `complete`, `cancelled` and
-`interrupted` do not raise: the method returns, or the iteration ends.
+`interrupted` do not raise: the method returns, or the iteration ends. A
+request you cancelled with `cancel_tts` raises no `TTSError`, also when the
+server failed it before the cancel landed: the method returns the audio so far,
+or the iteration ends.
 
 ### Full duplex: `duplex()`
 
