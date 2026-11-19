@@ -41,6 +41,8 @@ _TURN_ENGINE_REFUSALS = ("invalid_request", "turn_engine_unavailable",
 # The error_type the server sends once when the turn engine's process exits; the
 # session then goes on as one that never opted in.
 _TURN_ENGINE_LOST = "turn_engine_lost"
+# The frame types that DuplexSession.turn_frames() gives on one stream.
+_TURN_FRAME_TYPES = ("transcription", "turn_end", "turn_empty")
 # How the message of the server's invalid_request error frame starts when it refuses
 # a wake_word opt-in. The refusal has no error_type of its own, so the message tells
 # it from the other invalid_request frames.
@@ -317,6 +319,12 @@ class DuplexSession:
     turn_empty frame in place of turn_end, and ``turn_empties()`` yields it. Its
     ``speech`` is True when the user spoke and no words came, so a session that
     waits for an answer can ask again.
+
+    Turns in order: a final that the server sent before a turn_end is a part of that
+    turn, and a frame sent after it belongs to the next turn. Tasks that read
+    ``transcripts()``, ``turn_ends()`` and ``turn_empties()`` apart lose that order.
+    ``turn_frames()`` gives the three frame types on one stream in the order of
+    arrival; call it before the first ``send_audio`` and read turns from it alone.
 
     Barge state: a server that runs the pre-filter for speakers sends no barge until
     it has learned the user's voice. ``barge_state`` is then ``"learning"`` and later
@@ -736,6 +744,33 @@ class DuplexSession:
                     client._cancelled_tts.add(rid)
                 yield ("barge", item)
 
+    def turn_frames(self) -> AsyncIterator[dict]:
+        """Yield every transcription, turn_end and turn_empty frame on one stream, in
+        the order the server sent them.
+
+        A final that the server sent before a turn_end is a part of that turn, and a
+        frame that it sent after the turn_end belongs to the next one. The turn_id
+        does not tell them apart on a connection that sends no turn_start, where it
+        is 0 on every frame. Separate readers of ``transcripts()``, ``turn_ends()``
+        and ``turn_empties()`` lose the order between the streams.
+
+        Call this before the first ``send_audio``. From the call on, the three frame
+        types come here only, and ``transcripts()``, ``turn_ends()`` and
+        ``turn_empties()`` yield none of them; frames that arrived before the call
+        stay on those streams. The choice holds for the life of the client, also on
+        the connection that a reconnect opens. Tell the frames apart by ``type``; a
+        transcription frame has its ``turn_id`` as on ``transcripts()``. The stream
+        ends when its connection closes; call again for the next connection.
+        """
+        self._client._ordered_turn_frames = True
+        return self._turn_frames(self._client._turn_frame_queue)
+
+    async def _turn_frames(self, queue: asyncio.Queue) -> AsyncIterator[dict]:
+        while (frame := await queue.get()) is not None:
+            if frame.get("type") == "transcription":
+                frame = self._client._stamp_turn_id(frame)
+            yield frame
+
     async def turn_ends(self) -> AsyncIterator[dict]:
         """Yield every turn_end frame as it arrives (opted-in connections only)."""
         while (frame := await self._client._turn_end_queue.get()) is not None:
@@ -830,6 +865,12 @@ class VoiceManagerClient:
         self._turn_end_queue: asyncio.Queue = asyncio.Queue()
         # turn_empty frames: a turn that ended with no words.
         self._turn_empty_queue: asyncio.Queue = asyncio.Queue()
+        # Transcription, turn_end and turn_empty frames in the order of arrival,
+        # once a session asked for them with turn_frames(). The three queues above
+        # get none of them then. The choice is how the application reads, not
+        # server state, so a reconnect keeps it.
+        self._turn_frame_queue: asyncio.Queue = asyncio.Queue()
+        self._ordered_turn_frames = False
         # barge_state frames, from a server that runs the pre-filter, and the state
         # of the last one (None until one comes, and again after turn_engine_lost).
         self._barge_state_queue: asyncio.Queue = asyncio.Queue()
@@ -1027,7 +1068,7 @@ class VoiceManagerClient:
             # queues are unbounded, so put_nowait never raises QueueFull.
             for q in (self._stt_queue, self._tts_queue, self._error_queue,
                       self._turn_queue, self._turn_end_queue, self._turn_empty_queue,
-                      self._barge_state_queue):
+                      self._turn_frame_queue, self._barge_state_queue):
                 while not q.empty():
                     try:
                         q.get_nowait()
@@ -1115,6 +1156,7 @@ class VoiceManagerClient:
         self._turn_queue = asyncio.Queue()
         self._turn_end_queue = asyncio.Queue()
         self._turn_empty_queue = asyncio.Queue()
+        self._turn_frame_queue = asyncio.Queue()
         self._barge_state_queue = asyncio.Queue()
         self.barge_state = None
         self._wake_queue = asyncio.Queue()
@@ -1182,7 +1224,11 @@ class VoiceManagerClient:
                 else:
                     frame = json.loads(msg)
                     ftype = frame.get("type")
-                    if ftype == "transcription":
+                    if ftype in _TURN_FRAME_TYPES and self._ordered_turn_frames:
+                        # One queue for the three types, filled here in wire order
+                        # with no suspend (the queue is unbounded).
+                        self._turn_frame_queue.put_nowait(frame)
+                    elif ftype == "transcription":
                         await self._stt_queue.put(frame)
                     elif ftype == "audio_start":
                         await self._tts_queue.put(frame)
@@ -1295,6 +1341,7 @@ class VoiceManagerClient:
             await self._turn_queue.put(None)
             await self._turn_end_queue.put(None)
             await self._turn_empty_queue.put(None)
+            await self._turn_frame_queue.put(None)
             await self._barge_state_queue.put(None)
             await self._error_queue.put(None)
 
