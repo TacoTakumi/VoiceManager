@@ -910,6 +910,13 @@ connection that never opens a turn leaves every frame at `turn_id: 0`. The
 Python client guarantees the key is present on every transcription dict via
 `_stamp_turn_id`, so consumers can read `frame["turn_id"]` unconditionally.
 
+The `turn_id` changes only at a `turn_start`. A
+[turn engine](#turn-engine) connection needs no `turn_start`: the server ends
+each turn with `turn_end`. On such a connection that sends no `turn_start`,
+every transcription frame and every `turn_end` has `turn_id: 0`, so the
+`turn_id` does not tell one turn from the next there. The order of the frames
+does (see [Read the frames of a turn in order](#read-the-frames-of-a-turn-in-order)).
+
 ```json
 { "type": "transcription", "text": "book me a flight to boston", "is_final": true, "turn_id": 4, "segment_index": 3 }
 ```
@@ -1006,6 +1013,29 @@ client -> clears its playback, then { "type": "playback", "event": "stop", ... }
 ```
 
 For a complete client, see `scripts/voice_agent.py classic --turn-engine tyger`. It opts in, sends the `playback` frames, ends a turn on `turn_end` and clears its playback on a `barge`.
+
+### Read the frames of a turn in order
+
+The order in which the server sends the frames is the rule that puts a frame in a turn:
+
+- A final that the server sent before a `turn_end` is a part of that turn.
+- A transcription frame that the server sent after a `turn_end` or a `turn_empty` belongs to the next turn.
+
+A client must keep that order from the socket to the code that builds the turn. Do not sort by `turn_id`: a connection that sends no `turn_start` has `turn_id: 0` on every frame (see [`turn_id` on transcription frames](#4-turn_id-on-transcription-frames)). A client that puts transcription frames on one queue and `turn_end` frames on another, and reads the queues with separate tasks, loses the order between them. When a `turn_end` is then handled before the last finals of its turn, those finals move to the next turn.
+
+Read `transcription`, `turn_end` and `turn_empty` frames with one reader, in the order of arrival. In the Python client, `DuplexSession.turn_frames()` gives the three frame types on one stream in the server's order. Call it before the first `send_audio`. From the call on, `transcripts()`, `turn_ends()` and `turn_empties()` yield none of these frames, and the choice holds on the connection that a reconnect opens. The stream ends when its connection closes. Tell the frames apart by `type`:
+
+```python
+async for frame in session.turn_frames():      # one task reads all three types
+    if frame["type"] == "transcription":
+        show(frame)                            # a part of the turn that is open
+    elif frame["type"] == "turn_end":
+        answer(frame["text"])                  # the turn ended; later frames are the next turn
+    elif frame["type"] == "turn_empty":
+        pass                                   # the turn ended with no words
+```
+
+The stream also works on a connection with no turn engine. It then gives only transcription frames.
 
 ### Barge-in on speakers: the experimental pre-filter
 
@@ -1721,6 +1751,7 @@ another read transcripts, a third feed a reply and a fourth play audio.
 | `DuplexSession.playback_stop` | `(request, mic_sample=None, *, reply_sample)` | `None` | Send `playback` `stop`, with `reply_sample` in samples of the reply at its `audio_start` rate. |
 | `DuplexSession.turn_ends` | `()` | `AsyncIterator[dict]` | Yield each `turn_end` frame of an opted-in connection. |
 | `DuplexSession.turn_empties` | `()` | `AsyncIterator[dict]` | Yield each `turn_empty` frame of an opted-in connection: a turn that ended with no words. Its `speech` is `True` when the user spoke and the STT gave no text. |
+| `DuplexSession.turn_frames` | `()` | `AsyncIterator[dict]` | Yield every `transcription`, `turn_end` and `turn_empty` frame on one stream in the server's order. Call it before the first `send_audio`. From the call on, `transcripts`, `turn_ends` and `turn_empties` yield none of them. See [Read the frames of a turn in order](#read-the-frames-of-a-turn-in-order). Not a coroutine. |
 | `DuplexSession.barge_state` | property | `str \| None` | `"learning"` or `"ready"` from the server's last `barge_state` frame. `None` when the server sent none (no pre-filter, or no turn engine) and after `turn_engine_lost`. |
 | `DuplexSession.barge_states` | `()` | `AsyncIterator[dict]` | Yield each `barge_state` frame, from a server that runs the pre-filter. |
 | `DuplexSession.listen_stop` | `(timeout=5.0)` | `int \| None` | Stop listening: the session stops first, so `send_audio` drops frames from then on (on a session that opted in to the wake word it sends them as dormant audio and does not count them), then it sends `listen_stop` and returns the `mic_sample` of `listen_stopped`. Logs a warning when that count differs from `mic_sample`. Returns `None`, still stopped, when no answer comes within `timeout` (a server older than 0.8.0) or the connection closes. Sends the frame again when already stopped. |
