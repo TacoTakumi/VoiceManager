@@ -13,7 +13,9 @@ import asyncio
 import json
 from unittest.mock import AsyncMock
 
-from voicemanager.client import VoiceManagerClient
+import pytest
+
+from voicemanager.client import VoiceManagerClient, VoiceManagerError
 
 
 class _FakeServerWS:
@@ -213,6 +215,51 @@ def test_a_later_session_that_does_not_ask_for_the_one_stream_gets_its_three_str
         async with client.duplex() as session:
             session.turn_frames()
         async with client.duplex() as session:
+            ws.push(_final(0, "hello"))
+            ws.push(_turn_end("hello"))
+            ws.push(TURN_EMPTY)
+            ws.end()
+            async with asyncio.timeout(3):
+                return ([f async for f in session.transcripts()],
+                        [f async for f in session.turn_ends()],
+                        [f async for f in session.turn_empties()])
+    transcripts, ends, empties = asyncio.run(run())
+    assert _kinds(transcripts) == [("transcription", "hello")]
+    assert _kinds(ends) == [("turn_end", "hello")]
+    assert empties == [TURN_EMPTY]
+
+
+def test_a_closed_session_cannot_ask_for_the_one_stream_and_one_sided_stt_still_reads():
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def chunks():
+        yield b"\x00" * 320
+        ws.push(_final(0, "hello"))
+        ws.end()
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            pass
+        with pytest.raises(VoiceManagerError, match="closed"):
+            session.turn_frames()
+        async with asyncio.timeout(3):
+            return [f async for f in client.stream_stt_live(chunks())]
+    assert _kinds(asyncio.run(run())) == [("transcription", "hello")]
+
+
+def test_a_closed_session_cannot_take_the_three_streams_from_the_open_session():
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as closed:
+            pass
+        async with client.duplex() as session:
+            with pytest.raises(VoiceManagerError, match="closed"):
+                closed.turn_frames()
             ws.push(_final(0, "hello"))
             ws.push(_turn_end("hello"))
             ws.push(TURN_EMPTY)

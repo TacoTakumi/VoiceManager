@@ -764,7 +764,13 @@ class DuplexSession:
         the connection that a reconnect opens. Tell the frames apart by ``type``; a
         transcription frame has its ``turn_id`` as on ``transcripts()``. The stream
         ends when its connection closes; call again for the next connection.
+
+        Raises:
+            VoiceManagerError: If the session is closed. The choice is the open
+                session's, so a closed one cannot make it.
         """
+        if self.closed:
+            raise VoiceManagerError("the duplex session is closed")
         self._client._ordered_turn_frames = True
         return self._turn_frames(self._client._turn_frame_queue)
 
