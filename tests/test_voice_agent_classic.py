@@ -1177,15 +1177,12 @@ class _LiveDuplex:
         self.requests.append(req)
         return req
 
-    async def transcripts(self):
-        await asyncio.Event().wait()
-        yield {}
-
     async def audio(self):
         await asyncio.Event().wait()
         yield ()
 
-    async def turn_ends(self):
+    async def turn_frames(self):
+        # The agent reads its transcription and turn_end frames from this one stream.
         yield _turn_end("hello there")
         await asyncio.Event().wait()
 

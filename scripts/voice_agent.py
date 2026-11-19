@@ -836,20 +836,27 @@ async def classic(args: argparse.Namespace) -> None:
                 say(f"listening (stt {client.stt_engine}, tts {client.tts_engine}); "
                     f"{ends}; Ctrl-C to stop")
 
-                async def transcripts() -> None:
-                    async for frame in duplex.transcripts():
-                        await session.on_transcript(frame, session.clock())
+                async def turn_frames() -> None:
+                    # One task reads the transcription and turn_end frames from one
+                    # stream, so a final that the server sent before a turn_end is
+                    # handled before it. Two tasks on two streams lose that order.
+                    async for frame in duplex.turn_frames():
+                        kind = frame.get("type")
+                        if kind == "transcription":
+                            await session.on_transcript(frame, session.clock())
+                        elif kind == "turn_end":
+                            await session.on_turn_end(frame, session.clock())
                     logger.warning("VoiceManager closed the connection")
 
                 async def audio() -> None:
                     async for event in duplex.audio():
                         await session.on_event(event, session.clock())
 
-                coros = [microturn_client._mic_task(duplex, mic_clock), transcripts(),
+                coros = [microturn_client._mic_task(duplex, mic_clock), turn_frames(),
                          audio(), drain_errors(duplex, say, on_frame=session.on_error_frame)]
                 if args.turn_engine:
-                    coros += [_turn_end_task(duplex, session),
-                              _playback_task(session, player, asyncio.get_running_loop())]
+                    coros.append(
+                        _playback_task(session, player, asyncio.get_running_loop()))
                 tasks = [asyncio.create_task(c) for c in coros]
                 try:
                     await asyncio.wait(tasks, timeout=args.duration,
@@ -879,12 +886,6 @@ async def classic(args: argparse.Namespace) -> None:
         print(f"capture: {mic_path}  {out_path}  {json_path}")
     if session is not None:
         print(session.summary_line())
-
-
-async def _turn_end_task(duplex, session: ClassicSession) -> None:
-    """Feed the server's turn_end frames to the session until the connection closes."""
-    async for frame in duplex.turn_ends():
-        await session.on_turn_end(frame, session.clock())
 
 
 async def _playback_task(session: ClassicSession, player: "TrackedPlayer",
