@@ -4,6 +4,27 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0]
+
+### Added
+
+- Python client: `DuplexSession.turn_frames()` yields every `transcription`,
+  `turn_end` and `turn_empty` frame on one stream, in the order the server
+  sent them. That order puts a frame in a turn: a final sent before a
+  `turn_end` is a part of that turn, and a frame sent after it belongs to the
+  next turn. Tasks that read `transcripts()`, `turn_ends()` and
+  `turn_empties()` apart lose the order, and the `turn_id` cannot replace it
+  on a connection that sends no `turn_start`, where it is 0 on every frame.
+  Call `turn_frames()` before the first `send_audio`. From the call on, the
+  three older streams yield none of these frames, and the choice holds across
+  a reconnect. A session that does not call it is unchanged. See "Read the
+  frames of a turn in order" in the client guide.
+
+### Changed
+
+- `scripts/voice_agent.py` reads its transcription and `turn_end` frames with
+  one task from `turn_frames()`.
+
 ## [0.10.0]
 
 ### Added
