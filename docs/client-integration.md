@@ -1023,7 +1023,7 @@ The order in which the server sends the frames is the rule that puts a frame in 
 
 A client must keep that order from the socket to the code that builds the turn. Do not sort by `turn_id`: a connection that sends no `turn_start` has `turn_id: 0` on every frame (see [`turn_id` on transcription frames](#4-turn_id-on-transcription-frames)). A client that puts transcription frames on one queue and `turn_end` frames on another, and reads the queues with separate tasks, loses the order between them. When a `turn_end` is then handled before the last finals of its turn, those finals move to the next turn.
 
-Read `transcription`, `turn_end` and `turn_empty` frames with one reader, in the order of arrival. In the Python client, `DuplexSession.turn_frames()` gives the three frame types on one stream in the server's order. Call it before the first `send_audio`. From the call on, `transcripts()`, `turn_ends()` and `turn_empties()` yield none of these frames, and the choice holds on the connection that a reconnect opens. The stream ends when its connection closes. Tell the frames apart by `type`:
+Read `transcription`, `turn_end` and `turn_empty` frames with one reader, in the order of arrival. In the Python client, `DuplexSession.turn_frames()` gives the three frame types on one stream in the server's order. Call it before the first `send_audio`. From the call on, `transcripts()`, `turn_ends()` and `turn_empties()` yield none of these frames. The choice holds until the session closes, also on the connection that a reconnect opens. The stream ends when its connection closes, so call `turn_frames()` again after a reconnect. Tell the frames apart by `type`:
 
 ```python
 async for frame in session.turn_frames():      # one task reads all three types

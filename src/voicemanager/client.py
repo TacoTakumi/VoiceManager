@@ -383,6 +383,9 @@ class DuplexSession:
         self.closed = True
         if client._duplex is self:
             client._duplex = None
+        # The one stream was this session's choice. The one-sided methods and a
+        # later session read the three older queues.
+        client._ordered_turn_frames = False
         if not client._listen_stopped:
             return
         client._listen_stopped = False
@@ -757,7 +760,7 @@ class DuplexSession:
         Call this before the first ``send_audio``. From the call on, the three frame
         types come here only, and ``transcripts()``, ``turn_ends()`` and
         ``turn_empties()`` yield none of them; frames that arrived before the call
-        stay on those streams. The choice holds for the life of the client, also on
+        stay on those streams. The choice holds until this session closes, also on
         the connection that a reconnect opens. Tell the frames apart by ``type``; a
         transcription frame has its ``turn_id`` as on ``transcripts()``. The stream
         ends when its connection closes; call again for the next connection.
@@ -867,8 +870,8 @@ class VoiceManagerClient:
         self._turn_empty_queue: asyncio.Queue = asyncio.Queue()
         # Transcription, turn_end and turn_empty frames in the order of arrival,
         # once a session asked for them with turn_frames(). The three queues above
-        # get none of them then. The choice is how the application reads, not
-        # server state, so a reconnect keeps it.
+        # get none of them then. The choice is how the session reads, not server
+        # state, so a reconnect keeps it. It ends when the session closes.
         self._turn_frame_queue: asyncio.Queue = asyncio.Queue()
         self._ordered_turn_frames = False
         # barge_state frames, from a server that runs the pre-filter, and the state

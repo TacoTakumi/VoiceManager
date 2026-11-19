@@ -183,3 +183,45 @@ def test_the_choice_of_the_one_stream_holds_on_the_next_connection(monkeypatch):
     assert ended == []
     assert _kinds(got) == _kinds(sent)
     assert old_queues_empty
+
+
+def test_the_choice_ends_with_its_session_so_one_sided_stt_reads_transcriptions_again():
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def chunks():
+        yield b"\x00" * 320
+        ws.push(_final(0, "hello"))
+        ws.end()
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            session.turn_frames()
+        async with asyncio.timeout(3):
+            return [f async for f in client.stream_stt_live(chunks())]
+    assert _kinds(asyncio.run(run())) == [("transcription", "hello")]
+    assert client._turn_frame_queue.qsize() == 1  # the end sentinel only
+
+
+def test_a_later_session_that_does_not_ask_for_the_one_stream_gets_its_three_streams():
+    ws = _FakeServerWS()
+    client = _client(ws)
+
+    async def run():
+        _start_reader(client)
+        async with client.duplex() as session:
+            session.turn_frames()
+        async with client.duplex() as session:
+            ws.push(_final(0, "hello"))
+            ws.push(_turn_end("hello"))
+            ws.push(TURN_EMPTY)
+            ws.end()
+            async with asyncio.timeout(3):
+                return ([f async for f in session.transcripts()],
+                        [f async for f in session.turn_ends()],
+                        [f async for f in session.turn_empties()])
+    transcripts, ends, empties = asyncio.run(run())
+    assert _kinds(transcripts) == [("transcription", "hello")]
+    assert _kinds(ends) == [("turn_end", "hello")]
+    assert empties == [TURN_EMPTY]

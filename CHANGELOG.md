@@ -16,8 +16,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `turn_empties()` apart lose the order, and the `turn_id` cannot replace it
   on a connection that sends no `turn_start`, where it is 0 on every frame.
   Call `turn_frames()` before the first `send_audio`. From the call on, the
-  three older streams yield none of these frames, and the choice holds across
-  a reconnect. A session that does not call it is unchanged. See "Read the
+  three older streams yield none of these frames. The choice holds across a
+  reconnect and ends when the session closes. A session that does not call it
+  is unchanged. See "Read the
   frames of a turn in order" in the client guide.
 
 ### Changed
