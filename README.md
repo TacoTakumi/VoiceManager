@@ -102,13 +102,13 @@ Then set up the engines you want. Each subsection below is independent.
 
 ### audio.cpp engine (STT and TTS)
 
-The audio.cpp engine runs each session in its own sidecar process (`sidecar/`), which links a prebuilt audio.cpp engine. VoiceManager is tested against audio.cpp commit `624cf918e51263d39c2a0d28a6c5e3d55990b79f`. Use that commit.
+The audio.cpp engine runs each session in its own sidecar process (`sidecar/`), which links a prebuilt audio.cpp engine. VoiceManager is tested against audio.cpp commit `04a37f2e80ff2dbcdd84cc67848a970bd02a73e0`. Use that commit.
 
 1. Get audio.cpp at the pinned commit:
 
    ```bash
    git clone https://github.com/0xShug0/audio.cpp 3rdParty/audio.cpp
-   git -C 3rdParty/audio.cpp checkout 624cf918e51263d39c2a0d28a6c5e3d55990b79f
+   git -C 3rdParty/audio.cpp checkout 04a37f2e80ff2dbcdd84cc67848a970bd02a73e0
    ```
 
 2. Build the audio.cpp engine with CUDA and the model families the sidecar serves:

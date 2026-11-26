@@ -4,6 +4,16 @@ All notable changes to VoiceManager are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1]
+
+### Changed
+
+- VoiceManager is now tested against audio.cpp v0.9.6 (commit `04a37f2e`),
+  not commit `624cf918`. Rebuild the audio.cpp engine and the sidecar at the
+  new commit. In v0.9.6, Breeze-TTS on CUDA has three speed paths on by
+  default (`fused_depth`, `direct_prefill`, `skip_cache_round`), so the audio
+  can be a little different from earlier builds.
+
 ## [0.11.0]
 
 ### Added
